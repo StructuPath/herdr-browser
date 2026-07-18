@@ -21,13 +21,13 @@ export function deriveSession(env, cwd) {
   if (env.HERDR_PLUGIN_CONFIG_DIR) {
     const f = path.join(env.HERDR_PLUGIN_CONFIG_DIR, 'session');
     if (fs.existsSync(f)) {
-      const name = fs.readFileSync(f, 'utf8').split('\n')[0].trim();
+      const name = fs.readFileSync(f, 'utf8').split('\n')[0].replace(/\s/g, '');
       if (name) return name;
     }
   }
   if (env.HERDR_WORKSPACE_ID) return `herdr-ws-${env.HERDR_WORKSPACE_ID}`;
-  const sum = spawnSync('sh', ['-c', `printf '%s\\n' "${cwd}" | cksum`])
-    .stdout.toString().split(' ')[0];
+  const sum = spawnSync('sh', ['-c', "printf '%s\\n' \"$HB_CWD\" | cksum"],
+    { env: { ...process.env, HB_CWD: cwd } }).stdout.toString().split(' ')[0];
   return `herdr-cwd-${sum}`;
 }
 
@@ -110,7 +110,8 @@ function probeKittySupport(timeoutMs = 300) {
 
 function makeBrowser(session, bin = 'agent-browser') {
   const run = async (...args) => {
-    const { stdout } = await pExecFile(bin, ['--session', session, ...args, '--json']);
+    const { stdout } = await pExecFile(
+      bin, ['--session', session, ...args, '--json'], { timeout: 10_000 });
     const parsed = JSON.parse(stdout);
     if (parsed.success === false) throw new Error(parsed.error || 'agent-browser error');
     return parsed.data;
@@ -125,7 +126,8 @@ function makeBrowser(session, bin = 'agent-browser') {
     screenshot: async file => { await run('screenshot', file); },
     sessionExists: async () => {
       try {
-        const { stdout } = await pExecFile(bin, ['session', 'list', '--json']);
+        const { stdout } = await pExecFile(
+          bin, ['session', 'list', '--json'], { timeout: 10_000 });
         return stdout.includes(session);
       } catch { return false; }
     },
@@ -153,7 +155,14 @@ class Renderer {
     this.consoleLines = [];
     this.failures = 0;
     this.banner = '';
-    this.resizePending = false;
+    this.paintQueue = Promise.resolve();
+  }
+
+  // Serialize all screen-writing work: ticks and resize redraws must never
+  // interleave their stdout escape sequences.
+  enqueue(fn) {
+    this.paintQueue = this.paintQueue.then(fn, () => {});
+    return this.paintQueue;
   }
 
   size() {
@@ -183,14 +192,14 @@ class Renderer {
     process.stdout.write(`${ESC}[2;1H${line2}${ESC}[K`);
   }
 
-  async renderImage(fromCache = false) {
+  async renderImage() {
     const { cols, imageRows } = this.size();
     if (this.mode === 'text' || imageRows < 3 || !fs.existsSync(this.shot)) return;
     const fmt = this.mode === 'kitty' ? 'kitty' : 'symbols';
     try {
       const { stdout } = await pExecFile(
         'chafa', ['-f', fmt, '-s', `${cols}x${imageRows}`, '--animate', 'off', this.shot],
-        { maxBuffer: 32 * 1024 * 1024 },
+        { maxBuffer: 32 * 1024 * 1024, timeout: 15_000 },
       );
       if (this.mode === 'kitty') process.stdout.write(KITTY_DELETE);
       process.stdout.write(`${ESC}[3;1H`);
@@ -224,12 +233,11 @@ class Renderer {
   async tick() {
     let failed = false;
     try {
-      const [url, title] = [await this.browser.url(), await this.browser.title()];
-      if (url !== this.lastUrl || title !== this.lastTitle) {
-        this.lastUrl = url;
-        this.lastTitle = title;
-      }
-      const entries = await this.browser.console();
+      const [url, title, entries] = await Promise.all([
+        this.browser.url(), this.browser.title(), this.browser.console(),
+      ]);
+      this.lastUrl = url;
+      this.lastTitle = title;
       const { newEntries, marker } = reconcileConsole(this.consoleState, entries);
       if (newEntries.length || marker) {
         this.pushConsole(newEntries, marker);
@@ -266,7 +274,7 @@ class Renderer {
     process.stdout.write(`${ESC}[2J`);
     if (this.mode === 'kitty') process.stdout.write(KITTY_DELETE);
     this.header();
-    await this.renderImage(true);
+    await this.renderImage();
     this.renderConsole();
   }
 
@@ -292,21 +300,23 @@ class Renderer {
     let resizeTimer = null;
     process.stdout.on('resize', () => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => this.redrawAll(), 150);
+      resizeTimer = setTimeout(() => this.enqueue(() => this.redrawAll()), 150);
     });
     for (const sig of ['SIGTERM', 'SIGHUP', 'SIGINT']) {
       process.on(sig, () => { this.cleanup(); process.exit(0); });
     }
 
     while (true) {
-      await this.tick();
+      await this.enqueue(() => this.tick());
       await new Promise(r => setTimeout(r, this.intervalMs));
     }
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  new Renderer().run().catch(err => {
+  // Construct inside the async wrapper so constructor failures (state-dir
+  // permissions, etc.) hit the same catch and never flash-close the pane.
+  (async () => { await new Renderer().run(); })().catch(err => {
     process.stdout.write(`${ESC}[?1049l${ESC}[?25h`);
     console.error('herdr-browser renderer crashed:', err.message);
     setTimeout(() => process.exit(1), 600_000);

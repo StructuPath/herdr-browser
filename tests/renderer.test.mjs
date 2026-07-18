@@ -67,6 +67,30 @@ test('deriveSession precedence: env > config > workspace > cwd', () => {
   assert.match(deriveSession({}, '/some/dir'), /^herdr-cwd-\d+$/);
 });
 
+test('deriveSession config parsing matches bash: strips inner whitespace, skips empty', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-cfg-'));
+  fs.writeFileSync(path.join(tmp, 'session'), 'my session\n');
+  assert.equal(deriveSession({ HERDR_PLUGIN_CONFIG_DIR: tmp }, '/'), 'mysession');
+  fs.writeFileSync(path.join(tmp, 'session'), '\n');
+  assert.equal(
+    deriveSession({ HERDR_PLUGIN_CONFIG_DIR: tmp, HERDR_WORKSPACE_ID: 'w2' }, '/'),
+    'herdr-ws-w2');
+});
+
+test('deriveSession cwd fallback survives shell metacharacters in path', () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hb-meta-')));
+  const cwd = path.join(base, 'proj$HOME"x');
+  fs.mkdirSync(cwd);
+  const js = deriveSession({}, cwd);
+  const cleanEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith('HERDR')));
+  const sh = execFileSync(
+    'bash', ['-c', `. "${repoRoot}/scripts/lib.sh" && session_name`],
+    { cwd, env: cleanEnv },
+  ).toString().trim();
+  assert.equal(js, sh);
+});
+
 test('deriveSession cwd fallback matches bash session_name()', () => {
   const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hb-lockstep-')));
   const js = deriveSession({}, cwd);

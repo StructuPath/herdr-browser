@@ -11,4 +11,10 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+# Resolve the session once through the shared bash helper so the launcher and
+# the renderer can never derive different names.
+. scripts/lib.sh
+HERDR_BROWSER_SESSION="$(session_name)"
+export HERDR_BROWSER_SESSION
+
 exec node bin/renderer.mjs

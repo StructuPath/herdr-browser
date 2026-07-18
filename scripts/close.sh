@@ -20,4 +20,6 @@ if command -v agent-browser >/dev/null 2>&1; then
   agent-browser --session "$session" close >/dev/null 2>&1 || true
 fi
 
-rm -f "$(state_dir)"/shot-*.png
+sd="$(state_dir)"
+ws="${HERDR_WORKSPACE_ID:-default}"
+rm -f "$sd/shot-$ws.png" "$sd/shot-$ws.png.tmp"

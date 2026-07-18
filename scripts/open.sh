@@ -34,5 +34,11 @@ else
     echo "herdr-browser: failed to open pane" >&2
     exit 4
   }
-  printf '%s' "$out" | grep -o '"pane_id":"[^"]*"' | head -n1 | cut -d'"' -f4 > "$pidfile"
+  pane_id="$(printf '%s' "$out" | grep -o '"pane_id":"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+  if [ -n "$pane_id" ]; then
+    printf '%s\n' "$pane_id" > "$pidfile"
+  else
+    echo "herdr-browser: warning: could not parse pane id from pane-open output" >&2
+    rm -f "$pidfile"
+  fi
 fi

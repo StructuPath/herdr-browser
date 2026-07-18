@@ -13,17 +13,26 @@ state_dir() {
 }
 
 # Session precedence: env override > config file > workspace id > cwd hash.
-# Must stay in lockstep with deriveSession() in bin/renderer.mjs.
+# Must stay in lockstep with deriveSession() in bin/renderer.mjs (pane.sh
+# exports the resolved name, so the JS copy is a fallback only).
 session_name() {
   if [ -n "${HERDR_BROWSER_SESSION:-}" ]; then
     printf '%s\n' "$HERDR_BROWSER_SESSION"
-  elif [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/session" ]; then
-    head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/session" | tr -d '[:space:]'
-  elif [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
-    printf 'herdr-ws-%s\n' "$HERDR_WORKSPACE_ID"
-  else
-    printf 'herdr-cwd-%s\n' "$(printf '%s\n' "$PWD" | cksum | cut -d' ' -f1)"
+    return
   fi
+  if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/session" ]; then
+    local cfg
+    cfg="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/session" | tr -d '[:space:]')"
+    if [ -n "$cfg" ]; then
+      printf '%s\n' "$cfg"
+      return
+    fi
+  fi
+  if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+    printf 'herdr-ws-%s\n' "$HERDR_WORKSPACE_ID"
+    return
+  fi
+  printf 'herdr-cwd-%s\n' "$(printf '%s\n' "$PWD" | cksum | cut -d' ' -f1)"
 }
 
 require_agent_browser() {

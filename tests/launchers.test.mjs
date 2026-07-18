@@ -46,7 +46,11 @@ echo '{"success":true,"data":{}}'`);
   writeStub('herdr', `echo "herdr $@" >> "$STUB_LOG"
 if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
 if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
-  echo '{"id":"x","result":{"plugin_pane":{"pane":{"pane_id":"w9:p7"}}}}'
+  if [ -n "\${STUB_PRETTY:-}" ]; then
+    printf '{\\n  "result": {\\n    "plugin_pane": {"pane": {"pane_id": "w9:p7"}}\\n  }\\n}\\n'
+  else
+    echo '{"id":"x","result":{"plugin_pane":{"pane":{"pane_id":"w9:p7"}}}}'
+  fi
 fi
 exit 0`);
 });
@@ -100,6 +104,25 @@ test('missing agent-browser fails fast with install hint, no pane', () => {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /npm install -g agent-browser/);
   assert.doesNotMatch(log(), /pane open/);
+});
+
+test('unparseable pane-open output warns without failing or writing pidfile', () => {
+  fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
+  const r = runScript('open.sh', ['http://localhost:3000'], freshEnv({ STUB_PRETTY: '1' }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /could not parse pane id/);
+  assert.equal(fs.existsSync(path.join(stateDir, 'pane-id-w9')), false);
+});
+
+test('close removes only this workspace screenshot cache', () => {
+  fs.writeFileSync(path.join(stateDir, 'shot-w9.png'), 'x');
+  fs.writeFileSync(path.join(stateDir, 'shot-w9.png.tmp'), 'x');
+  fs.writeFileSync(path.join(stateDir, 'shot-other.png'), 'x');
+  const r = runScript('close.sh');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.existsSync(path.join(stateDir, 'shot-w9.png')), false);
+  assert.equal(fs.existsSync(path.join(stateDir, 'shot-w9.png.tmp')), false);
+  assert.equal(fs.existsSync(path.join(stateDir, 'shot-other.png')), true);
 });
 
 test('close closes pane then session, never --all', () => {

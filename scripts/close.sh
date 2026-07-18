@@ -16,6 +16,30 @@ if [ -f "$pidfile" ]; then
   rm -f "$pidfile"
 fi
 
+# Fallback: the pid file only knows about panes opened through open.sh. Sweep
+# this workspace's Browser/Browse panes from the live snapshot so close works
+# regardless of how a pane was opened.
+if [ -n "${HERDR_WORKSPACE_ID:-}" ] && command -v node >/dev/null 2>&1; then
+  "$HERDR" api snapshot 2>/dev/null | node -e '
+    let d = "";
+    process.stdin.on("data", c => d += c).on("end", () => {
+      const ws = process.argv[1];
+      let j; try { j = JSON.parse(d); } catch { return; }
+      const out = [];
+      const walk = o => {
+        if (o && typeof o === "object") {
+          if (o.pane_id && (o.label === "Browser" || o.label === "Browse")
+              && String(o.pane_id).startsWith(ws + ":")) out.push(o.pane_id);
+          for (const v of Object.values(o)) walk(v);
+        }
+      };
+      walk(j);
+      console.log(out.join("\n"));
+    });' "$HERDR_WORKSPACE_ID" | while IFS= read -r stray; do
+    [ -n "$stray" ] && "$HERDR" plugin pane close "$stray" >/dev/null 2>&1 || true
+  done
+fi
+
 if command -v agent-browser >/dev/null 2>&1; then
   agent-browser --session "$session" close >/dev/null 2>&1 || true
 fi

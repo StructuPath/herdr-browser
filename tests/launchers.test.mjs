@@ -45,6 +45,9 @@ before(() => {
 echo '{"success":true,"data":{}}'`);
   writeStub('herdr', `echo "herdr $@" >> "$STUB_LOG"
 if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
+if [ "$1" = "api" ] && [ "$2" = "snapshot" ]; then
+  echo '{"result":{"workspaces":[{"tabs":[{"panes":[{"pane_id":"w9:p9","label":"Browser"},{"pane_id":"w9:p4","label":"claude"},{"pane_id":"w8:p2","label":"Browser"}]}]}]}}'
+fi
 if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
   if [ -n "\${STUB_PRETTY:-}" ]; then
     printf '{\\n  "result": {\\n    "plugin_pane": {"pane": {"pane_id": "w9:p7"}}\\n  }\\n}\\n'
@@ -142,6 +145,15 @@ test('browse with no URL opens pane without URL env (pane will prompt)', () => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(log(), /--entrypoint browse/);
   assert.doesNotMatch(log(), /HERDR_BROWSE_URL/);
+});
+
+test('close sweeps untracked Browser panes in its workspace only', () => {
+  fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
+  const r = runScript('close.sh');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /herdr plugin pane close w9:p9/);
+  assert.doesNotMatch(log(), /pane close w8:p2/, 'other workspaces untouched');
+  assert.doesNotMatch(log(), /pane close w9:p4/, 'non-plugin panes untouched');
 });
 
 test('close closes pane then session, never --all', () => {

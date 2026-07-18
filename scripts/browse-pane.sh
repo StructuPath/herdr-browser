@@ -25,4 +25,9 @@ if [ -z "$url" ]; then
   esac
 fi
 
-exec carbonyl "$url"
+zoom="${HERDR_BROWSE_ZOOM:-}"
+if [ -z "$zoom" ] && [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/zoom" ]; then
+  zoom="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/zoom" | tr -cd '0-9')"
+fi
+
+exec carbonyl --zoom="${zoom:-100}" "$url"

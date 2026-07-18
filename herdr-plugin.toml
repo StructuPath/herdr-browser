@@ -31,7 +31,7 @@ command = ["bash", "scripts/pane.sh"]
 [[panes]]
 id = "browse"
 title = "Browse"
-placement = "split"
+placement = "zoomed"
 command = ["bash", "scripts/browse-pane.sh"]
 
 [[link_handlers]]

@@ -12,7 +12,7 @@ if [ -n "$url" ] && ! validate_url "$url"; then
 fi
 
 args=(plugin pane open --plugin "$PLUGIN_ID" --entrypoint browse
-  --placement split --direction right --focus)
+  --placement zoomed --focus)
 if [ -n "$url" ]; then
   args+=(--env "HERDR_BROWSE_URL=$url")
 fi

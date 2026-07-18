@@ -2,6 +2,7 @@
 # Shared helpers for herdr-browser launcher actions.
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
+# shellcheck disable=SC2034  # consumed by open.sh after sourcing
 PLUGIN_ID="structupath.browser"
 
 state_dir() {

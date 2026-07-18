@@ -3,7 +3,7 @@
 # view-only when invoked with no URL (action invoke and keybindings cannot
 # pass arguments in herdr 0.7.x, so URL-less is the primary invoke path).
 set -uo pipefail
-cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}"
+cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 . scripts/lib.sh
 
 require_agent_browser

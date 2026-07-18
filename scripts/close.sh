@@ -2,7 +2,7 @@
 # Close action: close the pane first (so the renderer exits cleanly), then
 # end this plugin's browser session. Never touches other sessions.
 set -uo pipefail
-cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}"
+cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 . scripts/lib.sh
 
 session="$(session_name)"

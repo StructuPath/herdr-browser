@@ -2,7 +2,7 @@
 # Pane entrypoint: run the renderer. Never exit instantly on a missing
 # dependency — an exiting pane process closes the pane before the user can
 # read the error.
-cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}"
+cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 
 if ! command -v node >/dev/null 2>&1; then
   echo "herdr-browser: node not found on PATH (need Node.js >= 20)."

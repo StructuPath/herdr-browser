@@ -1,0 +1,29 @@
+id = "structupath.browser"
+name = "Browser"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Driveable browser pane: live screenshots, console output, and localhost link handling via agent-browser"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "open"
+title = "Open browser pane"
+description = "Navigate the workspace browser session (or attach view-only with no URL)"
+command = ["bash", "scripts/open.sh"]
+
+[[actions]]
+id = "close"
+title = "Close browser session and pane"
+command = ["bash", "scripts/close.sh"]
+
+[[panes]]
+id = "view"
+title = "Browser"
+placement = "split"
+command = ["bash", "scripts/pane.sh"]
+
+[[link_handlers]]
+id = "localhost"
+title = "Open localhost URL in browser pane"
+pattern = "^https?://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]+)?(/.*)?$"
+action = "open"

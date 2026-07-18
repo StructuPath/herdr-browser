@@ -1,6 +1,6 @@
 id = "structupath.browser"
 name = "Browser"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
 description = "Driveable browser pane: live screenshots, console output, and localhost link handling via agent-browser"
 platforms = ["macos", "linux"]
@@ -16,11 +16,23 @@ id = "close"
 title = "Close browser session and pane"
 command = ["bash", "scripts/close.sh"]
 
+[[actions]]
+id = "browse"
+title = "Browse (interactive)"
+description = "Open an interactive carbonyl browser pane — prompts for a URL"
+command = ["bash", "scripts/browse.sh"]
+
 [[panes]]
 id = "view"
 title = "Browser"
 placement = "split"
 command = ["bash", "scripts/pane.sh"]
+
+[[panes]]
+id = "browse"
+title = "Browse"
+placement = "split"
+command = ["bash", "scripts/browse-pane.sh"]
 
 [[link_handlers]]
 id = "localhost"

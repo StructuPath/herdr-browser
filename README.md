@@ -59,6 +59,12 @@ description = "browser pane"
   `http://localhost:PORT`, `127.0.0.1`, or `[::1]` URL printed in a Herdr pane
   opens it in the browser pane instead of your system browser. Plain clicks
   keep their default behavior.
+- **Browse** (`structupath.browser.browse`) — an *interactive* browser pane
+  via [carbonyl](https://github.com/fathyb/carbonyl) (Chromium rendered into
+  the terminal: mouse, scrolling, typing all work). With no URL it prompts —
+  an address bar in a pane. Requires `npm install -g carbonyl`. This is a
+  personal browser with its own Chromium; it does not share the agent's
+  session — use the viewer pane (Open) for that.
 
 ## Real-pixel screenshots (optional)
 

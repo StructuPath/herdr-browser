@@ -125,6 +125,25 @@ test('close removes only this workspace screenshot cache', () => {
   assert.equal(fs.existsSync(path.join(stateDir, 'shot-other.png')), true);
 });
 
+test('browse with URL opens browse pane passing URL via env', () => {
+  const r = runScript('browse.sh', ['http://localhost:3000']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /--entrypoint browse/);
+  assert.match(log(), /HERDR_BROWSE_URL=http:\/\/localhost:3000/);
+});
+
+test('browse refuses flag-like and non-http URLs', () => {
+  assert.equal(runScript('browse.sh', ['-evil']).status, 2);
+  assert.equal(runScript('browse.sh', ['file:///etc/passwd']).status, 2);
+});
+
+test('browse with no URL opens pane without URL env (pane will prompt)', () => {
+  const r = runScript('browse.sh');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /--entrypoint browse/);
+  assert.doesNotMatch(log(), /HERDR_BROWSE_URL/);
+});
+
 test('close closes pane then session, never --all', () => {
   fs.writeFileSync(path.join(stateDir, 'pane-id-w9'), 'w9:p7\n');
   const r = runScript('close.sh', [], freshEnv({ STUB_PANE_ALIVE: '0' }));

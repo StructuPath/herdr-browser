@@ -66,6 +66,26 @@ description = "browser pane"
   personal browser with its own Chromium; it does not share the agent's
   session — use the viewer pane (Open) for that.
 
+## Viewer controls
+
+The viewer pane is passive until you act; every action below drives the
+shared session directly (your agent sees the same browser state):
+
+| Input | Action |
+|-------|--------|
+| `u` | address bar — type any URL, Enter to go (`https://` assumed) |
+| click on the screenshot | clicks the real page at that spot |
+| `i` | type text into the focused element |
+| `b` / `f` | history back / forward |
+| `r` | reload |
+| `j` / `k` / space | scroll down / up |
+| `q` | close the pane (session keeps running) |
+
+Clicks map through the screenshot geometry to page coordinates, so what you
+click is what Chrome clicks. Expect roughly a one-second round trip per
+interaction — this is browsing-by-snapshot, built for dev verification, not
+for reading Twitter.
+
 ## Real-pixel screenshots (optional)
 
 By default screenshots render as ANSI half-blocks. For real pixels, enable

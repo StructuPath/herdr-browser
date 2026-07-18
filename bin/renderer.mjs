@@ -81,29 +81,30 @@ export function truncate(s, width) {
   return s.length <= width ? s : s.slice(0, Math.max(0, width - 1)) + '…';
 }
 
-// --- terminal probe ---
+export function pngDims(buf) {
+  if (buf.length < 24 || buf.readUInt32BE(12) !== 0x49484452) return null; // IHDR
+  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+}
 
-function probeKittySupport(timeoutMs = 300) {
-  return new Promise(resolve => {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) return resolve('');
-    let buf = '';
-    const done = ans => {
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
-      process.stdin.removeListener('data', onData);
-      resolve(ans);
-    };
-    const onData = chunk => {
-      buf += chunk.toString('latin1');
-      // DA1 response terminates the probe: every terminal answers ESC [ ? ... c
-      if (/\x1b\[\?[\d;]*c/.test(buf)) done(buf);
-    };
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.on('data', onData);
-    process.stdout.write(`${ESC}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA${ESC}\\${ESC}[c`);
-    setTimeout(() => done(buf), timeoutMs);
-  });
+// SGR mouse report: ESC [ < button ; col ; row (M=press, m=release)
+export function parseSgrMouse(s) {
+  const m = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(s);
+  if (!m) return null;
+  return { button: Number(m[1]), col: Number(m[2]), row: Number(m[3]), release: m[4] === 'm' };
+}
+
+// Map a terminal cell click inside the image region to page pixel
+// coordinates. chafa draws top-left into a cols x imageRows box preserving
+// pixel aspect with a ~1:2 cell width:height ratio; work in half-cell units.
+export function mapClickToPage(col, row, { cols, imageRows, imageTopRow, pngW, pngH }) {
+  if (!pngW || !pngH || imageRows <= 0) return null;
+  const unitX = (col - 1) + 0.5;
+  const unitY = (row - imageTopRow) * 2 + 1;
+  if (unitY < 0) return null;
+  const scale = Math.min(cols / pngW, (imageRows * 2) / pngH);
+  if (!(scale > 0)) return null;
+  if (unitX > pngW * scale || unitY > pngH * scale) return null;
+  return { x: Math.round(unitX / scale), y: Math.round(unitY / scale) };
 }
 
 // --- agent-browser access ---
@@ -124,6 +125,13 @@ function makeBrowser(session, bin = 'agent-browser') {
       return Array.isArray(d) ? d : (d.messages ?? []);
     },
     screenshot: async file => { await run('screenshot', file); },
+    open: async u => { await run('open', u); },
+    back: async () => { await run('back'); },
+    forward: async () => { await run('forward'); },
+    reload: async () => { await run('reload'); },
+    scroll: async (dir, px) => { await run('scroll', dir, String(px)); },
+    type: async text => { await run('type', text); },
+    eval: async js => { await run('eval', js); },
     sessionExists: async () => {
       try {
         const { stdout } = await pExecFile(
@@ -156,6 +164,7 @@ class Renderer {
     this.failures = 0;
     this.banner = '';
     this.attached = false;
+    this.promptState = null;
     this.paintQueue = Promise.resolve();
   }
 
@@ -171,7 +180,7 @@ class Renderer {
     const rows = process.stdout.rows || 24;
     const consoleRows = this.mode === 'text' ? rows - 3 : Math.max(4, Math.floor(rows * 0.3));
     const imageRows = this.mode === 'text' ? 0 : rows - consoleRows - 4;
-    return { cols, rows, imageRows, consoleRows };
+    return { cols, rows, imageRows, consoleRows, imageTopRow: 3, bottomRow: rows };
   }
 
   configValue(name) {
@@ -192,6 +201,18 @@ class Renderer {
       : truncate(` ${this.lastUrl}${this.lastTitle ? '  —  ' + this.lastTitle : ''}${blankHint}`, cols);
     process.stdout.write(`${ESC}[1;1H${ESC}[7m${line1}${ESC}[K${ESC}[0m`);
     process.stdout.write(`${ESC}[2;1H${line2}${ESC}[K`);
+    this.renderBottom();
+  }
+
+  renderBottom() {
+    const { cols, bottomRow } = this.size();
+    if (this.promptState) {
+      const text = ` ${this.promptState.label}${this.promptState.value}█`;
+      process.stdout.write(`${ESC}[${bottomRow};1H${truncate(text, cols)}${ESC}[K`);
+    } else {
+      const help = ' u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  q:quit';
+      process.stdout.write(`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`);
+    }
   }
 
   async renderImage() {
@@ -200,7 +221,7 @@ class Renderer {
     const fmt = this.mode === 'kitty' ? 'kitty' : 'symbols';
     try {
       const { stdout } = await pExecFile(
-        'chafa', ['-f', fmt, '-s', `${cols}x${imageRows}`, '--animate', 'off', this.shot],
+        'chafa', ['-f', fmt, '-s', `${cols}x${imageRows}`, '--animate', 'off', '--probe', 'off', this.shot],
         { maxBuffer: 32 * 1024 * 1024, timeout: 15_000 },
       );
       if (this.mode === 'kitty') process.stdout.write(KITTY_DELETE);
@@ -289,6 +310,117 @@ class Renderer {
     this.header();
   }
 
+  // One permanent stdin pipeline: raw mode is set once and stdin is never
+  // paused. During the startup probe, bytes route to the probe sink; after
+  // that, to the interactive handler. (Toggling raw mode + pause/resume
+  // around a temporary listener silently kills later delivery.)
+  dbg(m) {
+    if (this.env.HB_DEBUG_INPUT) fs.appendFileSync(this.env.HB_DEBUG_INPUT, m + '\n');
+  }
+
+  setupInput() {
+    if (!process.stdin.isTTY) return;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', chunk => {
+      const s = chunk.toString('latin1');
+      if (this.env.HB_DEBUG_INPUT) {
+        fs.appendFileSync(this.env.HB_DEBUG_INPUT,
+          `data sink=${!!this.probeSink} s=${JSON.stringify(s)}\n`);
+      }
+      if (this.probeSink) this.probeSink(s);
+      else this.onInput(s);
+    });
+  }
+
+  // DA1 response terminates the probe: every terminal answers ESC [ ? ... c
+  probeKitty(timeoutMs = 300) {
+    return new Promise(resolve => {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) return resolve('');
+      let buf = '';
+      const timer = setTimeout(() => { this.probeSink = null; resolve(buf); }, timeoutMs);
+      this.probeSink = s => {
+        buf += s;
+        if (/\x1b\[\?[\d;]*c/.test(buf)) {
+          clearTimeout(timer);
+          this.probeSink = null;
+          resolve(buf);
+        }
+      };
+      process.stdout.write(`${ESC}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA${ESC}\\${ESC}[c`);
+    });
+  }
+
+  onInput(s) {
+    const mouse = parseSgrMouse(s);
+    if (mouse) {
+      if (!mouse.release && mouse.button === 0 && this.attached) {
+        this.userAction(() => this.clickAt(mouse.col, mouse.row));
+      }
+      return;
+    }
+    if (this.promptState) { this.promptInput(s); return; }
+    if (!this.attached && !['u', 'q', '\x03'].includes(s)) return;
+    switch (s) {
+      case 'u': this.openPrompt('URL: ', v => this.navigate(v)); break;
+      case 'i': this.openPrompt('type: ', v => this.browser.type(v)); break;
+      case 'b': this.userAction(() => this.browser.back()); break;
+      case 'f': this.userAction(() => this.browser.forward()); break;
+      case 'r': this.userAction(() => this.browser.reload()); break;
+      case 'j': case ' ': this.userAction(() => this.browser.scroll('down', 300)); break;
+      case 'k': this.userAction(() => this.browser.scroll('up', 300)); break;
+      case 'q': case '\x03': this.cleanup(); process.exit(0);
+    }
+  }
+
+  openPrompt(label, onSubmit) {
+    this.promptState = { label, value: '', onSubmit };
+    this.renderBottom();
+  }
+
+  promptInput(s) {
+    const p = this.promptState;
+    for (const ch of s) {
+      if (ch === '\r' || ch === '\n') {
+        this.promptState = null;
+        this.renderBottom();
+        const v = p.value.trim();
+        if (v) this.userAction(() => p.onSubmit(v));
+        return;
+      }
+      if (ch === '\x1b') { this.promptState = null; this.renderBottom(); return; }
+      if (ch === '\x7f' || ch === '\b') p.value = p.value.slice(0, -1);
+      else if (ch >= ' ') p.value += ch;
+    }
+    this.renderBottom();
+  }
+
+  // User-initiated drive of the shared session: run the action, then refresh
+  // immediately instead of waiting for the next poll tick.
+  userAction(fn) {
+    this.enqueue(async () => {
+      try { await fn(); } catch { /* next tick's banner reports failures */ }
+    }).then(() => this.enqueue(() => this.tick()));
+  }
+
+  async navigate(v) {
+    const u = /^https?:\/\//.test(v) ? v : `https://${v}`;
+    this.attached = true; // the user is explicitly starting/driving the session
+    await this.browser.open(u);
+  }
+
+  async clickAt(col, row) {
+    const { cols, imageRows, imageTopRow } = this.size();
+    if (row < imageTopRow || row >= imageTopRow + imageRows) return;
+    let dims;
+    try { dims = pngDims(fs.readFileSync(this.shot)); } catch { return; }
+    if (!dims) return;
+    const pt = mapClickToPage(col, row, { cols, imageRows, imageTopRow, pngW: dims.w, pngH: dims.h });
+    if (!pt) return;
+    await this.browser.eval(
+      `(() => { const el = document.elementFromPoint(${pt.x}, ${pt.y}); if (!el) return; if (el.focus) el.focus(); el.click(); })()`);
+  }
+
   async redrawAll() {
     process.stdout.write(`${ESC}[2J`);
     if (this.mode === 'kitty') process.stdout.write(KITTY_DELETE);
@@ -302,11 +434,13 @@ class Renderer {
     for (const f of [this.shot, this.shot + '.tmp']) {
       try { fs.unlinkSync(f); } catch { /* already gone */ }
     }
-    process.stdout.write(`${ESC}[?1049l${ESC}[?25h`);
+    try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch { /* fine */ }
+    process.stdout.write(`${ESC}[?1000l${ESC}[?1006l${ESC}[?1049l${ESC}[?25h`);
   }
 
   async run() {
-    const probe = await probeKittySupport();
+    this.setupInput();
+    const probe = await this.probeKitty();
     this.mode = pickRenderMode(this.env, this.configValue('render'), probe, this.chafa);
     process.stdout.write(`${ESC}[?1049h${ESC}[?25l`);
     if (this.mode === 'text') {
@@ -315,6 +449,7 @@ class Renderer {
         : 'chafa not found — text-only mode. Install: brew install chafa');
     }
     await this.redrawAll();
+    process.stdout.write(`${ESC}[?1000h${ESC}[?1006h`);
 
     let resizeTimer = null;
     process.stdout.on('resize', () => {

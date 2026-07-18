@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   deriveSession, reconcileConsole, consoleTail, pickRenderMode, truncate,
+  pngDims, parseSgrMouse, mapClickToPage,
 } from '../bin/renderer.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -101,6 +102,32 @@ test('deriveSession cwd fallback matches bash session_name()', () => {
     { cwd, env: cleanEnv },
   ).toString().trim();
   assert.equal(js, sh);
+});
+
+test('pngDims parses IHDR width/height, rejects junk', () => {
+  const buf = Buffer.alloc(24);
+  buf.writeUInt32BE(0x49484452, 12);
+  buf.writeUInt32BE(1280, 16);
+  buf.writeUInt32BE(720, 20);
+  assert.deepEqual(pngDims(buf), { w: 1280, h: 720 });
+  assert.equal(pngDims(Buffer.alloc(10)), null);
+  assert.equal(pngDims(Buffer.alloc(24)), null);
+});
+
+test('parseSgrMouse parses press and release', () => {
+  assert.deepEqual(parseSgrMouse('\x1b[<0;40;10M'),
+    { button: 0, col: 40, row: 10, release: false });
+  assert.equal(parseSgrMouse('\x1b[<0;40;10m').release, true);
+  assert.equal(parseSgrMouse('u'), null);
+});
+
+test('mapClickToPage maps clicks and respects letterboxing', () => {
+  const geom = { cols: 100, imageRows: 30, imageTopRow: 3, pngW: 1280, pngH: 720 };
+  // scale = min(100/1280, 60/720) = 0.078125; click at col 50, row 17
+  assert.deepEqual(mapClickToPage(50, 17, geom), { x: 634, y: 371 });
+  // drawn height is 56.25 half-cell units; row 31 => unitY 57 falls below the image
+  assert.equal(mapClickToPage(50, 31, geom), null);
+  assert.equal(mapClickToPage(50, 2, geom), null);
 });
 
 test('truncate', () => {

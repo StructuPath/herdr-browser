@@ -151,7 +151,7 @@ test('close sweeps untracked Browser panes in its workspace only', () => {
   fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
   const r = runScript('close.sh');
   assert.equal(r.status, 0, r.stderr);
-  assert.match(log(), /herdr plugin pane close w9:p9/);
+  assert.match(log(), /herdr pane close w9:p9/);
   assert.doesNotMatch(log(), /pane close w8:p2/, 'other workspaces untouched');
   assert.doesNotMatch(log(), /pane close w9:p4/, 'non-plugin panes untouched');
 });
@@ -161,10 +161,10 @@ test('close closes pane then session, never --all', () => {
   const r = runScript('close.sh', [], freshEnv({ STUB_PANE_ALIVE: '0' }));
   assert.equal(r.status, 0, r.stderr);
   const l = log();
-  assert.match(l, /herdr plugin pane close w9:p7/);
+  assert.match(l, /herdr pane close w9:p7/);
   assert.match(l, /agent-browser --session herdr-ws-w9 close/);
   assert.doesNotMatch(l, /--all/);
-  assert.ok(l.indexOf('plugin pane close') < l.indexOf('--session herdr-ws-w9 close'),
+  assert.ok(l.indexOf('pane close') < l.indexOf('--session herdr-ws-w9 close'),
     'pane must close before session');
   assert.equal(fs.existsSync(path.join(stateDir, 'pane-id-w9')), false);
 });

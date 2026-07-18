@@ -11,7 +11,7 @@ pidfile="$(pane_id_file)"
 if [ -f "$pidfile" ]; then
   pane="$(cat "$pidfile")"
   if pane_alive "$pane"; then
-    "$HERDR" plugin pane close "$pane" >/dev/null 2>&1 || true
+    "$HERDR" pane close "$pane" >/dev/null 2>&1 || true
   fi
   rm -f "$pidfile"
 fi
@@ -36,7 +36,9 @@ if [ -n "${HERDR_WORKSPACE_ID:-}" ] && command -v node >/dev/null 2>&1; then
       walk(j);
       console.log(out.join("\n"));
     });' "$HERDR_WORKSPACE_ID" | while IFS= read -r stray; do
-    [ -n "$stray" ] && "$HERDR" plugin pane close "$stray" >/dev/null 2>&1 || true
+    # Generic close, not `plugin pane close`: the plugin-scoped variant
+    # silently no-ops on panes from a previous plugin registration.
+    [ -n "$stray" ] && "$HERDR" pane close "$stray" >/dev/null 2>&1 || true
   done
 fi
 

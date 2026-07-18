@@ -19,7 +19,7 @@ function writeStub(name, body) {
 function freshEnv(overrides = {}) {
   fs.writeFileSync(logFile, '');
   return {
-    PATH: `${stubDir}:/usr/bin:/bin`,
+    PATH: `${stubDir}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
     HOME: os.homedir(),
     STUB_LOG: logFile,
     HERDR_BIN_PATH: path.join(stubDir, 'herdr'),

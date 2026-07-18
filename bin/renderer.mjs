@@ -212,7 +212,8 @@ class Renderer {
   pushConsole(entries, marker) {
     if (marker) this.consoleLines.push('— console cleared or rotated —');
     for (const e of entries) {
-      const prefix = e.type === 'error' ? '✖ ' : e.type === 'warn' ? '⚠ ' : '  ';
+      const prefix = e.type === 'error' ? '✖ '
+        : (e.type === 'warn' || e.type === 'warning') ? '⚠ ' : '  ';
       this.consoleLines.push(prefix + (e.text ?? ''));
     }
     if (this.consoleLines.length > 500) {

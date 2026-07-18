@@ -155,6 +155,7 @@ class Renderer {
     this.consoleLines = [];
     this.failures = 0;
     this.banner = '';
+    this.attached = false;
     this.paintQueue = Promise.resolve();
   }
 
@@ -185,9 +186,10 @@ class Renderer {
     const { cols } = this.size();
     const line1 = truncate(
       ` herdr-browser  session:${this.session}  mode:${this.mode}`, cols);
+    const blankHint = this.lastUrl === 'about:blank' ? '  (nothing loaded yet)' : '';
     const line2 = this.banner
       ? truncate(` ! ${this.banner}`, cols)
-      : truncate(` ${this.lastUrl}${this.lastTitle ? '  —  ' + this.lastTitle : ''}`, cols);
+      : truncate(` ${this.lastUrl}${this.lastTitle ? '  —  ' + this.lastTitle : ''}${blankHint}`, cols);
     process.stdout.write(`${ESC}[1;1H${ESC}[7m${line1}${ESC}[K${ESC}[0m`);
     process.stdout.write(`${ESC}[2;1H${line2}${ESC}[K`);
   }
@@ -231,6 +233,19 @@ class Renderer {
   }
 
   async tick() {
+    // Stay truly passive: any get/console/screenshot call would auto-create
+    // the session (and a headless Chrome) on the daemon. Until the session
+    // exists — created by an agent, a link click, or a URL-bearing open —
+    // only run the non-creating existence check and wait.
+    if (!this.attached) {
+      if (!(await this.browser.sessionExists())) {
+        this.banner = `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`;
+        this.header();
+        return;
+      }
+      this.attached = true;
+      this.banner = '';
+    }
     let failed = false;
     try {
       const [url, title, entries] = await Promise.all([
@@ -263,9 +278,13 @@ class Renderer {
       this.failures++;
     }
     if (failed && this.failures >= 3) {
-      this.banner = (await this.browser.sessionExists())
-        ? 'agent-browser not responding — retrying'
-        : `session "${this.session}" is not running — invoke "Browser: Open" to start it`;
+      if (await this.browser.sessionExists()) {
+        this.banner = 'agent-browser not responding — retrying';
+      } else {
+        this.attached = false;
+        this.failures = 0;
+        this.banner = `session "${this.session}" ended — waiting for it to come back`;
+      }
     }
     this.header();
   }

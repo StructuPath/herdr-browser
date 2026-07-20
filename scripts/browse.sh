@@ -16,4 +16,14 @@ args=(plugin pane open --plugin "$PLUGIN_ID" --entrypoint browse
 if [ -n "$url" ]; then
   args+=(--env "HERDR_BROWSE_URL=$url")
 fi
-exec "$HERDR" "${args[@]}" >/dev/null
+out="$("$HERDR" "${args[@]}")" || {
+  echo "herdr-browser: failed to open browse pane" >&2
+  exit 4
+}
+# Record the pane so the close action can find it later.
+pane_id="$(parse_pane_id "$out")"
+if [ -n "$pane_id" ]; then
+  printf '%s\n' "$pane_id" >> "$(browse_ids_file)"
+else
+  echo "herdr-browser: warning: could not parse pane id from pane-open output" >&2
+fi

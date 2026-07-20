@@ -56,6 +56,17 @@ pane_id_file() {
   printf '%s/pane-id-%s\n' "$(state_dir)" "${HERDR_WORKSPACE_ID:-default}"
 }
 
+# Browse panes are many-per-workspace; ids are appended, one per line.
+browse_ids_file() {
+  printf '%s/browse-ids-%s\n' "$(state_dir)" "${HERDR_WORKSPACE_ID:-default}"
+}
+
+# First pane_id in herdr JSON output. Whitespace-stripped first so compact
+# and pretty-printed responses both parse (pane ids never contain spaces).
+parse_pane_id() {
+  printf '%s' "$1" | tr -d ' \n\r\t' | grep -o '"pane_id":"[^"]*"' | head -n1 | cut -d'"' -f4
+}
+
 pane_alive() {
   [ -n "$1" ] && "$HERDR" pane read "$1" --lines 1 >/dev/null 2>&1
 }

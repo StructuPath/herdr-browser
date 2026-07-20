@@ -45,8 +45,10 @@ before(() => {
 echo '{"success":true,"data":{}}'`);
   writeStub('herdr', `echo "herdr $@" >> "$STUB_LOG"
 if [ "$1" = "pane" ] && [ "$2" = "read" ]; then exit "\${STUB_PANE_ALIVE:-1}"; fi
-if [ "$1" = "api" ] && [ "$2" = "snapshot" ]; then
-  echo '{"result":{"workspaces":[{"tabs":[{"panes":[{"pane_id":"w9:p9","label":"Browser"},{"pane_id":"w9:p4","label":"claude"},{"pane_id":"w8:p2","label":"Browser"}]}]}]}}'
+if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
+  # Mirrors the real herdr 0.7.4 pane_list schema: plugin panes carry the
+  # manifest pane title as "label"; plain terminal panes have no label.
+  echo '{"id":"cli:pane:list","result":{"panes":[{"agent_status":"unknown","label":"Browser","pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9"},{"agent":"claude","agent_status":"idle","pane_id":"w9:p4","tab_id":"w9:t1","terminal_title":"claude","workspace_id":"w9"}],"type":"pane_list"}}'
 fi
 if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
   if [ -n "\${STUB_PRETTY:-}" ]; then
@@ -109,12 +111,12 @@ test('missing agent-browser fails fast with install hint, no pane', () => {
   assert.doesNotMatch(log(), /pane open/);
 });
 
-test('unparseable pane-open output warns without failing or writing pidfile', () => {
+test('pretty-printed pane-open output still records the pane id', () => {
   fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
   const r = runScript('open.sh', ['http://localhost:3000'], freshEnv({ STUB_PRETTY: '1' }));
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stderr, /could not parse pane id/);
-  assert.equal(fs.existsSync(path.join(stateDir, 'pane-id-w9')), false);
+  assert.equal(
+    fs.readFileSync(path.join(stateDir, 'pane-id-w9'), 'utf8').trim(), 'w9:p7');
 });
 
 test('close removes only this workspace screenshot cache', () => {
@@ -129,10 +131,43 @@ test('close removes only this workspace screenshot cache', () => {
 });
 
 test('browse with URL opens browse pane passing URL via env', () => {
+  fs.rmSync(path.join(stateDir, 'browse-ids-w9'), { force: true });
   const r = runScript('browse.sh', ['http://localhost:3000']);
   assert.equal(r.status, 0, r.stderr);
   assert.match(log(), /--entrypoint browse/);
   assert.match(log(), /HERDR_BROWSE_URL=http:\/\/localhost:3000/);
+});
+
+test('browse records its pane id so close can find it', () => {
+  fs.rmSync(path.join(stateDir, 'browse-ids-w9'), { force: true });
+  runScript('browse.sh', ['http://localhost:3000']);
+  runScript('browse.sh', ['http://localhost:4000']);
+  assert.deepEqual(
+    fs.readFileSync(path.join(stateDir, 'browse-ids-w9'), 'utf8').trim().split('\n'),
+    ['w9:p7', 'w9:p7']);
+});
+
+test('close closes recorded browse panes and removes the record', () => {
+  fs.writeFileSync(path.join(stateDir, 'browse-ids-w9'), 'w9:p5\nw9:p6\n');
+  const r = runScript('close.sh');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /herdr pane close w9:p5/);
+  assert.match(log(), /herdr pane close w9:p6/);
+  assert.equal(fs.existsSync(path.join(stateDir, 'browse-ids-w9')), false);
+});
+
+test('close closes the tracked pane even when liveness cannot be confirmed', () => {
+  fs.writeFileSync(path.join(stateDir, 'pane-id-w9'), 'w9:p7\n');
+  const r = runScript('close.sh', [], freshEnv({ STUB_PANE_ALIVE: '1' }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /herdr pane close w9:p7/);
+  assert.equal(fs.existsSync(path.join(stateDir, 'pane-id-w9')), false);
+});
+
+test('close reports what it did instead of exiting silently', () => {
+  fs.writeFileSync(path.join(stateDir, 'pane-id-w9'), 'w9:p7\n');
+  const r = runScript('close.sh');
+  assert.match(r.stdout, /closed \d+ pane\(s\); session herdr-ws-w9 released/);
 });
 
 test('browse refuses flag-like and non-http URLs', () => {
@@ -149,10 +184,11 @@ test('browse with no URL opens pane without URL env (pane will prompt)', () => {
 
 test('close sweeps untracked Browser panes in its workspace only', () => {
   fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
+  fs.rmSync(path.join(stateDir, 'browse-ids-w9'), { force: true });
   const r = runScript('close.sh');
   assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /herdr pane list --workspace w9/, 'sweep scoped to workspace');
   assert.match(log(), /herdr pane close w9:p9/);
-  assert.doesNotMatch(log(), /pane close w8:p2/, 'other workspaces untouched');
   assert.doesNotMatch(log(), /pane close w9:p4/, 'non-plugin panes untouched');
 });
 

@@ -116,7 +116,7 @@ export function mapClickToPage(col, row, { cols, imageRows, imageTopRow, pngW, p
 
 // --- agent-browser access ---
 
-function makeBrowser(session, bin = 'agent-browser') {
+export function makeBrowser(session, bin = 'agent-browser') {
   const run = async (...args) => {
     const { stdout } = await pExecFile(
       bin, ['--session', session, ...args, '--json'], {
@@ -153,7 +153,10 @@ function makeBrowser(session, bin = 'agent-browser') {
       try {
         const { stdout } = await pExecFile(
           bin, ['session', 'list', '--json'], { timeout: 10_000 });
-        return stdout.includes(session);
+        // Exact match only: a substring hit (herdr-ws-w2 vs herdr-ws-w22)
+        // would make the pane attach and auto-create a session it must not.
+        const list = JSON.parse(stdout).data?.sessions ?? [];
+        return list.some(s => (typeof s === 'string' ? s : s?.name) === session);
       } catch { return false; }
     },
   };

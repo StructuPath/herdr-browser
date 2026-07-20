@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   deriveSession, reconcileConsole, consoleTail, pickRenderMode, truncate,
-  pngDims, parseSgrMouse, mapClickToPage, sanitizeText, Renderer,
+  pngDims, parseSgrMouse, mapClickToPage, sanitizeText, Renderer, makeBrowser,
 } from '../bin/renderer.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -133,6 +133,18 @@ test('mapClickToPage maps clicks and respects letterboxing', () => {
 test('truncate', () => {
   assert.equal(truncate('hello', 10), 'hello');
   assert.equal(truncate('hello world', 8), 'hello w…');
+});
+
+test('sessionExists requires an exact session-name match', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-sess-'));
+  const stub = path.join(dir, 'ab-stub');
+  fs.writeFileSync(stub,
+    '#!/usr/bin/env bash\necho \'{"success":true,"data":{"sessions":["herdr-ws-w22","other"]}}\'\n');
+  fs.chmodSync(stub, 0o755);
+  assert.equal(await makeBrowser('herdr-ws-w2', stub).sessionExists(), false,
+    'substring of a listed session must not count');
+  assert.equal(await makeBrowser('herdr-ws-w22', stub).sessionExists(), true);
+  assert.equal(await makeBrowser('other', stub).sessionExists(), true);
 });
 
 test('navigate claims session ownership only when it creates the session', async () => {

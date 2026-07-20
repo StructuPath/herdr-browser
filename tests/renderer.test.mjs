@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   deriveSession, reconcileConsole, consoleTail, pickRenderMode, truncate,
   pngDims, parseSgrMouse, mapClickToPage, sanitizeText, Renderer, makeBrowser,
+  pollDelay,
 } from '../bin/renderer.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -133,6 +134,28 @@ test('mapClickToPage maps clicks and respects letterboxing', () => {
 test('truncate', () => {
   assert.equal(truncate('hello', 10), 'hello');
   assert.equal(truncate('hello world', 8), 'hello w…');
+});
+
+test('pollDelay backs off on idle and caps at 8x', () => {
+  assert.equal(pollDelay(1000, 0), 1000);
+  assert.equal(pollDelay(1000, 9), 1000);
+  assert.equal(pollDelay(1000, 10), 2000);
+  assert.equal(pollDelay(1000, 30), 4000);
+  assert.equal(pollDelay(1000, 60), 8000);
+  assert.equal(pollDelay(1000, 10_000), 8000);
+});
+
+test('intervalMs is clamped: no busy-loop from tiny/negative/garbage values', () => {
+  const mk = v => new Renderer({
+    HERDR_BROWSER_INTERVAL_MS: v,
+    HERDR_BROWSER_SESSION: 'hb-clamp',
+    HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'hb-clamp-')),
+  }).intervalMs;
+  assert.equal(mk('-5'), 250);
+  assert.equal(mk('100'), 250);
+  assert.equal(mk('abc'), 1000);
+  assert.equal(mk(undefined), 1000);
+  assert.equal(mk('2000'), 2000);
 });
 
 test('sessionExists requires an exact session-name match', async () => {

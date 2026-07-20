@@ -81,6 +81,14 @@ export function truncate(s, width) {
   return s.length <= width ? s : s.slice(0, Math.max(0, width - 1)) + '…';
 }
 
+// Poll backoff: each tick spawns 4 agent-browser subprocesses, so a quiet
+// page should not be polled at full rate forever. Any observed change (or
+// user input) resets idleTicks to 0 and restores the base cadence.
+export function pollDelay(baseMs, idleTicks) {
+  const mult = idleTicks < 10 ? 1 : idleTicks < 30 ? 2 : idleTicks < 60 ? 4 : 8;
+  return baseMs * mult;
+}
+
 // Page-controlled text (console lines, titles, URLs) gets written into the
 // user's terminal; strip C0/C1 control chars so a page can't smuggle escape
 // sequences (retitle, clear, OSC 52, kitty graphics) into the session.
@@ -175,7 +183,10 @@ export class Renderer {
     this.shot = path.join(this.stateDir, `shot-${env.HERDR_WORKSPACE_ID || 'default'}.png`);
     this.browser = makeBrowser(this.session);
     this.chafa = spawnSync('sh', ['-c', 'command -v chafa']).status === 0;
-    this.intervalMs = Number(env.HERDR_BROWSER_INTERVAL_MS) || 1000;
+    // Clamp: a tiny or negative interval would busy-loop spawning processes.
+    this.intervalMs = Math.max(250, Number(env.HERDR_BROWSER_INTERVAL_MS) || 1000);
+    this.idleTicks = 0;
+    this.consolePushes = 0;
     this.lastHash = '';
     this.lastUrl = '';
     this.lastTitle = '';
@@ -263,6 +274,7 @@ export class Renderer {
   }
 
   pushConsole(entries, marker) {
+    this.consolePushes += entries.length + (marker ? 1 : 0);
     if (marker) this.consoleLines.push('— console cleared or rotated —');
     for (const e of entries) {
       const prefix = e.type === 'error' ? '✖ '
@@ -417,9 +429,18 @@ export class Renderer {
     this.renderBottom();
   }
 
+  // Everything the poll loop watches, cheap to compare between ticks.
+  // consolePushes is monotonic so console traffic still registers once
+  // consoleLines has hit its 500-line display cap.
+  sig() {
+    return [this.attached, this.banner, this.lastUrl, this.lastTitle,
+      this.lastHash, this.consolePushes].join(' ');
+  }
+
   // User-initiated drive of the shared session: run the action, then refresh
   // immediately instead of waiting for the next poll tick.
   userAction(fn) {
+    this.idleTicks = 0; // interaction restores the base poll cadence
     this.enqueue(async () => {
       try { await fn(); } catch { /* next tick's banner reports failures */ }
     }).then(() => this.enqueue(() => this.tick()));
@@ -496,8 +517,10 @@ export class Renderer {
     }
 
     while (true) {
+      const before = this.sig();
       await this.enqueue(() => this.tick());
-      await new Promise(r => setTimeout(r, this.intervalMs));
+      this.idleTicks = this.sig() === before ? this.idleTicks + 1 : 0;
+      await new Promise(r => setTimeout(r, pollDelay(this.intervalMs, this.idleTicks)));
     }
   }
 }

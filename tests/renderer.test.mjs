@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   deriveSession, reconcileConsole, consoleTail, pickRenderMode, truncate,
-  pngDims, parseSgrMouse, mapClickToPage, sanitizeText,
+  pngDims, parseSgrMouse, mapClickToPage, sanitizeText, Renderer,
 } from '../bin/renderer.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -133,6 +133,22 @@ test('mapClickToPage maps clicks and respects letterboxing', () => {
 test('truncate', () => {
   assert.equal(truncate('hello', 10), 'hello');
   assert.equal(truncate('hello world', 8), 'hello w…');
+});
+
+test('navigate claims session ownership only when it creates the session', async () => {
+  const mk = () => new Renderer({
+    HERDR_BROWSER_SESSION: 'hb-unit',
+    HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'hb-own-')),
+  });
+  const fresh = mk();
+  fresh.browser = { sessionExists: async () => false, open: async () => {} };
+  await fresh.navigate('example.com');
+  assert.equal(fresh.selfCreated, true, 'pane created it: pane owns it');
+
+  const attached = mk();
+  attached.browser = { sessionExists: async () => true, open: async () => {} };
+  await attached.navigate('example.com');
+  assert.equal(attached.selfCreated, false, 'agent created it: never ours');
 });
 
 test('sanitizeText strips escape sequences and control chars from page text', () => {

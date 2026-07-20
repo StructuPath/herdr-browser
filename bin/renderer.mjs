@@ -119,7 +119,17 @@ export function mapClickToPage(col, row, { cols, imageRows, imageTopRow, pngW, p
 function makeBrowser(session, bin = 'agent-browser') {
   const run = async (...args) => {
     const { stdout } = await pExecFile(
-      bin, ['--session', session, ...args, '--json'], { timeout: 10_000 });
+      bin, ['--session', session, ...args, '--json'], {
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          // If this call is the one that spawns the session daemon, the
+          // daemon self-reaps after idle instead of living forever. No-op
+          // for daemons an agent already owns (read at daemon spawn only).
+          AGENT_BROWSER_IDLE_TIMEOUT_MS:
+            process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS || '1800000',
+        },
+      });
     const parsed = JSON.parse(stdout);
     if (parsed.success === false) throw new Error(parsed.error || 'agent-browser error');
     return parsed.data;
@@ -151,7 +161,7 @@ function makeBrowser(session, bin = 'agent-browser') {
 
 // --- renderer main ---
 
-class Renderer {
+export class Renderer {
   constructor(env = process.env) {
     this.env = env;
     this.session = deriveSession(env, process.cwd());
@@ -171,6 +181,7 @@ class Renderer {
     this.failures = 0;
     this.banner = '';
     this.attached = false;
+    this.selfCreated = false;
     this.promptState = null;
     this.paintQueue = Promise.resolve();
   }
@@ -413,6 +424,11 @@ class Renderer {
 
   async navigate(v) {
     const u = /^https?:\/\//.test(v) ? v : `https://${v}`;
+    // If this navigation is what brings the session to life, the pane owns
+    // it and closes it on quit. A session an agent created is never ours.
+    if (!this.selfCreated && !(await this.browser.sessionExists())) {
+      this.selfCreated = true;
+    }
     this.attached = true; // the user is explicitly starting/driving the session
     await this.browser.open(u);
   }
@@ -439,6 +455,14 @@ class Renderer {
 
   cleanup() {
     if (this.mode === 'kitty') process.stdout.write(KITTY_DELETE);
+    if (this.selfCreated) {
+      // The session exists only because the user navigated in this pane;
+      // quitting the pane ends it (and its daemon) instead of leaking it.
+      try {
+        spawnSync('agent-browser', ['--session', this.session, 'close'],
+          { timeout: 8_000 });
+      } catch { /* already gone */ }
+    }
     for (const f of [this.shot, this.shot + '.tmp']) {
       try { fs.unlinkSync(f); } catch { /* already gone */ }
     }

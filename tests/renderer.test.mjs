@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   deriveSession, reconcileConsole, consoleTail, pickRenderMode, truncate,
-  pngDims, parseSgrMouse, mapClickToPage,
+  pngDims, parseSgrMouse, mapClickToPage, sanitizeText,
 } from '../bin/renderer.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -133,4 +133,12 @@ test('mapClickToPage maps clicks and respects letterboxing', () => {
 test('truncate', () => {
   assert.equal(truncate('hello', 10), 'hello');
   assert.equal(truncate('hello world', 8), 'hello w…');
+});
+
+test('sanitizeText strips escape sequences and control chars from page text', () => {
+  assert.equal(sanitizeText('\x1b]0;PWNED\x07evil\x1b[2J'), ']0;PWNEDevil[2J');
+  assert.equal(sanitizeText('\x1b_Ga=T\x1b\\x'), '_Ga=T\\x');
+  assert.equal(sanitizeText('a\tb\r\nc\x7f\u009bd'), 'a bcd');
+  assert.equal(sanitizeText('plain — unicode ✓ stays'), 'plain — unicode ✓ stays');
+  assert.equal(sanitizeText(123), '123');
 });

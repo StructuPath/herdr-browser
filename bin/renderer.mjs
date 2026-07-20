@@ -81,6 +81,13 @@ export function truncate(s, width) {
   return s.length <= width ? s : s.slice(0, Math.max(0, width - 1)) + '…';
 }
 
+// Page-controlled text (console lines, titles, URLs) gets written into the
+// user's terminal; strip C0/C1 control chars so a page can't smuggle escape
+// sequences (retitle, clear, OSC 52, kitty graphics) into the session.
+export function sanitizeText(s) {
+  return String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, ch => (ch === '\t' ? ' ' : ''));
+}
+
 export function pngDims(buf) {
   if (buf.length < 24 || buf.readUInt32BE(12) !== 0x49484452) return null; // IHDR
   return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
@@ -246,7 +253,8 @@ class Renderer {
     for (const e of entries) {
       const prefix = e.type === 'error' ? '✖ '
         : (e.type === 'warn' || e.type === 'warning') ? '⚠ ' : '  ';
-      this.consoleLines.push(prefix + (e.text ?? ''));
+      // Sanitize the display copy only — reconcile matching needs raw texts.
+      this.consoleLines.push(prefix + sanitizeText(e.text ?? ''));
     }
     if (this.consoleLines.length > 500) {
       this.consoleLines = this.consoleLines.slice(-500);
@@ -272,8 +280,8 @@ class Renderer {
       const [url, title, entries] = await Promise.all([
         this.browser.url(), this.browser.title(), this.browser.console(),
       ]);
-      this.lastUrl = url;
-      this.lastTitle = title;
+      this.lastUrl = sanitizeText(url);
+      this.lastTitle = sanitizeText(title);
       const { newEntries, marker } = reconcileConsole(this.consoleState, entries);
       if (newEntries.length || marker) {
         this.pushConsole(newEntries, marker);

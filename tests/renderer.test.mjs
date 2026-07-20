@@ -170,6 +170,28 @@ test('sessionExists requires an exact session-name match', async () => {
   assert.equal(await makeBrowser('other', stub).sessionExists(), true);
 });
 
+test('navigate accepts only http(s), banners anything else, never opens it', async () => {
+  const r = new Renderer({
+    HERDR_BROWSER_SESSION: 'hb-nav',
+    HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'hb-nav-')),
+  });
+  const opened = [];
+  r.browser = { sessionExists: async () => true, open: async u => opened.push(u) };
+  r.header = () => {};
+  await r.navigate('example.com');
+  await r.navigate('HTTP://caps.example');
+  await r.navigate('localhost:3000');
+  assert.deepEqual(opened,
+    ['https://example.com', 'HTTP://caps.example', 'https://localhost:3000']);
+  for (const bad of ['not a url at all //', 'file:///etc/passwd',
+    'ftp://host/x', 'javascript:alert(1)']) {
+    r.banner = '';
+    await r.navigate(bad);
+    assert.equal(opened.length, 3, `must not reach the browser: ${bad}`);
+    assert.match(r.banner, /not an http\(s\) URL/);
+  }
+});
+
 test('navigate claims session ownership only when it creates the session', async () => {
   const mk = () => new Renderer({
     HERDR_BROWSER_SESSION: 'hb-unit',

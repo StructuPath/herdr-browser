@@ -447,7 +447,22 @@ export class Renderer {
   }
 
   async navigate(v) {
-    const u = /^https?:\/\//.test(v) ? v : `https://${v}`;
+    // Same policy as the launchers' validate_url: plain http(s) only, and
+    // tell the user why nothing happened instead of failing silently.
+    // An explicit non-http scheme:// must be refused before prefixing —
+    // "https://file:///x" parses as a valid https URL with host "file".
+    // Bare host:port (localhost:3000) stays allowed. Schemes without //
+    // (javascript:, mailto:) end up as a non-numeric port and fail parsing.
+    const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(v);
+    const u = /^https?:\/\//i.test(v) ? v : `https://${v}`;
+    let parsed;
+    try { parsed = new URL(u); } catch { parsed = null; }
+    if ((explicitScheme && !/^https?:\/\//i.test(v))
+        || !parsed || !['http:', 'https:'].includes(parsed.protocol)) {
+      this.banner = `not an http(s) URL: ${truncate(v, 48)}`;
+      this.header();
+      return;
+    }
     // If this navigation is what brings the session to life, the pane owns
     // it and closes it on quit. A session an agent created is never ours.
     if (!this.selfCreated && !(await this.browser.sessionExists())) {

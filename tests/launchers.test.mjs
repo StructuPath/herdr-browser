@@ -1,6 +1,6 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -51,6 +51,7 @@ if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
   echo '{"id":"cli:pane:list","result":{"panes":[{"agent_status":"unknown","label":"Browser","pane_id":"w9:p9","tab_id":"w9:t1","workspace_id":"w9"},{"agent":"claude","agent_status":"idle","pane_id":"w9:p4","tab_id":"w9:t1","terminal_title":"claude","workspace_id":"w9"}],"type":"pane_list"}}'
 fi
 if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
+  [ -n "\${STUB_OPEN_SLEEP:-}" ] && sleep "\$STUB_OPEN_SLEEP"
   if [ -n "\${STUB_PRETTY:-}" ]; then
     printf '{\\n  "result": {\\n    "plugin_pane": {"pane": {"pane_id": "w9:p7"}}\\n  }\\n}\\n'
   else
@@ -117,6 +118,34 @@ test('pretty-printed pane-open output still records the pane id', () => {
   assert.equal(r.status, 0, r.stderr);
   assert.equal(
     fs.readFileSync(path.join(stateDir, 'pane-id-w9'), 'utf8').trim(), 'w9:p7');
+});
+
+test('concurrent opens are serialized: one pane opens, the other focuses it', async () => {
+  fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
+  fs.rmSync(path.join(stateDir, 'open-lock-w9'), { recursive: true, force: true });
+  // Slow pane-open keeps invoke A inside the critical section while B waits;
+  // pane read reports alive so B takes the focus path once A has tracked it.
+  const env = freshEnv({ STUB_OPEN_SLEEP: '0.5', STUB_PANE_ALIVE: '0' });
+  const runAsync = () => new Promise(resolve => {
+    const c = spawn('bash', [path.join(repoRoot, 'scripts', 'open.sh')], { env });
+    c.on('close', code => resolve(code));
+  });
+  const [a, b] = await Promise.all([runAsync(), runAsync()]);
+  assert.equal(a, 0);
+  assert.equal(b, 0);
+  const l = log();
+  assert.equal(l.match(/plugin pane open/g).length, 1, 'exactly one pane opened');
+  assert.match(l, /plugin pane focus w9:p7/);
+  assert.equal(fs.existsSync(path.join(stateDir, 'open-lock-w9')), false, 'lock released');
+});
+
+test('a stale lock from a crashed opener is stolen, not waited on forever', () => {
+  fs.rmSync(path.join(stateDir, 'pane-id-w9'), { force: true });
+  fs.mkdirSync(path.join(stateDir, 'open-lock-w9'), { recursive: true });
+  const r = runScript('open.sh', [], freshEnv({ HERDR_BROWSER_LOCK_TRIES: '3' }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(log(), /plugin pane open/);
+  assert.equal(fs.existsSync(path.join(stateDir, 'open-lock-w9')), false, 'lock released');
 });
 
 test('close removes only this workspace screenshot cache', () => {

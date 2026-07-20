@@ -25,6 +25,21 @@ if [ -n "$url" ]; then
   fi
 fi
 
+# Serialize concurrent opens: two invokes racing past the liveness check
+# would each open a pane (herdr pane open is not idempotent). mkdir is the
+# portable atomic lock; after ~5s of waiting the holder is presumed dead and
+# the lock is stolen — a duplicate pane beats an open action that never acts.
+lock="$(state_dir)/open-lock-${HERDR_WORKSPACE_ID:-default}"
+tries=0
+until mkdir "$lock" 2>/dev/null; do
+  tries=$((tries + 1))
+  if [ "$tries" -gt "${HERDR_BROWSER_LOCK_TRIES:-50}" ]; then
+    rm -rf "$lock"
+  fi
+  sleep 0.1
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+
 pidfile="$(pane_id_file)"
 existing=""
 [ -f "$pidfile" ] && existing="$(cat "$pidfile")"

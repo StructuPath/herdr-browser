@@ -1,15 +1,50 @@
 # herdr-browser
 
-A driveable browser pane for [Herdr](https://herdr.dev). Open a URL from an
-action or a Ctrl+click on a localhost link, and get a live view of a headless
-Chrome session inside a Herdr pane: screenshot, URL/title, and streaming
-console output. Screenshots render as real pixels via the Kitty graphics
-protocol, with an ANSI fallback everywhere else.
+A drivable browser pane for [Herdr](https://herdr.dev), built around
+[agent-browser](https://github.com/vercel-labs/agent-browser).
 
-Built for the agent workflow: when a coding agent drives
-[agent-browser](https://github.com/vercel-labs/agent-browser) in one pane, this
-plugin gives you a live human-visible view of the same browser session in
-another — without touching the agent's page state.
+When a coding agent drives Chrome in one pane, herdr-browser gives you a live,
+human-visible view of that same session in another. You can inspect the page,
+watch console output and page errors, click real browser coordinates, type,
+scroll, navigate, and record the flow without leaving Herdr.
+
+## Highlights
+
+- **Shared agent sessions** — one isolated browser session per Herdr workspace.
+- **Live push streaming** — frames, URL/title changes, console messages, and
+  page errors arrive over WebSocket, with transparent polling fallback.
+- **Pane-aware layout** — the browser viewport fits the pane without stretching
+  or changing its responsive width; the console opens only when output exists.
+- **Real interaction** — clicks use Chrome mouse events rather than DOM selector
+  guesses; keyboard input, history, reload, and wheel scrolling are supported.
+- **Adaptive rendering** — Kitty graphics when available, ANSI symbols through
+  chafa otherwise, and a text-only last resort.
+- **Built-in recording** — capture the workspace session as WebM.
+- **Localhost integration** — Cmd/Ctrl+click a local development URL in Herdr to
+  open it in the workspace browser pane.
+
+## Requirements
+
+| Component | Requirement | Notes |
+| --- | --- | --- |
+| Herdr | `>= 0.7.0` | Tested with Herdr 0.7.4 |
+| Node.js | `>= 20` | Node 22+ enables live WebSocket streaming |
+| agent-browser | Required | Tested with agent-browser 0.28.x |
+| chafa | Optional | ANSI rendering and streamed JPEGs in Kitty mode |
+| carbonyl | Optional | Only required for the separate interactive Browse action |
+
+Install the browser engine:
+
+```sh
+npm install -g agent-browser
+agent-browser install
+```
+
+For ANSI image rendering on macOS:
+
+```sh
+brew install chafa
+```
 
 ## Install
 
@@ -17,33 +52,39 @@ another — without touching the agent's page state.
 herdr plugin install StructuPath/herdr-browser
 ```
 
-### Prerequisites
+For development from a local checkout:
 
-- **agent-browser** — the browser engine (daemon-backed headless Chrome):
+```sh
+git clone https://github.com/StructuPath/herdr-browser
+cd herdr-browser
+herdr plugin link .
+```
 
-  ```sh
-  npm install -g agent-browser && agent-browser install
-  ```
+## Quick start
 
-- **chafa** — renders screenshots into the terminal in `symbols` mode
-  (optional; `kitty` mode transmits the PNG directly and `text` mode needs
-  nothing):
+Open the viewer from the CLI:
 
-  ```sh
-  brew install chafa        # macOS
-  ```
+```sh
+herdr plugin action invoke structupath.browser.open
+```
 
-- **Node.js >= 20** on your PATH (the pane renderer).
+With no URL, **Open** creates the pane without creating or navigating a browser
+session. Start agent-browser with the session name shown in the pane header:
 
-Tested against herdr 0.7.4 and agent-browser 0.28.x.
+```sh
+# Replace this example with the exact session shown in the pane header.
+agent-browser --session herdr-ws-w123456 open http://localhost:3000
+```
 
-## Usage
+You can also press `u` inside the pane and enter a URL, or Cmd/Ctrl+click a
+localhost URL printed in another Herdr pane.
 
-The plugin ships two actions (Herdr plugins cannot ship default keybindings —
-add your own):
+### Optional keybinding
+
+Herdr plugins do not install default keybindings. Add one to
+`~/.config/herdr/config.toml`:
 
 ```toml
-# ~/.config/herdr/config.toml
 [[keys.command]]
 key = "prefix+b"
 type = "plugin_action"
@@ -51,56 +92,75 @@ command = "structupath.browser.open"
 description = "browser pane"
 ```
 
-- **Open** (`structupath.browser.open`) — with no URL (the keybinding/invoke
-  path), attaches the pane **view-only** to this workspace's browser session
-  without navigating it. With a URL (the link-click path), navigates first.
-- **Close** (`structupath.browser.close`) — closes the pane and ends this
-  workspace's browser session.
-- **Localhost links** — a modified click (Cmd/Ctrl+click) on any
-  `http://localhost:PORT`, `127.0.0.1`, or `[::1]` URL printed in a Herdr pane
-  opens it in the browser pane instead of your system browser. Plain clicks
-  keep their default behavior.
-- **Browse** (`structupath.browser.browse`) — an *interactive* browser pane
-  via [carbonyl](https://github.com/fathyb/carbonyl) (Chromium rendered into
-  the terminal: mouse, scrolling, typing all work). With no URL it prompts —
-  an address bar in a pane. Requires `npm install -g carbonyl@next`. This is a
-  personal browser with its own Chromium; it does not share the agent's
-  session — use the viewer pane (Open) for that. Note: carbonyl is dormant
-  (last release 2023) and bundles an old Chromium — keep it to localhost dev
-  pages, not general web browsing.
-- **Record** (`structupath.browser.record-start` / `.record-stop`) — record the
-  workspace session to a WebM video under the plugin state dir's
-  `recordings/`. Starting a recording creates a fresh browser context (the
-  page reloads; cookies and localStorage are preserved), so start before the
-  flow you want to capture.
+## Actions
+
+The plugin registers five actions:
+
+| Action | ID | Behavior |
+| --- | --- | --- |
+| Open browser pane | `structupath.browser.open` | Attach view-only with no URL, or navigate when invoked by a link handler |
+| Close browser session and pane | `structupath.browser.close` | Close every browser pane in the workspace and end its session |
+| Browse interactively | `structupath.browser.browse` | Open a separate Carbonyl browser in a zoomed pane |
+| Start session recording | `structupath.browser.record-start` | Begin WebM recording for the workspace session |
+| Stop session recording | `structupath.browser.record-stop` | Finish the active recording |
+
+The localhost link handler accepts only `http://` or `https://` URLs for
+`localhost`, `127.0.0.1`, or `[::1]`. A modified click opens the URL in the
+browser pane; an ordinary click keeps Herdr's default behavior.
+
+### Interactive Browse action
+
+The Browse action uses [Carbonyl](https://github.com/fathyb/carbonyl), a
+separate terminal-rendered Chromium with native mouse and keyboard support:
+
+```sh
+npm install -g carbonyl@next
+```
+
+Carbonyl does **not** share the coding agent's browser session. Use the
+standard Open action whenever you need to observe or drive the same session as
+your coding agent.
 
 ## Viewer controls
 
-The viewer pane is passive until you act; every action below drives the
-shared session directly (your agent sees the same browser state):
+Use these controls to drive the shared session directly:
 
 | Input | Action |
-| ------- | -------- |
-| `u` | address bar — type any URL, Enter to go (`https://` assumed) |
-| click on the screenshot | clicks the real page at that spot (real Chrome mouse events) |
-| `i` | type text into the focused element |
-| `b` / `f` | history back / forward |
-| `r` | reload |
-| `j` / `k` / space | scroll down / up |
-| mouse wheel | scrolls the page |
-| `q` | close the pane (session keeps running) |
+| --- | --- |
+| `u` | Open the address prompt; `https://` is assumed when omitted |
+| Click the screenshot | Send real Chrome mouse move/down/up events at that page coordinate |
+| `i` | Type into the currently focused page element |
+| `b` / `f` | Navigate backward / forward |
+| `r` | Reload |
+| `j` / `k` | Scroll down / up |
+| Space | Scroll down |
+| Mouse wheel | Scroll the page |
+| `Esc` | Cancel the active prompt |
+| `q` | Close the viewer pane |
 
-Clicks map through the screenshot geometry to page coordinates and are sent
-as real CDP mouse press/release events, so what you click is what Chrome
-clicks — overlays, canvas targets, and shadow DOM included. Expect roughly a
-one-second round trip per interaction — this is browsing-by-snapshot, built
-for dev verification, not for reading Twitter.
+Clicks are mapped through the rendered-frame geometry to page pixels, so they
+work with overlays, canvas content, and shadow DOM. Live sessions usually
+repaint immediately; polling fallback can take up to the configured interval.
 
-## Real-pixel screenshots (optional)
+## Rendering and streaming
 
-By default screenshots render as ANSI half-blocks. For real pixels, enable
-Herdr's experimental Kitty graphics support (requires a Kitty-graphics-capable
-outer terminal — Ghostty, Kitty, WezTerm):
+### Automatic mode selection
+
+The renderer probes the terminal at startup and selects the strongest usable
+mode:
+
+| Mode | Behavior |
+| --- | --- |
+| `kitty` | Real-pixel graphics; polling PNGs are transmitted directly |
+| `symbols` | Screenshot rendered as ANSI symbols through chafa |
+| `text` | URL, title, status, and console output without an image |
+
+Live-stream frames are JPEG. Kitty terminals therefore use chafa for live
+frames; when chafa is unavailable, the renderer keeps the direct-PNG polling
+path instead of sending an unsupported image format.
+
+To enable Herdr's experimental Kitty graphics support in Ghostty, Kitty, or
+WezTerm:
 
 ```toml
 # ~/.config/herdr/config.toml
@@ -108,86 +168,140 @@ outer terminal — Ghostty, Kitty, WezTerm):
 kitty_graphics = true
 ```
 
-Then `herdr server reload-config`. The renderer probes for support at pane
-start and picks the best mode automatically; override with the `render` config
-(see below) or `HERDR_BROWSER_RENDER=kitty|symbols|text`.
-
-## Live stream (automatic upgrade)
-
-On Node >= 22 with agent-browser >= 0.23, the pane upgrades from polling to
-the session's push stream: screencast frames arrive when the page actually
-changes (instead of once a second), console entries and page errors appear
-instantly, and the poll loop drops to a slow liveness watch. If the stream
-is unavailable (older Node, older agent-browser, or a dropped socket) the
-pane falls back to polling transparently — there is nothing to configure.
-
-The renderer preserves the session's current viewport width (and therefore its
-responsive breakpoint), then fits only the viewport height to the pane's image
-region on attach and resize. The page fills that region without stretching. The console region stays
-collapsed while the page is quiet and opens only when console output or a
-page error arrives.
-
-## The session model
-
-Each Herdr workspace gets its own browser session, named `herdr-ws-<id>`. The
-pane is a **passive viewer**: it never navigates, never clears the console,
-and never kills the session — closing the pane leaves the browser running for
-whatever agent is using it. Cleanup is the Close action, or agent-browser's
-idle timeout (`AGENT_BROWSER_IDLE_TIMEOUT_MS`, disabled by default).
-
-To watch the session your coding agent is actually using, either tell the
-agent to use the workspace session:
-
-> run agent-browser with `--session herdr-ws-<id>` (the pane header shows the
-> exact name)
-
-or point the pane at the agent's session by writing the session name to the
-plugin config:
+Then reload Herdr:
 
 ```sh
-echo "my-agents-session" > "$(herdr plugin config-dir structupath.browser)/session"
+herdr server reload-config
 ```
 
-Config files (one value per line, in the plugin config dir):
+### Live stream with polling fallback
 
-| File      | Values                    | Meaning                          |
-|-----------|---------------------------|----------------------------------|
-| `session` | any agent-browser session | watch this session instead       |
-| `render`  | `kitty` `symbols` `text`  | force a render mode              |
+On Node 22+ with a compatible agent-browser, the pane connects to the local
+session stream. Frames arrive only when the page changes, while the polling
+loop becomes a low-frequency liveness check.
 
-## Privacy note
+The pane falls back automatically when WebSocket support is unavailable, the
+stream disconnects, or the selected renderer cannot display streamed JPEGs.
+No feature flag is required.
 
-The pane caches the latest screenshot (and nothing else) as a PNG in Herdr's
-plugin state dir, `chmod 600`, deleted when the pane closes. If your agent
-browses authenticated pages, that content is visible in the pane and briefly
-on disk — treat screen shares accordingly.
+### Pane fitting
 
-Browser sessions are shared by name on the local machine: any local process
-(including an agent in another workspace) that knows the session name can
-drive it, including authenticated pages. Treat session names as a trusted
-local boundary, and use the Close action when a session holds logged-in
-state you no longer need.
+On attach and pane resize, herdr-browser preserves the session's current
+viewport width—and therefore its responsive breakpoint—while fitting only the
+height to the pane's image area. The frame fills that area without stretching.
+
+On a quiet page, the image uses all rows between the header and controls. The
+console region appears only after a console message or page error arrives; the
+viewport then refits to the remaining image area.
+
+## Session model
+
+By default, each Herdr workspace uses:
+
+```text
+herdr-ws-<workspace-id>
+```
+
+This prevents browser state from leaking between workspaces. The exact session
+name appears in the viewer header.
+
+- Opening the pane without a URL does not create a browser session.
+- A session that already existed remains owned by the agent or caller.
+- A session created from the viewer's `u` prompt is owned by that viewer and is
+  closed with it so the browser daemon is not leaked.
+- The **Close** action always ends the workspace session and closes its browser
+  panes.
+- Plugin-created browser daemons default to a 30-minute idle timeout.
+
+To watch a differently named agent-browser session, write its name to the
+plugin configuration directory:
+
+```sh
+echo "my-agent-session" \
+  > "$(herdr plugin config-dir structupath.browser)/session"
+```
+
+## Recording
+
+Start and stop recording through the two recording actions. Files are written
+to:
+
+```text
+<Herdr plugin state>/recordings/herdr-ws-<id>-YYYYMMDD-HHMMSS.webm
+```
+
+Starting a recording creates a fresh browser context: the page reloads, while
+cookies and localStorage are preserved. Start recording before the flow you
+want to capture. Recordings persist until you delete them.
+
+## Configuration
+
+Plugin config files contain one value on their first line:
+
+| File | Values | Default | Purpose |
+| --- | --- | --- | --- |
+| `session` | Session name | `herdr-ws-<workspace-id>` | Watch a different agent-browser session |
+| `render` | `kitty`, `symbols`, `text` | Automatic probe | Force a rendering mode |
+
+Equivalent environment controls:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HERDR_BROWSER_SESSION` | Workspace session | Override the watched session |
+| `HERDR_BROWSER_RENDER` | Automatic probe | Override the rendering mode |
+| `HERDR_BROWSER_INTERVAL_MS` | `1000` | Polling interval; clamped to safe bounds |
+| `AGENT_BROWSER_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for plugin-created browser daemons |
+
+Environment variables take precedence over config files.
+
+## Security and privacy
+
+- Navigation accepts only `http://` and `https://` URLs and rejects embedded
+  credentials and flag-like values.
+- Workspace identifiers are sanitized before they are used in state paths.
+- Polling frames are cached as PNG; streamed frames are cached as JPEG. Frame
+  files are mode `0600` and removed when the pane exits.
+- WebM recordings are intentionally retained under the plugin state directory.
+- Browser sessions are a trusted local boundary: any local process that knows a
+  session name can drive it, including authenticated pages.
+
+If an agent browses sensitive or authenticated content, that content is visible
+in the pane and briefly present in its cached frame. Treat screen sharing and
+recordings accordingly, and use the Close action when the session is no longer
+needed.
 
 ## Troubleshooting
 
-- **Pane says "agent-browser is not installed"** — install the engine:
+- **`agent-browser is not installed`** — run
   `npm install -g agent-browser && agent-browser install`.
-- **Pane says "session … is not running"** — nothing has started that
-  workspace's browser yet. Invoke Open with a URL, click a localhost link, or
-  have your agent use the session name in the header.
-- **Text-only mode** — chafa isn't installed and your terminal doesn't
-  support Kitty graphics (`brew install chafa` for symbols mode).
-- **No image, garbled block art** — your outer terminal doesn't support Kitty
-  graphics; the renderer should fall back to `symbols` automatically. Force it:
+- **`session … is not running`** — open a URL with `u`, click a localhost link,
+  or start agent-browser with the session shown in the pane header.
+- **Text-only mode** — install chafa or enable Kitty graphics in a compatible
+  outer terminal.
+- **No image or garbled symbols** — force symbols mode:
   `echo symbols > "$(herdr plugin config-dir structupath.browser)/render"`.
-- **Plugin logs** — `herdr plugin log list --plugin structupath.browser`.
+- **Space below the image** — console output has opened the console region.
+  Pages that have emitted no console output automatically give those rows to
+  the browser.
+- **Changes are not visible after updating a linked plugin** — close and reopen
+  the Browser pane so its renderer process loads the new code.
+- **Plugin action failures** — inspect:
+  `herdr plugin log list --plugin structupath.browser`.
 
 ## Development
 
 ```sh
 git clone https://github.com/StructuPath/herdr-browser
-herdr plugin link ./herdr-browser
+cd herdr-browser
 npm test
+shellcheck scripts/*.sh
+herdr plugin link .
 ```
+
+`npm test` includes unit, launcher, security, rendering, input, recording, and
+live-stream coverage. The real agent-browser integration test skips when its
+engine is unavailable.
+
+## License
 
 MIT © StructuPath

@@ -1,0 +1,127 @@
+{
+  "runId": "fd9c841e-cabf-4640-8e19-05b38d7546f3",
+  "agent": "ce-correctness-reviewer",
+  "task": "Review /Users/vics/dev/structupath/herdr-browser for logic errors, edge cases, state bugs, and error-propagation failures. Context: herdr-browser is a Herdr terminal-multiplexer plugin — a driveable browser pane. bin/renderer.mjs (~551 lines, Node>=20, ES module) is a TUI renderer that polls agent-browser (daemon-backed headless Chrome) for screenshots/URL/title/console output and renders into the terminal via Kitty graphics or ANSI half-blocks (via chafa), maps mouse clicks back to page coordinates, has an address bar, scroll, history nav. scripts/*.sh implement plugin actions (open.sh, close.sh, browse.sh, browse-pane.sh, pane.sh, lib.sh shared helpers). herdr-plugin.toml is the manifest. tests/*.mjs are node:test suites (57 tests, currently passing — run `npm test` to confirm). Read every file fully (use offset/limit reads). Hunt: off-by-one geometry math in click mapping, race conditions between poll loop and user input, partial/corrupt PNG handling, session-name derivation mismatches between bash and JS, process cleanup on signals, integer parsing of env vars, escape-sequence sanitization completeness. Report concrete findings as P0 (correctness bug users will hit), P1 (edge case), P2 (nit), each with file:line, a one-line explanation, and a suggested fix. Do NOT edit any files — report only.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "moonshotai/kimi-k3",
+  "attemptedModels": [
+    "moonshotai/kimi-k3"
+  ],
+  "modelAttempts": [
+    {
+      "model": "moonshotai/kimi-k3",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 79325,
+        "output": 40944,
+        "cacheRead": 1455104,
+        "cacheWrite": 0,
+        "cost": 1.2886662,
+        "turns": 33
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Returned 15 concrete findings with file:line, severity (5x P1, 10x P2, no P0), one-line explanations, and suggested fixes in the findings JSON above; key suspicions verified empirically (chafa alignment, setTimeout overflow, literal-tilde dir creation)"
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "npm test",
+          "result": "passed",
+          "summary": "57/57 tests pass (node --test), confirming the review baseline"
+        },
+        {
+          "command": "chafa -f symbols -s 40x20 --animate off --probe off spike-out/test.png",
+          "result": "passed",
+          "summary": "Verified chafa 1.18.2 top-left alignment and row-count behavior — mapClickToPage geometry assumption is correct"
+        },
+        {
+          "command": "node -e 'setTimeout(..., 300000000 * 8)'",
+          "result": "passed",
+          "summary": "Confirmed delay > 2^31-1 triggers TimeoutOverflowWarning and fires in ~1ms (substantiates P2-1 busy-loop)"
+        },
+        {
+          "command": "HERDR_PLUGIN_STATE_DIR='~/.local/state/x' bash -c 'mkdir -p \"$d\"' in mktemp dir",
+          "result": "passed",
+          "summary": "Confirmed literal-~ env value creates ./~ tree under cwd (substantiates P1-5; matching artifact already present in repo)"
+        }
+      ],
+      "validationOutput": [
+        "npm test: tests 57, pass 57, fail 0, duration ~1.5s",
+        "git status --porcelain: only pre-existing .pi-subagents artifact modifications from the review fanout runtime; zero source files touched"
+      ],
+      "residualRisks": [
+        "chafa kitty-format (-f kitty) placement/alignment unverifiable without a kitty terminal; click mapping could skew if chafa defaults change",
+        "elementFromPoint assumes screenshot DPR=1; agent-browser deviceScaleFactor drift would offset all clicks",
+        "agent-browser and herdr 0.7.x JSON schemas are assumed; drift fails soft (waiting banner / unparsed pane id) rather than loud",
+        "reconcileConsole can skip new entries under pathological duplicate-log streams until the next clear/rotation marker"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "No diff — report-only review; no files edited, no tests added.",
+      "reviewFindings": [
+        "no blockers (no P0s)",
+        "P1: scripts/open.sh:34-41 - stolen pane-open lock has no ownership token; holder's EXIT trap and unreset steal counter allow duplicate panes",
+        "P1: bin/renderer.mjs:468-470 - selfCreated set before open() succeeds; failed navigate then quit can close an agent-owned session",
+        "P1: bin/renderer.mjs:544-549 - crash path never restores raw mode or disables mouse reporting; 10-minute linger in broken terminal state",
+        "P1: bin/renderer.mjs:360,416-431 - latin1 stdin decoding deterministically corrupts all non-ASCII prompt/type input to mojibake",
+        "P1: scripts/lib.sh:8-12 + bin/renderer.mjs:178-183 - literal '~' in HERDR_PLUGIN_STATE_DIR creates ./~ state tree under cwd; evidence artifact present in repo",
+        "P2 x10: setTimeout overflow from unclamped interval env (187,538); symbols-mode stale frame rows (256-269); unsanitized session name + bidi chars in header (231-234); cksum fallback hashes plugin root / JS-bash cwd mismatch (lib.sh:35); split/coalesced stdin chunks drop clicks/keys (393-410); non-numeric LOCK_TRIES infinite wait (open.sh:36); no PNG signature/IEND validation before promotion (104-106,318-330); browse-pane whitespace/zoom validation (17-28); truncate() cell-width miscount (91-93); clicks active during prompt + 8s blocking quit (393-397,500-502)"
+      ],
+      "manualNotes": "Click-mapping geometry was explicitly cleared: chafa 1.18.2 default alignment is top-left (verified by rendering spike-out/test.png into a mismatched box), and mapClickToPage's half-cell math inverts chafa's fit correctly including letterbox rejection. The stray ./~/.local/... directory in the repo root is real evidence of finding P1-5 and should be deleted. Testing gaps and residual risks are itemized in the findings JSON."
+    }
+  },
+  "transcriptPath": "/Users/vics/dev/structupath/herdr-browser/.pi-subagents/artifacts/fd9c841e-cabf-4640-8e19-05b38d7546f3_ce-correctness-reviewer_0_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1784696302042
+}

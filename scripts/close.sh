@@ -60,7 +60,7 @@ fi
 sd="$(state_dir)"
 ws="$(ws_id)"
 rm -f "$sd/shot-$ws.png" "$sd/shot-$ws.png.tmp" "$sd/shot-$ws.png".*.tmp \
-  "$sd/shot-$ws.jpg" "$sd/shot-$ws.jpg".*.tmp
+	"$sd/shot-$ws.jpg" "$sd/shot-$ws.jpg".*.tmp
 
 # Surfaces in `herdr plugin log list` — close must never fail silently again.
 echo "herdr-browser: closed $closed pane(s); session $session released"

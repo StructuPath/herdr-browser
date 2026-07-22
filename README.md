@@ -68,6 +68,11 @@ description = "browser pane"
   session — use the viewer pane (Open) for that. Note: carbonyl is dormant
   (last release 2023) and bundles an old Chromium — keep it to localhost dev
   pages, not general web browsing.
+- **Record** (`structupath.browser.record.start` / `.stop`) — record the
+  workspace session to a WebM video under the plugin state dir's
+  `recordings/`. Starting a recording creates a fresh browser context (the
+  page reloads; cookies and localStorage are preserved), so start before the
+  flow you want to capture.
 
 ## Viewer controls
 
@@ -82,6 +87,7 @@ shared session directly (your agent sees the same browser state):
 | `b` / `f` | history back / forward |
 | `r` | reload |
 | `j` / `k` / space | scroll down / up |
+| mouse wheel | scrolls the page |
 | `q` | close the pane (session keeps running) |
 
 Clicks map through the screenshot geometry to page coordinates and are sent

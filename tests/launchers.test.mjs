@@ -535,3 +535,16 @@ test("browse-pane clamps zoom to 25..500 with 100 as the garbage default", () =>
 	assert.match(run("999999\n"), /--zoom=500/);
 	assert.match(run("5\n"), /--zoom=25/);
 });
+
+// --- Wave 2c: record action ---
+
+test('record start/stop drive the workspace session and name the file', () => {
+  const start = runScript('record.sh', ['start']);
+  assert.equal(start.status, 0, start.stderr);
+  assert.match(log(), /agent-browser --session herdr-ws-w9 record start .*\/recordings\/herdr-ws-w9-.*\.webm/);
+  assert.match(start.stdout, /recording to .*\.webm/);
+  const stop = runScript('record.sh', ['stop']);
+  assert.equal(stop.status, 0, stop.stderr);
+  assert.match(log(), /agent-browser --session herdr-ws-w9 record stop/);
+  assert.equal(runScript('record.sh', ['bogus']).status, 2);
+});

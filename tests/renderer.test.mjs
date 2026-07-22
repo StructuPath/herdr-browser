@@ -1247,3 +1247,53 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 		await ab(["close"]).catch(() => {});
 	}
 });
+
+// --- Wave 2c: wheel scroll, header repaint gating ---
+
+test('mouse wheel scrolls the page, click still clicks', async () => {
+  const r = quiet(mkRenderer());
+  r.attached = true;
+  r.size = () => ({ cols: 100, rows: 37, imageRows: 30, consoleRows: 7, imageTopRow: 3, bottomRow: 37 });
+  fs.writeFileSync(r.shot, PNG_1PX);
+  const scrolls = [];
+  const clicks = [];
+  r.browser = {
+    scroll: async dir => scrolls.push(dir),
+    click: async (x, y) => clicks.push([x, y]),
+  };
+  r.feed('\x1b[<64;50;10M'); // wheel up
+  r.feed('\x1b[<65;50;10M'); // wheel down
+  r.feed('\x1b[<64;50;10m'); // wheel release: never an action
+  await flush();
+  assert.deepEqual(scrolls, ['up', 'down']);
+  assert.equal(clicks.length, 0, 'wheel reports never reach clickAt');
+  r.feed('\x1b[<0;10;5M');
+  await flush();
+  assert.equal(clicks.length, 1);
+});
+
+test('header is repaint-gated but always paints real changes', () => {
+  const r = quiet(mkRenderer());
+  r.mode = 'symbols';
+  // Restore the real header (quiet() stubs it); capture writes.
+  const realHeader = Object.getPrototypeOf(r).header.bind(r);
+  const writes = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = s => { writes.push(s); return true; };
+  try {
+    realHeader();
+    const first = writes.length;
+    assert.ok(first > 0, 'first paint writes');
+    realHeader();
+    assert.equal(writes.length, first, 'identical header is not rewritten');
+    r.banner = 'something changed';
+    realHeader();
+    assert.ok(writes.length > first, 'a banner change repaints');
+    const afterBanner = writes.length;
+    r.openPrompt('URL: ', () => {});
+    realHeader();
+    assert.ok(writes.length > afterBanner, 'prompt-open repaints (help -> prompt line)');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+});

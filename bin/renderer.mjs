@@ -540,6 +540,7 @@ export class Renderer {
 			process.stdout.write(
 				`${ESC}[1;1H${truncate(" terminal too small", cols)}${ESC}[K`,
 			);
+			this.lastHeaderSig = null; // force a repaint once we fit again
 			return;
 		}
 		const line1 = truncate(
@@ -554,6 +555,11 @@ export class Renderer {
 					` ${this.lastUrl}${this.lastTitle ? "  —  " + this.lastTitle : ""}${blankHint}`,
 					cols,
 				);
+		// Repaint-gating: the poll loop calls header() every tick; skip the
+		// writes entirely when nothing visible changed.
+		const headerSig = `${line1}\n${line2}\n${this.promptState ? `${this.promptState.label}${this.promptState.value}` : "-"}`;
+		if (headerSig === this.lastHeaderSig) return;
+		this.lastHeaderSig = headerSig;
 		process.stdout.write(`${ESC}[1;1H${ESC}[7m${line1}${ESC}[K${ESC}[0m`);
 		process.stdout.write(`${ESC}[2;1H${line2}${ESC}[K`);
 		this.renderBottom();
@@ -870,7 +876,17 @@ export class Renderer {
 	}
 
 	onMouse(mouse) {
-		if (!mouse || mouse.release || mouse.button !== 0 || !this.attached) return;
+		if (!mouse || mouse.release) return;
+		// Wheel reports (64=up, 65=down) scroll the page; presses only.
+		if (mouse.button === 64 || mouse.button === 65) {
+			if (this.attached) {
+				this.userAction(() =>
+					this.browser.scroll(mouse.button === 64 ? "up" : "down", 300),
+				);
+			}
+			return;
+		}
+		if (mouse.button !== 0 || !this.attached) return;
 		this.userAction(() => this.clickAt(mouse.col, mouse.row));
 	}
 
@@ -1172,6 +1188,7 @@ export class Renderer {
 	async redrawAll() {
 		process.stdout.write(`${ESC}[2J`);
 		if (this.mode === "kitty") process.stdout.write(KITTY_DELETE_ALL);
+		this.lastHeaderSig = null; // screen was cleared: header must repaint
 		this.header();
 		await this.renderImage();
 		this.renderConsole();

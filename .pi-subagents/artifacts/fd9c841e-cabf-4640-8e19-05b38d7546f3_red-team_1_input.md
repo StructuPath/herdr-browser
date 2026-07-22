@@ -1,0 +1,54 @@
+# Task for red-team
+
+Adversarially review /Users/vics/dev/structupath/herdr-browser — think like an attacker. Context: this is a Herdr terminal plugin that renders REMOTE WEB PAGE CONTENT (page title, console output, URLs) into the user's terminal, caches screenshots to disk, takes URLs from user input and from Ctrl+clicked links in any pane, and shells out to agent-browser/chafa/carbonyl. Attack surfaces to probe: (1) terminal escape-sequence injection via page title/console/URL — sanitizeText in bin/renderer.mjs claims to strip escapes; try to break it (C0/C1 controls, OSC 8 hyperlinks, OSC 52 clipboard write, DCS/APC sequences, UTF-8 tricks, newlines); (2) shell injection via URL, session name (derived from workspace id / cwd), or file paths in scripts/*.sh — check every variable expansion for quoting; (3) the link-handler regex in herdr-plugin.toml — can a crafted URL match localhost pattern but reach another host, or carry credentials/CLI-flag-like args (e.g. URL starting with `-`)?; (4) screenshot cache privacy (PNG in plugin state dir, chmod 600 — verify); (5) workspace lock/session-ownership logic — can one workspace hijack another's session?; (6) what happens with hostile agent-browser output (huge console lines, binary junk). Read all files. Report each viable attack with severity, file:line, a concrete exploit input, and a fix. If an attack does NOT work, say why briefly (that validates the defense). Do NOT edit files — report only.
+
+## Acceptance Contract
+Acceptance level: attested
+Completion is not accepted from prose alone. End with a structured acceptance report.
+
+Criteria:
+- criterion-1: Return concrete findings with file paths and severity when applicable
+
+Required evidence: review-findings, residual-risks
+
+Finish with a fenced JSON block tagged `acceptance-report` in this shape:
+Use empty arrays when no items apply; array fields contain strings unless object entries are shown.
+`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.
+`commandsRun[].result` must be exactly one of: passed, failed, not-run.
+`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.
+```acceptance-report
+{
+  "criteriaSatisfied": [
+    {
+      "id": "criterion-1",
+      "status": "satisfied",
+      "evidence": "specific proof"
+    }
+  ],
+  "changedFiles": [
+    "src/file.ts"
+  ],
+  "testsAddedOrUpdated": [
+    "test/file.test.ts"
+  ],
+  "commandsRun": [
+    {
+      "command": "command",
+      "result": "passed",
+      "summary": "short result"
+    }
+  ],
+  "validationOutput": [
+    "validation output or concise summary"
+  ],
+  "residualRisks": [
+    "none"
+  ],
+  "noStagedFiles": true,
+  "diffSummary": "short description of the diff",
+  "reviewFindings": [
+    "blocker: file.ts:12 - issue found, or no blockers"
+  ],
+  "manualNotes": "anything else the parent should know"
+}
+```

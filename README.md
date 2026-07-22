@@ -106,6 +106,15 @@ Then `herdr server reload-config`. The renderer probes for support at pane
 start and picks the best mode automatically; override with the `render` config
 (see below) or `HERDR_BROWSER_RENDER=kitty|symbols|text`.
 
+## Live stream (automatic upgrade)
+
+On Node >= 22 with agent-browser >= 0.23, the pane upgrades from polling to
+the session's push stream: screencast frames arrive when the page actually
+changes (instead of once a second), console entries and page errors appear
+instantly, and the poll loop drops to a slow liveness watch. If the stream
+is unavailable (older Node, older agent-browser, or a dropped socket) the
+pane falls back to polling transparently — there is nothing to configure.
+
 ## The session model
 
 Each Herdr workspace gets its own browser session, named `herdr-ws-<id>`. The

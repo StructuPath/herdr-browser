@@ -12,21 +12,21 @@ session="$(session_name)"
 closed=0
 
 close_pane() {
-  [ -n "$1" ] || return 0
-  if with_timeout 5 "$HERDR" pane close "$1" >/dev/null 2>&1; then
-    closed=$((closed + 1))
-  fi
-  return 0
+	[ -n "$1" ] || return 0
+	if with_timeout 5 "$HERDR" pane close "$1" >/dev/null 2>&1; then
+		closed=$((closed + 1))
+	fi
+	return 0
 }
 
 # Tracked panes: the view pane (open.sh) and any browse panes (browse.sh).
 # Close unconditionally — a liveness pre-check that fails would strand a live
 # pane, while closing an already-dead id is harmless.
 for f in "$(pane_id_file)" "$(browse_ids_file)"; do
-  if [ -f "$f" ]; then
-    while IFS= read -r id; do close_pane "$id"; done < "$f"
-    rm -f "$f"
-  fi
+	if [ -f "$f" ]; then
+		while IFS= read -r id; do close_pane "$id"; done <"$f"
+		rm -f "$f"
+	fi
 done
 
 # Safety net for untracked panes: list this workspace's panes and close any
@@ -34,8 +34,8 @@ done
 # the plugin-scoped variant silently no-ops on panes from a previous plugin
 # registration.
 if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
-  if command -v node >/dev/null 2>&1; then
-    strays="$(with_timeout 10 "$HERDR" pane list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null | node -e '
+	if command -v node >/dev/null 2>&1; then
+		strays="$(with_timeout 10 "$HERDR" pane list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null | node -e '
     let d = "";
     process.stdin.on("data", c => d += c).on("end", () => {
       let j; try { j = JSON.parse(d); } catch { return; }
@@ -45,21 +45,22 @@ if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
         }
       }
     });')"
-    for stray in $strays; do close_pane "$stray"; done
-  else
-    # The sweep needs node for JSON parsing; without it the close still
-    # succeeds but untracked panes linger — say so instead of hiding it.
-    echo "herdr-browser: warning: stray-pane sweep skipped (node not found)" >&2
-  fi
+		for stray in $strays; do close_pane "$stray"; done
+	else
+		# The sweep needs node for JSON parsing; without it the close still
+		# succeeds but untracked panes linger — say so instead of hiding it.
+		echo "herdr-browser: warning: stray-pane sweep skipped (node not found)" >&2
+	fi
 fi
 
 if command -v agent-browser >/dev/null 2>&1; then
-  with_timeout 10 agent-browser --session "$session" close >/dev/null 2>&1 || true
+	with_timeout 10 agent-browser --session "$session" close >/dev/null 2>&1 || true
 fi
 
 sd="$(state_dir)"
 ws="$(ws_id)"
-rm -f "$sd/shot-$ws.png" "$sd/shot-$ws.png.tmp" "$sd/shot-$ws.png".*.tmp
+rm -f "$sd/shot-$ws.png" "$sd/shot-$ws.png.tmp" "$sd/shot-$ws.png".*.tmp \
+  "$sd/shot-$ws.jpg" "$sd/shot-$ws.jpg".*.tmp
 
 # Surfaces in `herdr plugin log list` — close must never fail silently again.
 echo "herdr-browser: closed $closed pane(s); session $session released"

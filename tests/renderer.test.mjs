@@ -23,6 +23,7 @@ import {
 	pollDelay,
 	safeWsId,
 	kittyImageSequence,
+	viewportForPane,
 } from "../bin/renderer.mjs";
 
 const repoRoot = path.resolve(
@@ -1061,6 +1062,7 @@ test("onStreamMessage routes frames, console, page errors, and tabs", async () =
 	r.renderImage = async () => {
 		renders++;
 	};
+	r.fitViewport = async () => false;
 	r.onStreamMessage({
 		type: "frame",
 		data: jpeg(1280, 720).toString("base64"),
@@ -1220,6 +1222,9 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 	try {
 		await ab(["open", "https://example.com"]);
 		const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
+		// Viewport fitting has dedicated tests; disabling it here prevents its
+		// queued resize command from racing this stream test's session close.
+		r.fitViewport = async () => false;
 		assert.equal(await r.goLive(), true, "stream connects");
 		const deadline = Date.now() + 10_000;
 		while (r.frameSeq === 0 && Date.now() < deadline) {
@@ -1316,6 +1321,7 @@ test("header is repaint-gated but always paints real changes", () => {
 test('poll tick after a stream drop renders the fresh PNG, not the stale JPEG', async () => {
   const r = quiet(mkRenderer());
   r.attached = true;
+  r.fitViewport = async () => false;
   // Simulate a prior live stream: a jpg frame landed, then the stream died.
   r.onStreamMessage({ type: 'frame', data: jpeg(1280, 720).toString('base64') });
   await flush();
@@ -1415,4 +1421,61 @@ test('feed holds a split ESC-[ but a bare ESC still dispatches immediately', () 
   // bare ESC reaches the key path at once (prompt cancel must not lag);
   // onKey ignores it when no prompt is open and it is not a mapped key.
   assert.equal(r.inputBuf, '');
+});
+
+// --- Pane viewport fitting ---
+
+test("viewportForPane preserves width and fills the image-cell aspect", () => {
+	assert.deepEqual(
+		viewportForPane(1280, { cols: 80, imageRows: 30 }),
+		{ w: 1280, h: 960 },
+	);
+	assert.deepEqual(
+		viewportForPane(390, { cols: 80, imageRows: 30 }),
+		{ w: 390, h: 293 },
+		"mobile width/breakpoint is preserved",
+	);
+	assert.equal(viewportForPane(1280, { cols: 0, imageRows: 30 }), null);
+	assert.equal(viewportForPane(1280, { cols: 80, imageRows: 2 }), null);
+});
+
+test("fitViewport sets the browser height once per pane geometry", async () => {
+	const r = quiet(mkRenderer());
+	r.size = () => ({ cols: 80, imageRows: 30 });
+	const calls = [];
+	r.browser = {
+		setViewport: async (w, h) => calls.push([w, h]),
+	};
+	assert.equal(await r.fitViewport(1280, 577), true);
+	assert.deepEqual(calls, [[1280, 960]]);
+	assert.deepEqual(r.lastImageDims, { w: 1280, h: 577 });
+	assert.equal(await r.fitViewport(1280, 577), false, "same geometry is cached");
+	assert.equal(calls.length, 1);
+
+	r.lastViewportRequest = ""; // pane resize invalidates the cache
+	r.size = () => ({ cols: 80, imageRows: 40 });
+	assert.equal(await r.fitViewport(1280, 960), true);
+	assert.deepEqual(calls.at(-1), [1280, 1280]);
+});
+
+test("fitViewport avoids resize churn when the frame already fits", async () => {
+	const r = quiet(mkRenderer());
+	r.size = () => ({ cols: 80, imageRows: 30 });
+	let calls = 0;
+	r.browser = { setViewport: async () => { calls++; } };
+	assert.equal(await r.fitViewport(1280, 959), false);
+	assert.equal(calls, 0);
+});
+
+test("empty console gives its rows to the browser until output arrives", () => {
+	const r = quiet(mkRenderer());
+	r.mode = "symbols";
+	const empty = r.size();
+	assert.equal(empty.consoleRows, 0);
+	assert.ok(empty.imageRows > 0);
+
+	r.consoleLines.push("a browser log");
+	const visible = r.size();
+	assert.ok(visible.consoleRows >= 4);
+	assert.equal(visible.imageRows, empty.imageRows - visible.consoleRows);
 });

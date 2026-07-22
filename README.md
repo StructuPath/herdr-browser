@@ -121,6 +121,12 @@ instantly, and the poll loop drops to a slow liveness watch. If the stream
 is unavailable (older Node, older agent-browser, or a dropped socket) the
 pane falls back to polling transparently — there is nothing to configure.
 
+The renderer preserves the session's current viewport width (and therefore its
+responsive breakpoint), then fits only the viewport height to the pane's image
+region on attach and resize. The page fills that region without stretching. The console region stays
+collapsed while the page is quiet and opens only when console output or a
+page error arrives.
+
 ## The session model
 
 Each Herdr workspace gets its own browser session, named `herdr-ws-<id>`. The

@@ -297,6 +297,21 @@ export function mapClickToPage(
 	return { x: Math.round(unitX / scale), y: Math.round(unitY / scale) };
 }
 
+// Preserve the browser's current CSS-pixel width, but choose a height whose
+// aspect ratio matches the terminal image box. Renderer geometry models one
+// cell as ~1x2 pixel units (same assumption as chafa/mapClickToPage), so this
+// removes vertical letterboxing without stretching or changing breakpoints.
+export function viewportForPane(frameWidth, { cols, imageRows }) {
+	const width = Math.round(Number(frameWidth));
+	if (!(width > 0) || !(cols > 0) || imageRows < 3) return null;
+	const w = Math.min(3840, Math.max(320, width));
+	const h = Math.min(
+		2160,
+		Math.max(240, Math.round((w * imageRows * 2) / cols)),
+	);
+	return { w, h };
+}
+
 // --- agent-browser access ---
 
 export function makeBrowser(session, bin = "agent-browser") {
@@ -393,6 +408,9 @@ export function makeBrowser(session, bin = "agent-browser") {
 		type: async (text) => {
 			await run("keyboard", "type", text);
 		},
+		setViewport: async (w, h) => {
+			await run("set", "viewport", String(w), String(h));
+		},
 		// Live push stream (agent-browser >= 0.23): 'already enabled' is not an
 		// error for us, and status carries the WS port.
 		streamEnable: async () => {
@@ -488,6 +506,8 @@ export class Renderer {
 		);
 		this.lastLiveCheck = 0;
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
+		this.lastImageDims = null;
+		this.lastViewportRequest = "";
 	}
 
 	// Serialize all screen-writing work: ticks and resize redraws must never
@@ -507,10 +527,12 @@ export class Renderer {
 	size() {
 		const cols = process.stdout.columns || 80;
 		const rows = process.stdout.rows || 24;
-		const consoleRows =
-			this.mode === "text"
-				? Math.max(0, rows - 3)
-				: Math.max(4, Math.floor(rows * 0.3));
+		let consoleRows = 0;
+		if (this.mode === "text") {
+			consoleRows = Math.max(0, rows - 3);
+		} else if (this.consoleLines.length > 0) {
+			consoleRows = Math.max(4, Math.floor(rows * 0.3));
+		}
 		const imageRows =
 			this.mode === "text" ? 0 : Math.max(0, rows - consoleRows - 4);
 		return {
@@ -521,6 +543,40 @@ export class Renderer {
 			imageTopRow: 3,
 			bottomRow: rows,
 		};
+	}
+
+	async fitViewport(frameW, frameH) {
+		if (typeof this.browser.setViewport !== "function") return false;
+		this.lastImageDims = { w: frameW, h: frameH };
+		const target = viewportForPane(frameW, this.size());
+		if (!target) return false;
+		const key = `${target.w}x${target.h}`;
+		if (key === this.lastViewportRequest) return false;
+		this.lastViewportRequest = key;
+		if (Math.abs(frameH - target.h) <= 2) return false;
+		try {
+			await this.browser.setViewport(target.w, target.h);
+			return true;
+		} catch {
+			this.lastViewportRequest = "";
+			return false;
+		}
+	}
+
+	queueConsolePaint(hadConsole) {
+		const layoutChanged =
+			this.mode !== "text" && !hadConsole && this.consoleLines.length > 0;
+		return this.enqueue(async () => {
+			if (!layoutChanged) {
+				this.renderConsole();
+				return;
+			}
+			await this.redrawAll();
+			if (this.lastImageDims) {
+				this.lastViewportRequest = "";
+				await this.fitViewport(this.lastImageDims.w, this.lastImageDims.h);
+			}
+		});
 	}
 
 	configValue(name) {
@@ -717,6 +773,7 @@ export class Renderer {
 			this.attached = true;
 			this.banner = "";
 			this.streamCooldownUntil = 0; // try the live stream right away
+			this.lastViewportRequest = ""; // fit the new session once
 		}
 		if (this.live) {
 			// Event-driven: the stream paints everything; the poll loop only
@@ -742,6 +799,7 @@ export class Renderer {
 			}
 		}
 		let failed = false;
+		let consoleLayoutChanged = false;
 		try {
 			// Unique tmp name: a duplicate pane in this workspace must not be
 			// able to rename (and corrupt) this renderer's in-flight frame.
@@ -756,8 +814,11 @@ export class Renderer {
 			if (this.suppressConsoleOnce) {
 				this.suppressConsoleOnce = false;
 			} else if (newEntries.length || marker) {
+				const hadConsole = this.consoleLines.length > 0;
 				this.pushConsole(newEntries, marker);
-				this.renderConsole();
+				consoleLayoutChanged =
+					this.mode !== "text" && !hadConsole && this.consoleLines.length > 0;
+				if (!consoleLayoutChanged) this.renderConsole();
 			}
 			this.consoleState = {
 				count: snap.entries.length,
@@ -766,6 +827,7 @@ export class Renderer {
 
 			const buf = fs.readFileSync(tmp);
 			if (!pngComplete(buf)) throw new Error("incomplete screenshot frame");
+			const dims = pngDims(buf);
 			const hash = createHash("md5").update(buf).digest("hex");
 			if (hash !== this.lastHash) {
 				fs.renameSync(tmp, this.shot);
@@ -773,8 +835,15 @@ export class Renderer {
 				this.shotFormat = "png"; // heal after a dropped stream's jpg frames
 				this.lastHash = hash;
 				await this.renderImage();
+				await this.fitViewport(dims.w, dims.h);
+				if (consoleLayoutChanged) this.renderConsole();
 			} else {
 				fs.unlinkSync(tmp);
+				if (consoleLayoutChanged) {
+					await this.redrawAll();
+					this.lastViewportRequest = "";
+					await this.fitViewport(dims.w, dims.h);
+				}
 			}
 			this.banner = "";
 			this.failures = 0;
@@ -1078,7 +1147,8 @@ export class Renderer {
 			case "frame": {
 				if (typeof m.data !== "string") return;
 				const buf = Buffer.from(m.data, "base64");
-				if (!jpegDims(buf)) return;
+				const dims = jpegDims(buf);
+				if (!dims) return;
 				const tmp = `${this.shotJpg}.${process.pid}.tmp`;
 				try {
 					fs.writeFileSync(tmp, buf);
@@ -1091,19 +1161,21 @@ export class Renderer {
 				this.frameSeq++;
 				this.enqueue(async () => {
 					await this.renderImage();
+					await this.fitViewport(dims.w, dims.h);
 				});
 				break;
 			}
-			case "console":
+			case "console": {
+				const hadConsole = this.consoleLines.length > 0;
 				this.pushConsole(
 					[{ text: m.text ?? "", type: m.level ?? "log" }],
 					false,
 				);
-				this.enqueue(() => {
-					this.renderConsole();
-				});
+				this.queueConsolePaint(hadConsole);
 				break;
-			case "page_error":
+			}
+			case "page_error": {
+				const hadConsole = this.consoleLines.length > 0;
 				this.pushConsole(
 					[
 						{
@@ -1113,10 +1185,9 @@ export class Renderer {
 					],
 					false,
 				);
-				this.enqueue(() => {
-					this.renderConsole();
-				});
+				this.queueConsolePaint(hadConsole);
 				break;
+			}
 			case "tabs": {
 				if (!Array.isArray(m.tabs)) break;
 				const active = m.tabs.find((t) => t.active);
@@ -1305,7 +1376,20 @@ export class Renderer {
 		let resizeTimer = null;
 		process.stdout.on("resize", () => {
 			clearTimeout(resizeTimer);
-			resizeTimer = setTimeout(() => this.enqueue(() => this.redrawAll()), 150);
+			resizeTimer = setTimeout(
+				() =>
+					this.enqueue(async () => {
+						this.lastViewportRequest = "";
+						if (this.lastImageDims) {
+							await this.fitViewport(
+								this.lastImageDims.w,
+								this.lastImageDims.h,
+							);
+						}
+						await this.redrawAll();
+					}),
+				150,
+			);
 		});
 
 		while (true) {

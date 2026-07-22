@@ -736,7 +736,10 @@ export class Renderer {
 		// Go live once attached, then retry at most once a minute after failures.
 		if (Date.now() >= this.streamCooldownUntil) {
 			this.streamCooldownUntil = Date.now() + 60_000;
-			if (await this.goLive()) return;
+			if (await this.goLive()) {
+				this.header(); // clear any waiting/failure banner on screen
+				return;
+			}
 		}
 		let failed = false;
 		try {
@@ -767,6 +770,7 @@ export class Renderer {
 			if (hash !== this.lastHash) {
 				fs.renameSync(tmp, this.shot);
 				fs.chmodSync(this.shot, 0o600);
+				this.shotFormat = "png"; // heal after a dropped stream's jpg frames
 				this.lastHash = hash;
 				await this.renderImage();
 			} else {
@@ -850,7 +854,10 @@ export class Renderer {
 	// escape tails and split everything into single events before dispatch.
 	feed(s) {
 		s = this.inputBuf + s;
-		const tail = /\x1b\[<<?[\d;]*$/.exec(s);
+		// Hold a trailing partial escape for the next chunk: ESC-[ alone, or
+		// an incomplete mouse report. A bare ESC (prompt cancel) dispatches
+		// immediately — holding it would swallow the cancel until another key.
+		const tail = /\x1b\[(?:<[\d;]*)?$/.exec(s);
 		this.inputBuf = tail ? tail[0] : "";
 		s = s.slice(0, s.length - this.inputBuf.length);
 		if (!s) return;
@@ -982,6 +989,9 @@ export class Renderer {
 	async goLive() {
 		if (typeof WebSocket !== "function") return false; // Node < 22: poll
 		if (typeof this.browser.streamEnable !== "function") return false; // test doubles
+		// Stream frames are JPEG and kitty's f=100 only accepts PNG: without
+		// chafa to decode them, poll mode (direct PNG) is strictly better.
+		if (this.mode === "kitty" && !this.chafa) return false;
 		await this.browser.streamEnable();
 		let status;
 		try {
@@ -989,8 +999,15 @@ export class Renderer {
 		} catch {
 			status = null;
 		}
-		if (!status?.port) return false;
-		const ws = new WebSocket(`ws://127.0.0.1:${status.port}`);
+		// The port comes from a CLI response — validate before building a URL.
+		const port = Number(status?.port);
+		if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+		let ws;
+		try {
+			ws = new WebSocket(`ws://127.0.0.1:${port}`);
+		} catch {
+			return false; // malformed URL or constructor failure: just poll
+		}
 		const ok = await new Promise((resolve) => {
 			const timer = setTimeout(() => {
 				try {
@@ -1018,7 +1035,13 @@ export class Renderer {
 			} catch {
 				return;
 			}
-			this.onStreamMessage(m);
+			// A malformed message must never become an uncaughtException —
+			// those bypass cleanup() and leave the terminal wedged.
+			try {
+				this.onStreamMessage(m);
+			} catch {
+				this.paintErrors++;
+			}
 		};
 		const drop = () => this.dropLive("live stream dropped — polling");
 		ws.onclose = drop;
@@ -1041,6 +1064,9 @@ export class Renderer {
 		// The poll path re-syncs the console ring silently once, so entries the
 		// stream already showed are not replayed as a wall of "new" lines.
 		this.suppressConsoleOnce = true;
+		// The next rendered/read frame must be the poll path's fresh PNG, not
+		// the stream's now-frozen last JPEG.
+		this.shotFormat = "png";
 		if (note && wasLive) {
 			this.banner = note;
 			this.header();
@@ -1050,7 +1076,8 @@ export class Renderer {
 	onStreamMessage(m) {
 		switch (m.type) {
 			case "frame": {
-				const buf = Buffer.from(m.data || "", "base64");
+				if (typeof m.data !== "string") return;
+				const buf = Buffer.from(m.data, "base64");
 				if (!jpegDims(buf)) return;
 				const tmp = `${this.shotJpg}.${process.pid}.tmp`;
 				try {
@@ -1091,7 +1118,8 @@ export class Renderer {
 				});
 				break;
 			case "tabs": {
-				const active = (m.tabs || []).find((t) => t.active);
+				if (!Array.isArray(m.tabs)) break;
+				const active = m.tabs.find((t) => t.active);
 				if (active) {
 					this.lastUrl = sanitizeText(active.url ?? "");
 					this.lastTitle = sanitizeText(active.title ?? "");
@@ -1119,7 +1147,10 @@ export class Renderer {
 			try {
 				await fn();
 			} catch {
-				/* next tick's banner reports failures */
+				// Poll mode reports daemon failures via the tick failure counter;
+				// live mode's tick never runs that path, so say it directly.
+				this.banner = "command failed — agent-browser not responding";
+				this.header();
 			}
 		}).then(() => this.enqueue(() => this.tick()));
 	}
@@ -1246,6 +1277,13 @@ export class Renderer {
 				process.exit(0);
 			});
 		}
+		// Last-resort safety net: a throw outside the run() promise (event
+		// handlers, timers) must still restore the terminal on the way out.
+		process.on("uncaughtException", (err) => {
+			this.cleanup();
+			console.error("herdr-browser renderer crashed:", err.message);
+			process.exit(1);
+		});
 		const probe = await this.probeKitty();
 		this.mode = pickRenderMode(
 			this.env,

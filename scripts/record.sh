@@ -11,6 +11,7 @@ require_agent_browser
 
 session="$(session_name)"
 dir="$(state_dir)/recordings"
+mkdir -p "$dir"
 
 case "${1:-}" in
 start)

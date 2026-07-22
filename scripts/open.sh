@@ -29,24 +29,29 @@ fi
 # Serialize concurrent opens: two invokes racing past the liveness check
 # would each open a pane (herdr pane open is not idempotent). mkdir is the
 # portable atomic lock, with a PID token so the holder's EXIT trap can never
-# remove a stealer's fresh lock. After ~5s of waiting the holder is presumed
-# dead and the lock is stolen — once, then the waiter keeps waiting normally
-# (repeated steals would let two waiters break mutual exclusion). The steal
-# removes only the known token file + dir, never an rm -rf of a foreign path.
+# remove a stealer's fresh lock. After ~2s of waiting the lock may be stolen
+# — but only when the holder's PID is actually dead (kill -0): a legitimate
+# hold can last ~20s (5s focus timeout + 15s pane-open timeout), so elapsed
+# time alone must never break mutual exclusion. Each waiter steals at most
+# once, then keeps waiting; the steal removes only the known token file +
+# dir, never an rm -rf of a foreign path.
 lock="$(state_dir)/open-lock-$(ws_id)"
-case "${HERDR_BROWSER_LOCK_TRIES:-50}" in
-'' | *[!0-9]*) tries_max=50 ;;
-*) tries_max="${HERDR_BROWSER_LOCK_TRIES:-50}" ;;
+case "${HERDR_BROWSER_LOCK_TRIES:-20}" in
+'' | *[!0-9]*) tries_max=20 ;;
+*) tries_max="${HERDR_BROWSER_LOCK_TRIES:-20}" ;;
 esac
 tries=0
 stolen=0
 until mkdir "$lock" 2>/dev/null; do
 	tries=$((tries + 1))
 	if [ "$tries" -gt "$tries_max" ] && [ "$stolen" -eq 0 ]; then
-		rm -f "$lock/pid" 2>/dev/null
-		rmdir "$lock" 2>/dev/null || true
-		stolen=1
-		tries=0
+		holder="$(cat "$lock/pid" 2>/dev/null || true)"
+		if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+			rm -f "$lock/pid" 2>/dev/null
+			rmdir "$lock" 2>/dev/null || true
+			stolen=1
+			tries=0
+		fi
 	fi
 	sleep 0.1
 done

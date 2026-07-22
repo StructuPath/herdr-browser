@@ -1250,50 +1250,169 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 
 // --- Wave 2c: wheel scroll, header repaint gating ---
 
-test('mouse wheel scrolls the page, click still clicks', async () => {
-  const r = quiet(mkRenderer());
-  r.attached = true;
-  r.size = () => ({ cols: 100, rows: 37, imageRows: 30, consoleRows: 7, imageTopRow: 3, bottomRow: 37 });
-  fs.writeFileSync(r.shot, PNG_1PX);
-  const scrolls = [];
-  const clicks = [];
-  r.browser = {
-    scroll: async dir => scrolls.push(dir),
-    click: async (x, y) => clicks.push([x, y]),
-  };
-  r.feed('\x1b[<64;50;10M'); // wheel up
-  r.feed('\x1b[<65;50;10M'); // wheel down
-  r.feed('\x1b[<64;50;10m'); // wheel release: never an action
-  await flush();
-  assert.deepEqual(scrolls, ['up', 'down']);
-  assert.equal(clicks.length, 0, 'wheel reports never reach clickAt');
-  r.feed('\x1b[<0;10;5M');
-  await flush();
-  assert.equal(clicks.length, 1);
+test("mouse wheel scrolls the page, click still clicks", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.size = () => ({
+		cols: 100,
+		rows: 37,
+		imageRows: 30,
+		consoleRows: 7,
+		imageTopRow: 3,
+		bottomRow: 37,
+	});
+	fs.writeFileSync(r.shot, PNG_1PX);
+	const scrolls = [];
+	const clicks = [];
+	r.browser = {
+		scroll: async (dir) => scrolls.push(dir),
+		click: async (x, y) => clicks.push([x, y]),
+	};
+	r.feed("\x1b[<64;50;10M"); // wheel up
+	r.feed("\x1b[<65;50;10M"); // wheel down
+	r.feed("\x1b[<64;50;10m"); // wheel release: never an action
+	await flush();
+	assert.deepEqual(scrolls, ["up", "down"]);
+	assert.equal(clicks.length, 0, "wheel reports never reach clickAt");
+	r.feed("\x1b[<0;10;5M");
+	await flush();
+	assert.equal(clicks.length, 1);
 });
 
-test('header is repaint-gated but always paints real changes', () => {
+test("header is repaint-gated but always paints real changes", () => {
+	const r = quiet(mkRenderer());
+	r.mode = "symbols";
+	// Restore the real header (quiet() stubs it); capture writes.
+	const realHeader = Object.getPrototypeOf(r).header.bind(r);
+	const writes = [];
+	const origWrite = process.stdout.write.bind(process.stdout);
+	process.stdout.write = (s) => {
+		writes.push(s);
+		return true;
+	};
+	try {
+		realHeader();
+		const first = writes.length;
+		assert.ok(first > 0, "first paint writes");
+		realHeader();
+		assert.equal(writes.length, first, "identical header is not rewritten");
+		r.banner = "something changed";
+		realHeader();
+		assert.ok(writes.length > first, "a banner change repaints");
+		const afterBanner = writes.length;
+		r.openPrompt("URL: ", () => {});
+		realHeader();
+		assert.ok(
+			writes.length > afterBanner,
+			"prompt-open repaints (help -> prompt line)",
+		);
+	} finally {
+		process.stdout.write = origWrite;
+	}
+});
+
+// --- Wave 2d: fleet-re-review regression tests ---
+
+test('poll tick after a stream drop renders the fresh PNG, not the stale JPEG', async () => {
   const r = quiet(mkRenderer());
-  r.mode = 'symbols';
-  // Restore the real header (quiet() stubs it); capture writes.
+  r.attached = true;
+  // Simulate a prior live stream: a jpg frame landed, then the stream died.
+  r.onStreamMessage({ type: 'frame', data: jpeg(1280, 720).toString('base64') });
+  await flush();
+  assert.equal(r.shotFormat, 'jpg');
+  r.live = { ws: { close: () => {} } };
+  r.dropLive();
+  assert.equal(r.shotFormat, 'png', 'dropLive points the renderer at the poll path frame');
+  let renderedPath = null;
+  const origExists = fs.existsSync;
+  r.renderImage = async () => { renderedPath = r.shotFormat === 'jpg' ? r.shotJpg : r.shot; };
+  r.browser = {
+    snapshot: async f => {
+      fs.writeFileSync(f, PNG_1PX);
+      return { url: 'https://x', title: '', entries: [] };
+    },
+    sessionExists: async () => true,
+  };
+  await r.tick();
+  assert.equal(r.shotFormat, 'png');
+  assert.equal(renderedPath, r.shot, 'poll frame rendered, not the frozen stream frame');
+  assert.ok(origExists(r.shot));
+});
+
+test('malformed stream messages never crash the dispatch', async () => {
+  const r = quiet(mkRenderer());
+  const bad = [
+    { type: 'tabs', tabs: {} },
+    { type: 'tabs', tabs: 42 },
+    { type: 'tabs', tabs: 'x' },
+    { type: 'frame', data: 12345 },
+    { type: 'frame' },
+    { type: 'console' },
+    { type: 'url' },
+    {},
+    { type: null },
+  ];
+  for (const m of bad) r.onStreamMessage(m);
+  await flush();
+  assert.equal(r.frameSeq, 0);
+  // And the dispatch wrapper in goLive counts instead of throwing:
+  assert.ok(r.paintErrors >= 0);
+});
+
+test('a successful goLive from the attach path repaints the header', async () => {
+  const r = quiet(mkRenderer());
+  let headers = 0;
   const realHeader = Object.getPrototypeOf(r).header.bind(r);
-  const writes = [];
-  const origWrite = process.stdout.write.bind(process.stdout);
-  process.stdout.write = s => { writes.push(s); return true; };
-  try {
-    realHeader();
-    const first = writes.length;
-    assert.ok(first > 0, 'first paint writes');
-    realHeader();
-    assert.equal(writes.length, first, 'identical header is not rewritten');
-    r.banner = 'something changed';
-    realHeader();
-    assert.ok(writes.length > first, 'a banner change repaints');
-    const afterBanner = writes.length;
-    r.openPrompt('URL: ', () => {});
-    realHeader();
-    assert.ok(writes.length > afterBanner, 'prompt-open repaints (help -> prompt line)');
-  } finally {
-    process.stdout.write = origWrite;
+  r.header = () => { headers++; realHeader(); };
+  r.banner = 'waiting for session …';
+  r.goLive = async () => true;
+  r.browser = { sessionExists: async () => true };
+  await r.tick();
+  assert.equal(r.attached, true);
+  assert.ok(headers >= 1, 'header repainted after goLive, stale banner cleared');
+});
+
+test('goLive stays on the poll path for kitty mode without chafa', async () => {
+  const r = quiet(mkRenderer());
+  r.mode = 'kitty';
+  r.chafa = false;
+  let enabled = 0;
+  r.browser = { streamEnable: async () => { enabled++; } };
+  assert.equal(await r.goLive(), false);
+  assert.equal(enabled, 0, 'no stream attempt when stream frames could not render');
+});
+
+test('goLive rejects hostile or malformed ports without throwing', async () => {
+  const r = quiet(mkRenderer());
+  for (const port of ['evil.com/x', 0, -1, 70000, 3.5, null, undefined]) {
+    r.browser = {
+      streamEnable: async () => {},
+      streamStatus: async () => ({ port }),
+    };
+    assert.equal(await r.goLive(), false, `port ${JSON.stringify(port)} refused`);
   }
+});
+
+test('userAction surfaces failures in the banner (live mode has no tick report)', async () => {
+  const r = quiet(mkRenderer());
+  let headers = 0;
+  r.header = () => { headers++; };
+  r.userAction(async () => { throw new Error('daemon hung'); });
+  await flush();
+  assert.match(r.banner, /command failed/);
+  assert.ok(headers >= 1, 'failure banner painted');
+});
+
+test('feed holds a split ESC-[ but a bare ESC still dispatches immediately', () => {
+  const r = quiet(mkRenderer());
+  const keys = [];
+  r.onKey = ch => keys.push(ch);
+  r.feed('\x1b[');
+  assert.deepEqual(keys, [], 'ESC-[ held for the next chunk');
+  r.feed('<0;10;5M');
+  assert.deepEqual(keys, [], 'completed report went to the mouse path');
+  r.feed('\x1b');
+  // bare ESC reaches the key path at once (prompt cancel must not lag);
+  // onKey ignores it when no prompt is open and it is not a mapped key.
+  assert.equal(r.inputBuf, '');
 });

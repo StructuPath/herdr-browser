@@ -68,7 +68,7 @@ description = "browser pane"
   session — use the viewer pane (Open) for that. Note: carbonyl is dormant
   (last release 2023) and bundles an old Chromium — keep it to localhost dev
   pages, not general web browsing.
-- **Record** (`structupath.browser.record.start` / `.stop`) — record the
+- **Record** (`structupath.browser.record-start` / `.record-stop`) — record the
   workspace session to a WebM video under the plugin state dir's
   `recordings/`. Starting a recording creates a fresh browser context (the
   page reloads; cookies and localStorage are preserved), so start before the

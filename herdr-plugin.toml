@@ -23,13 +23,13 @@ description = "Open an interactive carbonyl browser pane — prompts for a URL"
 command = ["bash", "scripts/browse.sh"]
 
 [[actions]]
-id = "record.start"
+id = "record-start"
 title = "Start session recording"
 description = "Record the workspace browser session to WebM (starts a fresh context: page reloads, cookies kept)"
 command = ["bash", "scripts/record.sh", "start"]
 
 [[actions]]
-id = "record.stop"
+id = "record-stop"
 title = "Stop session recording"
 command = ["bash", "scripts/record.sh", "stop"]
 

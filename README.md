@@ -62,9 +62,11 @@ description = "browser pane"
 - **Browse** (`structupath.browser.browse`) — an *interactive* browser pane
   via [carbonyl](https://github.com/fathyb/carbonyl) (Chromium rendered into
   the terminal: mouse, scrolling, typing all work). With no URL it prompts —
-  an address bar in a pane. Requires `npm install -g carbonyl`. This is a
+  an address bar in a pane. Requires `npm install -g carbonyl@next`. This is a
   personal browser with its own Chromium; it does not share the agent's
-  session — use the viewer pane (Open) for that.
+  session — use the viewer pane (Open) for that. Note: carbonyl is dormant
+  (last release 2023) and bundles an old Chromium — keep it to localhost dev
+  pages, not general web browsing.
 
 ## Viewer controls
 
@@ -72,7 +74,7 @@ The viewer pane is passive until you act; every action below drives the
 shared session directly (your agent sees the same browser state):
 
 | Input | Action |
-|-------|--------|
+| ------- | -------- |
 | `u` | address bar — type any URL, Enter to go (`https://` assumed) |
 | click on the screenshot | clicks the real page at that spot |
 | `i` | type text into the focused element |
@@ -137,8 +139,16 @@ plugin state dir, `chmod 600`, deleted when the pane closes. If your agent
 browses authenticated pages, that content is visible in the pane and briefly
 on disk — treat screen shares accordingly.
 
+Browser sessions are shared by name on the local machine: any local process
+(including an agent in another workspace) that knows the session name can
+drive it, including authenticated pages. Treat session names as a trusted
+local boundary, and use the Close action when a session holds logged-in
+state you no longer need.
+
 ## Troubleshooting
 
+- **Pane says "agent-browser is not installed"** — install the engine:
+  `npm install -g agent-browser && agent-browser install`.
 - **Pane says "session … is not running"** — nothing has started that
   workspace's browser yet. Invoke Open with a URL, click a localhost link, or
   have your agent use the session name in the header.

@@ -5,9 +5,11 @@ set -uo pipefail
 cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 . scripts/lib.sh
 
+require_herdr
+
 url="${1:-${HERDR_PLUGIN_CLICKED_URL:-}}"
 if [ -n "$url" ] && ! validate_url "$url"; then
-  echo "herdr-browser: refusing URL (must start with http:// or https://): $url" >&2
+  echo "herdr-browser: refusing URL (must start with http:// or https://, no credentials): $url" >&2
   exit 2
 fi
 
@@ -16,7 +18,7 @@ args=(plugin pane open --plugin "$PLUGIN_ID" --entrypoint browse
 if [ -n "$url" ]; then
   args+=(--env "HERDR_BROWSE_URL=$url")
 fi
-out="$("$HERDR" "${args[@]}")" || {
+out="$(with_timeout 15 "$HERDR" "${args[@]}")" || {
   echo "herdr-browser: failed to open browse pane" >&2
   exit 4
 }

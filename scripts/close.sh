@@ -6,12 +6,14 @@ set -uo pipefail
 cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 . scripts/lib.sh
 
+require_herdr
+
 session="$(session_name)"
 closed=0
 
 close_pane() {
   [ -n "$1" ] || return 0
-  if "$HERDR" pane close "$1" >/dev/null 2>&1; then
+  if with_timeout 5 "$HERDR" pane close "$1" >/dev/null 2>&1; then
     closed=$((closed + 1))
   fi
   return 0
@@ -31,8 +33,9 @@ done
 # carrying this plugin's pane labels. Generic close, not `plugin pane close`:
 # the plugin-scoped variant silently no-ops on panes from a previous plugin
 # registration.
-if [ -n "${HERDR_WORKSPACE_ID:-}" ] && command -v node >/dev/null 2>&1; then
-  strays="$("$HERDR" pane list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null | node -e '
+if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+  if command -v node >/dev/null 2>&1; then
+    strays="$(with_timeout 10 "$HERDR" pane list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null | node -e '
     let d = "";
     process.stdin.on("data", c => d += c).on("end", () => {
       let j; try { j = JSON.parse(d); } catch { return; }
@@ -42,16 +45,21 @@ if [ -n "${HERDR_WORKSPACE_ID:-}" ] && command -v node >/dev/null 2>&1; then
         }
       }
     });')"
-  for stray in $strays; do close_pane "$stray"; done
+    for stray in $strays; do close_pane "$stray"; done
+  else
+    # The sweep needs node for JSON parsing; without it the close still
+    # succeeds but untracked panes linger — say so instead of hiding it.
+    echo "herdr-browser: warning: stray-pane sweep skipped (node not found)" >&2
+  fi
 fi
 
 if command -v agent-browser >/dev/null 2>&1; then
-  agent-browser --session "$session" close >/dev/null 2>&1 || true
+  with_timeout 10 agent-browser --session "$session" close >/dev/null 2>&1 || true
 fi
 
 sd="$(state_dir)"
-ws="${HERDR_WORKSPACE_ID:-default}"
-rm -f "$sd/shot-$ws.png" "$sd/shot-$ws.png.tmp"
+ws="$(ws_id)"
+rm -f "$sd/shot-$ws.png" "$sd/shot-$ws.png.tmp" "$sd/shot-$ws.png".*.tmp
 
 # Surfaces in `herdr plugin log list` — close must never fail silently again.
 echo "herdr-browser: closed $closed pane(s); session $session released"

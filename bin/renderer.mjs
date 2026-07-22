@@ -15,20 +15,36 @@ const KITTY_DELETE = `${ESC}_Ga=d,d=A${ESC}\\`;
 
 // --- pure helpers (unit-tested) ---
 
+// Workspace ids become file names (locks, pane-id files, screenshots) and
+// one lock path is subject to an rm -rf in open.sh's lock steal — only a
+// strict charset may pass. Must stay in lockstep with ws_id() in lib.sh.
+export function safeWsId(id) {
+  const s = String(id || 'default').replace(/[^A-Za-z0-9_-]/g, '');
+  return s || 'default';
+}
+
+// Names flow into the terminal on every header repaint: strip whitespace and
+// C0/C1 control chars from every source so ESC can never reach the screen.
+const cleanName = s => String(s).replace(/[\s\u0000-\u001f\u007f-\u009f]/g, '');
+
 // Must stay in lockstep with session_name() in scripts/lib.sh.
 export function deriveSession(env, cwd) {
-  if (env.HERDR_BROWSER_SESSION) return env.HERDR_BROWSER_SESSION;
+  if (env.HERDR_BROWSER_SESSION) {
+    const name = cleanName(env.HERDR_BROWSER_SESSION);
+    if (name) return name;
+  }
   if (env.HERDR_PLUGIN_CONFIG_DIR) {
     const f = path.join(env.HERDR_PLUGIN_CONFIG_DIR, 'session');
     if (fs.existsSync(f)) {
-      const name = fs.readFileSync(f, 'utf8').split('\n')[0].replace(/\s/g, '');
+      const name = cleanName(fs.readFileSync(f, 'utf8').split('\n')[0]);
       if (name) return name;
     }
   }
-  if (env.HERDR_WORKSPACE_ID) return `herdr-ws-${env.HERDR_WORKSPACE_ID}`;
-  const sum = spawnSync('sh', ['-c', "printf '%s\\n' \"$HB_CWD\" | cksum"],
-    { env: { ...process.env, HB_CWD: cwd } }).stdout.toString().split(' ')[0];
-  return `herdr-cwd-${sum}`;
+  if (env.HERDR_WORKSPACE_ID) return `herdr-ws-${safeWsId(env.HERDR_WORKSPACE_ID)}`;
+  const res = spawnSync('sh', ['-c', "printf '%s\\n' \"$HB_CWD\" | cksum"],
+    { env: { ...process.env, HB_CWD: cwd }, timeout: 5000 });
+  const sum = res.stdout ? res.stdout.toString().split(' ')[0].trim() : '';
+  return `herdr-cwd-${sum || 'unknown'}`;
 }
 
 // Console cursor reconciliation over agent-browser's 1000-entry ring buffer.
@@ -77,28 +93,74 @@ export function pickRenderMode(env, configDirValue, probeResponse, chafaAvailabl
   return 'symbols';
 }
 
+// Display-cell width: enough wcwidth for header truncation — CJK wide
+// ranges and emoji count 2 cells, everything else 1.
+function cellWidth(s) {
+  let w = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    w += (cp >= 0x1100 && (
+      cp <= 0x115f || cp === 0x2329 || cp === 0x232a
+      || (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f)
+      || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff)
+      || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60)
+      || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff)
+      || (cp >= 0x20000 && cp <= 0x3fffd))) ? 2 : 1;
+  }
+  return w;
+}
+
 export function truncate(s, width) {
-  return s.length <= width ? s : s.slice(0, Math.max(0, width - 1)) + '…';
+  if (width <= 0) return '';
+  if (cellWidth(s) <= width) return s;
+  let out = '';
+  let w = 0;
+  for (const ch of s) {
+    const cw = cellWidth(ch);
+    if (w + cw > width - 1) break;
+    out += ch;
+    w += cw;
+  }
+  return out + '…';
 }
 
 // Poll backoff: each tick spawns 4 agent-browser subprocesses, so a quiet
 // page should not be polled at full rate forever. Any observed change (or
-// user input) resets idleTicks to 0 and restores the base cadence.
+// user input) resets idleTicks to 0 and restores the base cadence. After
+// ~5 quiet minutes the floor drops to 30x — an unwatched pane costs ~zero.
 export function pollDelay(baseMs, idleTicks) {
-  const mult = idleTicks < 10 ? 1 : idleTicks < 30 ? 2 : idleTicks < 60 ? 4 : 8;
-  return baseMs * mult;
+  const mult = idleTicks < 10 ? 1 : idleTicks < 30 ? 2 : idleTicks < 60 ? 4
+    : idleTicks < 300 ? 8 : 30;
+  // 2**31-1 is setTimeout's ceiling; beyond it Node fires after ~1ms.
+  return Math.min(baseMs * mult, 2 ** 31 - 1);
 }
 
 // Page-controlled text (console lines, titles, URLs) gets written into the
 // user's terminal; strip C0/C1 control chars so a page can't smuggle escape
 // sequences (retitle, clear, OSC 52, kitty graphics) into the session.
 export function sanitizeText(s) {
-  return String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, ch => (ch === '\t' ? ' ' : ''));
+  return String(s)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ch => (ch === '\t' ? ' ' : ''))
+    // Bidi overrides and zero-width format chars survive C0/C1 stripping but
+    // let page text visually spoof URLs in the header — drop them too.
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, '');
 }
 
+// Full 8-byte PNG signature + IHDR, so a random file can't pass as a frame.
 export function pngDims(buf) {
-  if (buf.length < 24 || buf.readUInt32BE(12) !== 0x49484452) return null; // IHDR
+  if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47
+      || buf.readUInt32BE(4) !== 0x0d0a1a0a
+      || buf.readUInt32BE(12) !== 0x49484452) return null; // IHDR
   return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+}
+
+// A frame is only promoted to the live screenshot when it is a complete
+// PNG: signature + IHDR + the terminal IEND chunk.
+export function pngComplete(buf) {
+  if (!pngDims(buf)) return false;
+  return buf.length >= 12
+    && buf.readUInt32BE(buf.length - 12) === 0 // IEND carries no data
+    && buf.readUInt32BE(buf.length - 8) === 0x49454e44; // 'IEND'
 }
 
 // SGR mouse report: ESC [ < button ; col ; row (M=press, m=release)
@@ -125,10 +187,14 @@ export function mapClickToPage(col, row, { cols, imageRows, imageTopRow, pngW, p
 // --- agent-browser access ---
 
 export function makeBrowser(session, bin = 'agent-browser') {
+  // Console rings on noisy pages reach several MB — Node's 1 MiB default
+  // maxBuffer would throw on every tick and freeze the pane for good.
+  const maxBuffer = 16 * 1024 * 1024;
   const run = async (...args) => {
     const { stdout } = await pExecFile(
       bin, ['--session', session, ...args, '--json'], {
         timeout: 10_000,
+        maxBuffer,
         env: {
           ...process.env,
           // If this call is the one that spawns the session daemon, the
@@ -138,7 +204,12 @@ export function makeBrowser(session, bin = 'agent-browser') {
             process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS || '1800000',
         },
       });
-    const parsed = JSON.parse(stdout);
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      throw new Error(`agent-browser returned non-JSON output (${stdout.length} bytes)`);
+    }
     if (parsed.success === false) throw new Error(parsed.error || 'agent-browser error');
     return parsed.data;
   };
@@ -155,12 +226,14 @@ export function makeBrowser(session, bin = 'agent-browser') {
     forward: async () => { await run('forward'); },
     reload: async () => { await run('reload'); },
     scroll: async (dir, px) => { await run('scroll', dir, String(px)); },
-    type: async text => { await run('type', text); },
+    // 'keyboard type' takes raw text; plain 'type' expects a selector first,
+    // so the prompt's free-form input only works through the keyboard path.
+    type: async text => { await run('keyboard', 'type', text); },
     eval: async js => { await run('eval', js); },
     sessionExists: async () => {
       try {
         const { stdout } = await pExecFile(
-          bin, ['session', 'list', '--json'], { timeout: 10_000 });
+          bin, ['session', 'list', '--json'], { timeout: 10_000, maxBuffer });
         // Exact match only: a substring hit (herdr-ws-w2 vs herdr-ws-w22)
         // would make the pane attach and auto-create a session it must not.
         const list = JSON.parse(stdout).data?.sessions ?? [];
@@ -176,15 +249,26 @@ export class Renderer {
   constructor(env = process.env) {
     this.env = env;
     this.session = deriveSession(env, process.cwd());
-    this.stateDir = env.HERDR_PLUGIN_STATE_DIR
+    // HERDR_PLUGIN_STATE_DIR comes from the environment: expand a literal
+    // leading '~' (nothing expands it inside a variable value) and refuse
+    // relative paths — otherwise state silently lands in a per-cwd tree.
+    let dir = env.HERDR_PLUGIN_STATE_DIR
       || path.join(env.HOME || '.', '.local/state/herdr-browser');
+    if (dir === '~' || dir.startsWith('~/')) dir = path.join(env.HOME || '.', dir.slice(1));
+    if (!path.isAbsolute(dir)) dir = path.join(env.HOME || '.', '.local/state/herdr-browser');
+    this.stateDir = dir;
     fs.mkdirSync(this.stateDir, { recursive: true });
     fs.chmodSync(this.stateDir, 0o700);
-    this.shot = path.join(this.stateDir, `shot-${env.HERDR_WORKSPACE_ID || 'default'}.png`);
-    this.browser = makeBrowser(this.session);
-    this.chafa = spawnSync('sh', ['-c', 'command -v chafa']).status === 0;
-    // Clamp: a tiny or negative interval would busy-loop spawning processes.
-    this.intervalMs = Math.max(250, Number(env.HERDR_BROWSER_INTERVAL_MS) || 1000);
+    this.shot = path.join(this.stateDir, `shot-${safeWsId(env.HERDR_WORKSPACE_ID)}.png`);
+    this.bin = 'agent-browser';
+    this.browser = makeBrowser(this.session, this.bin);
+    const onPath = cmd => spawnSync('sh', ['-c', `command -v ${cmd}`], { timeout: 5000 }).status === 0;
+    this.agentBrowser = onPath(this.bin);
+    this.chafa = onPath('chafa');
+    // Clamp both ends: tiny/negative values busy-loop; values past the
+    // setTimeout ceiling (2^31-1 after backoff) fire after ~1ms.
+    this.intervalMs = Math.min(86_400_000,
+      Math.max(250, Number(env.HERDR_BROWSER_INTERVAL_MS) || 1000));
     this.idleTicks = 0;
     this.consolePushes = 0;
     this.lastHash = '';
@@ -198,20 +282,28 @@ export class Renderer {
     this.selfCreated = false;
     this.promptState = null;
     this.paintQueue = Promise.resolve();
+    this.paintErrors = 0;
+    this.chafaFails = 0;
+    this.chafaCooldownUntil = 0;
+    this.stdoutBlocked = false;
   }
 
   // Serialize all screen-writing work: ticks and resize redraws must never
-  // interleave their stdout escape sequences.
+  // interleave their stdout escape sequences. Failures are counted, not
+  // silently swallowed forever — a persistent paint bug degrades the pane.
   enqueue(fn) {
-    this.paintQueue = this.paintQueue.then(fn, () => {});
+    this.paintQueue = this.paintQueue.then(async () => {
+      try { await fn(); } catch { this.paintErrors++; }
+    });
     return this.paintQueue;
   }
 
   size() {
     const cols = process.stdout.columns || 80;
     const rows = process.stdout.rows || 24;
-    const consoleRows = this.mode === 'text' ? rows - 3 : Math.max(4, Math.floor(rows * 0.3));
-    const imageRows = this.mode === 'text' ? 0 : rows - consoleRows - 4;
+    const consoleRows = this.mode === 'text'
+      ? Math.max(0, rows - 3) : Math.max(4, Math.floor(rows * 0.3));
+    const imageRows = this.mode === 'text' ? 0 : Math.max(0, rows - consoleRows - 4);
     return { cols, rows, imageRows, consoleRows, imageTopRow: 3, bottomRow: rows };
   }
 
@@ -224,7 +316,11 @@ export class Renderer {
   }
 
   header() {
-    const { cols } = this.size();
+    const { cols, rows } = this.size();
+    if (rows < 6) {
+      process.stdout.write(`${ESC}[1;1H${truncate(' terminal too small', cols)}${ESC}[K`);
+      return;
+    }
     const line1 = truncate(
       ` herdr-browser  session:${this.session}  mode:${this.mode}`, cols);
     const blankHint = this.lastUrl === 'about:blank' ? '  (nothing loaded yet)' : '';
@@ -250,20 +346,47 @@ export class Renderer {
   async renderImage() {
     const { cols, imageRows } = this.size();
     if (this.mode === 'text' || imageRows < 3 || !fs.existsSync(this.shot)) return;
+    // Backpressure: a stalled consumer must not buffer whole frames per tick.
+    if (this.stdoutBlocked) return;
+    // Circuit breaker: a persistently hanging chafa would otherwise burn its
+    // 15s timeout on every changed frame, freezing the pane's image forever.
+    if (this.chafaFails >= 3 && Date.now() < this.chafaCooldownUntil) return;
     const fmt = this.mode === 'kitty' ? 'kitty' : 'symbols';
     try {
       const { stdout } = await pExecFile(
-        'chafa', ['-f', fmt, '-s', `${cols}x${imageRows}`, '--animate', 'off', '--probe', 'off', this.shot],
+        'chafa', ['-f', fmt, '-s', `${cols}x${imageRows}`, '--animate', 'off',
+          '--probe', 'off', '--polite', 'on', '-c', 'full', this.shot],
         { maxBuffer: 32 * 1024 * 1024, timeout: 15_000 },
       );
-      if (this.mode === 'kitty') process.stdout.write(KITTY_DELETE);
+      this.chafaFails = 0;
+      if (this.mode === 'kitty') {
+        process.stdout.write(KITTY_DELETE);
+      } else {
+        // chafa emits only the rows the scaled image needs; erase the rest
+        // of the box or a shrinking frame leaves stale rows of the last one.
+        for (let r = 3; r < 3 + imageRows; r++) {
+          process.stdout.write(`${ESC}[${r};1H${ESC}[K`);
+        }
+      }
       process.stdout.write(`${ESC}[3;1H`);
-      process.stdout.write(stdout);
-    } catch { /* chafa hiccup: keep previous frame */ }
+      const flushed = process.stdout.write(stdout);
+      if (!flushed && !this.stdoutBlocked) {
+        this.stdoutBlocked = true;
+        process.stdout.once('drain', () => { this.stdoutBlocked = false; });
+      }
+    } catch {
+      this.chafaFails++;
+      if (this.chafaFails >= 3) {
+        this.chafaCooldownUntil = Date.now() + 60_000;
+        this.banner = 'image rendering paused: chafa not responding';
+        this.header();
+      }
+    }
   }
 
   renderConsole() {
     const { cols, rows, consoleRows } = this.size();
+    if (rows < 8 || consoleRows < 2) return; // below this, lines overpaint the header
     const top = rows - consoleRows;
     process.stdout.write(`${ESC}[${top};1H${'─'.repeat(cols)}`);
     const lines = this.consoleLines.slice(-(consoleRows - 1));
@@ -294,7 +417,11 @@ export class Renderer {
     // only run the non-creating existence check and wait.
     if (!this.attached) {
       if (!(await this.browser.sessionExists())) {
-        this.banner = `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`;
+        // A missing binary is not 'session not started yet' — the waiting
+        // advice below can never fix it, so say what's actually wrong.
+        this.banner = this.agentBrowser
+          ? `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`
+          : 'agent-browser is not installed — npm install -g agent-browser && agent-browser install';
         this.header();
         return;
       }
@@ -315,9 +442,13 @@ export class Renderer {
       }
       this.consoleState = { count: entries.length, tail: consoleTail(entries) };
 
-      const tmp = this.shot + '.tmp';
+      // Unique tmp name: a duplicate pane in this workspace must not be
+      // able to rename (and corrupt) this renderer's in-flight frame.
+      const tmp = `${this.shot}.${process.pid}.tmp`;
       await this.browser.screenshot(tmp);
-      const hash = createHash('md5').update(fs.readFileSync(tmp)).digest('hex');
+      const buf = fs.readFileSync(tmp);
+      if (!pngComplete(buf)) throw new Error('incomplete screenshot frame');
+      const hash = createHash('md5').update(buf).digest('hex');
       if (hash !== this.lastHash) {
         fs.renameSync(tmp, this.shot);
         fs.chmodSync(this.shot, 0o600);
@@ -337,6 +468,9 @@ export class Renderer {
         this.banner = 'agent-browser not responding — retrying';
       } else {
         this.attached = false;
+        // Ownership dies with the session that granted it: if someone later
+        // recreates a session under the same name, it is not ours to close.
+        this.selfCreated = false;
         this.failures = 0;
         this.banner = `session "${this.session}" ended — waiting for it to come back`;
       }
@@ -356,8 +490,11 @@ export class Renderer {
     if (!process.stdin.isTTY) return;
     process.stdin.setRawMode(true);
     process.stdin.resume();
+    // Streaming UTF-8 decode: escape sequences are pure ASCII (identical to
+    // the old latin1 path) but typed text keeps its multibyte characters.
+    const decoder = new TextDecoder('utf-8');
     process.stdin.on('data', chunk => {
-      const s = chunk.toString('latin1');
+      const s = decoder.decode(chunk, { stream: true });
       if (this.env.HB_DEBUG_INPUT) {
         fs.appendFileSync(this.env.HB_DEBUG_INPUT,
           `data sink=${!!this.probeSink} s=${JSON.stringify(s)}\n`);
@@ -386,6 +523,9 @@ export class Renderer {
   }
 
   onInput(s) {
+    // A prompt owns the keyboard; clicks while typing must not drive the
+    // page behind the prompt.
+    if (this.promptState) { this.promptInput(s); return; }
     const mouse = parseSgrMouse(s);
     if (mouse) {
       if (!mouse.release && mouse.button === 0 && this.attached) {
@@ -393,7 +533,6 @@ export class Renderer {
       }
       return;
     }
-    if (this.promptState) { this.promptInput(s); return; }
     if (!this.attached && !['u', 'q', '\x03'].includes(s)) return;
     switch (s) {
       case 'u': this.openPrompt('URL: ', v => this.navigate(v)); break;
@@ -414,6 +553,9 @@ export class Renderer {
 
   promptInput(s) {
     const p = this.promptState;
+    // Swallow mouse reports whole: a click while typing must neither cancel
+    // the prompt (the report starts with ESC) nor leak into the value.
+    s = s.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '');
     for (const ch of s) {
       if (ch === '\r' || ch === '\n') {
         this.promptState = null;
@@ -424,7 +566,9 @@ export class Renderer {
       }
       if (ch === '\x1b') { this.promptState = null; this.renderBottom(); return; }
       if (ch === '\x7f' || ch === '\b') p.value = p.value.slice(0, -1);
-      else if (ch >= ' ') p.value += ch;
+      // Printable chars only; 8-bit C1 controls (0x80-0x9f) are refused —
+      // the value is echoed to the terminal on every keystroke.
+      else if (ch >= ' ' && !(ch >= '\x7f' && ch <= '\x9f')) p.value += ch;
     }
     this.renderBottom();
   }
@@ -447,29 +591,33 @@ export class Renderer {
   }
 
   async navigate(v) {
-    // Same policy as the launchers' validate_url: plain http(s) only, and
-    // tell the user why nothing happened instead of failing silently.
-    // An explicit non-http scheme:// must be refused before prefixing —
-    // "https://file:///x" parses as a valid https URL with host "file".
-    // Bare host:port (localhost:3000) stays allowed. Schemes without //
-    // (javascript:, mailto:) end up as a non-numeric port and fail parsing.
+    // Same policy as the launchers' validate_url: plain http(s) only (any
+    // case), no credentials in the authority — and tell the user why nothing
+    // happened instead of failing silently. An explicit non-http scheme://
+    // must be refused before prefixing — "https://file:///x" parses as a
+    // valid https URL with host "file". Bare host:port (localhost:3000)
+    // stays allowed. Scheme-less junk containing '@' (mailto:user@x.com)
+    // prefixes into a valid https URL with a userinfo authority — refuse.
     const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(v);
     const u = /^https?:\/\//i.test(v) ? v : `https://${v}`;
     let parsed;
     try { parsed = new URL(u); } catch { parsed = null; }
     if ((explicitScheme && !/^https?:\/\//i.test(v))
-        || !parsed || !['http:', 'https:'].includes(parsed.protocol)) {
-      this.banner = `not an http(s) URL: ${truncate(v, 48)}`;
+        || v.startsWith('-')
+        || !parsed || !['http:', 'https:'].includes(parsed.protocol)
+        || !parsed.hostname || parsed.username || parsed.password) {
+      this.banner = `not an http(s) URL: ${truncate(sanitizeText(v), 48)}`;
       this.header();
       return;
     }
     // If this navigation is what brings the session to life, the pane owns
-    // it and closes it on quit. A session an agent created is never ours.
-    if (!this.selfCreated && !(await this.browser.sessionExists())) {
-      this.selfCreated = true;
-    }
-    this.attached = true; // the user is explicitly starting/driving the session
+    // it and closes it on quit. A session an agent created is never ours —
+    // and ownership is claimed only after the open actually succeeds, so a
+    // failed navigate can never make us kill someone else's session.
+    const existed = await this.browser.sessionExists();
     await this.browser.open(u);
+    if (!existed) this.selfCreated = true;
+    this.attached = true; // the user is explicitly starting/driving the session
   }
 
   async clickAt(col, row) {
@@ -497,12 +645,14 @@ export class Renderer {
     if (this.selfCreated) {
       // The session exists only because the user navigated in this pane;
       // quitting the pane ends it (and its daemon) instead of leaking it.
+      // Short timeout: a wedged daemon must not freeze the quit path — its
+      // own idle reaper collects the session anyway.
       try {
-        spawnSync('agent-browser', ['--session', this.session, 'close'],
-          { timeout: 8_000 });
+        spawnSync(this.bin, ['--session', this.session, 'close'],
+          { timeout: 2_000 });
       } catch { /* already gone */ }
     }
-    for (const f of [this.shot, this.shot + '.tmp']) {
+    for (const f of [this.shot, this.shot + '.tmp', `${this.shot}.${process.pid}.tmp`]) {
       try { fs.unlinkSync(f); } catch { /* already gone */ }
     }
     try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch { /* fine */ }
@@ -511,6 +661,11 @@ export class Renderer {
 
   async run() {
     this.setupInput();
+    // Register exits before anything that can hang (kitty probe, first
+    // paint) so a kill in that window still restores the terminal.
+    for (const sig of ['SIGTERM', 'SIGHUP', 'SIGINT']) {
+      process.on(sig, () => { this.cleanup(); process.exit(0); });
+    }
     const probe = await this.probeKitty();
     this.mode = pickRenderMode(this.env, this.configValue('render'), probe, this.chafa);
     process.stdout.write(`${ESC}[?1049h${ESC}[?25l`);
@@ -527,9 +682,6 @@ export class Renderer {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => this.enqueue(() => this.redrawAll()), 150);
     });
-    for (const sig of ['SIGTERM', 'SIGHUP', 'SIGINT']) {
-      process.on(sig, () => { this.cleanup(); process.exit(0); });
-    }
 
     while (true) {
       const before = this.sig();
@@ -544,7 +696,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // Construct inside the async wrapper so constructor failures (state-dir
   // permissions, etc.) hit the same catch and never flash-close the pane.
   (async () => { await new Renderer().run(); })().catch(err => {
-    process.stdout.write(`${ESC}[?1049l${ESC}[?25h`);
+    // Restore everything the interactive path enables — a pane left in raw
+    // mode (or with mouse reporting on) swallows keystrokes for the whole
+    // 10-minute linger below.
+    try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch { /* never set */ }
+    process.stdout.write(`${ESC}[?1000l${ESC}[?1006l${ESC}[?1049l${ESC}[?25h`);
     console.error('herdr-browser renderer crashed:', err.message);
     setTimeout(() => process.exit(1), 600_000);
   });

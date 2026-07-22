@@ -1,0 +1,124 @@
+{
+  "runId": "fd9c841e-cabf-4640-8e19-05b38d7546f3",
+  "agent": "ce-testing-reviewer",
+  "task": "Audit test coverage of /Users/vics/dev/structupath/herdr-browser. Context: Herdr terminal plugin. bin/renderer.mjs (~551 lines) — polling TUI renderer with click-mapping geometry, address bar, escape sanitization, poll backoff, session ownership; scripts/*.sh — open/close/browse/pane/lib; tests/ has renderer.test.mjs, launchers.test.mjs, pattern.test.mjs (57 tests, all passing via `npm test`, node:test runner). Read bin/renderer.mjs and every script and every test file fully. Map which functions/branches are tested vs untested. Identify: (1) high-risk untested paths (geometry edge cases, sanitize completeness, shell script logic tested only via launchers.test?), (2) weak assertions that would pass despite bugs, (3) missing integration-ish tests that are feasible with node:test (e.g. spawning renderer against a stub agent-browser binary on PATH), (4) brittle tests coupled to implementation. Deliver a prioritized list of specific test cases to add (name + what it asserts + which file), and note any production-code seams needed to make them testable. Do NOT edit files — report only.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "moonshotai/kimi-k3",
+  "attemptedModels": [
+    "moonshotai/kimi-k3"
+  ],
+  "modelAttempts": [
+    {
+      "model": "moonshotai/kimi-k3",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 60161,
+        "output": 24207,
+        "cacheRead": 868352,
+        "cacheWrite": 0,
+        "cost": 0.8040936000000001,
+        "turns": 25
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "16 concrete findings returned with file paths, line numbers, severity, and confidence (T1-T16): e.g. high/T1 tick() passive guard untested at bin/renderer.mjs:290-299; high/T2 navigate() accepts mailto:user@example.com (verified by node probe) at bin/renderer.mjs:434-455; high/T3 shell/JS URL-policy drift at scripts/lib.sh:41-47 vs tests/renderer.test.mjs (verified by execution); weak assertion T13 at tests/launchers.test.mjs; plus 18 prioritized named test cases (P0-P2) with target files, assertions, and required seams."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "npm test (node --test)",
+          "result": "passed",
+          "summary": "57 tests, 57 pass, 0 fail, duration ~1.5s — baseline confirmed before audit"
+        },
+        {
+          "command": "bash probe: validate_url 'HTTP://example.com' + browse-pane.sh prefix simulation",
+          "result": "passed",
+          "summary": "Confirmed T3: shell refuses uppercase scheme; browse-pane would mangle to https://HTTP://example.com"
+        },
+        {
+          "command": "node probe of navigate() URL parsing for mailto/userinfo/empty-host cases",
+          "result": "passed",
+          "summary": "Confirmed T2: 'mailto:user@example.com' OPENED as https://mailto:user@example.com/ despite comment claiming parse failure"
+        }
+      ],
+      "validationOutput": [
+        "node --test: tests 57, pass 57, fail 0",
+        "validate_url probe: 'HTTP REFUSED by validate_url'; browse-pane probe: 'https://HTTP://example.com'",
+        "navigate probe: mailto:user@example.com -> OPENED; javascript:alert(1) -> REJECTED; http:// -> REJECTED; //evil.com/x -> OPENED"
+      ],
+      "residualRisks": [
+        "run() poll-loop backoff (idleTicks/sig) unobservable without child-process integration test or a step() seam — P0-2 covers it if implemented",
+        "TTY-only paths (raw mode, kitty probe, resize debounce) remain uncoverable by pipe-based node:test without a PTY harness",
+        "pattern.test.mjs's Rust-regex↔JS-RegExp equivalence assumption silently breaks if the manifest pattern ever uses lookaround/backreferences",
+        "T2 and T3 require production decisions (which URL policy is correct); proposed tests P1-10/P1-11 fail until resolved"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "No diff — read-only audit. Reviewed bin/renderer.mjs (551 lines), 6 scripts, 3 test files; delivered 16 findings + 18 prioritized test cases + seam recommendations.",
+      "reviewFindings": [
+        "no blockers (report-only audit; no code changed)",
+        "high T1: bin/renderer.mjs:290-299 - tick() passive-viewer invariant (never auto-create session) has zero test coverage",
+        "high T2: bin/renderer.mjs:434-455 - navigate() accepts 'mailto:user@example.com' as https userinfo URL, contradicting inline comment; verified, unpinned by tests",
+        "high T3: scripts/lib.sh:41-47 vs bin/renderer.mjs:434-455 - validate_url refuses 'HTTP://x' while renderer test asserts acceptance; browse-pane.sh:20-23 mangles it; drift unpinned",
+        "high T4: bin/renderer.mjs:475-487 - clickAt guards and eval-coordinate pipeline untested end-to-end",
+        "medium T5: scripts/open.sh:14 - HERDR_PLUGIN_CLICKED_URL (primary link-click path) untested",
+        "medium T6/T7: bin/renderer.mjs:328-343,495-510 - tick failure lifecycle and selfCreated cleanup ownership untested",
+        "low T13: tests/launchers.test.mjs - /closed \\d+ pane(s)/ passes with any count; exact count knowable per fixture"
+      ],
+      "manualNotes": "Baseline suite is healthy (57/57). The highest-leverage single addition is P0-2 (child-process integration test against a stub agent-browser on PATH — fully feasible with node:test, no production seam required). Two findings (T2, T3) are production behavior bugs/decisions the test suite should pin once the parent decides intended URL policy; everything else is implementable as tests today using the existing fake-browser and PATH-stub patterns already present in the suite."
+    }
+  },
+  "transcriptPath": "/Users/vics/dev/structupath/herdr-browser/.pi-subagents/artifacts/fd9c841e-cabf-4640-8e19-05b38d7546f3_ce-testing-reviewer_3_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1784695887195
+}

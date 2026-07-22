@@ -11,7 +11,11 @@ import path from 'node:path';
 
 const pExecFile = promisify(execFile);
 const ESC = '\x1b';
-const KITTY_DELETE = `${ESC}_Ga=d,d=A${ESC}\\`;
+// Fixed graphics id for the pane's screenshot frame: re-transmitting data
+// for an id auto-replaces the previous frame, and deletes target only our
+// image instead of every image in the terminal (d=A).
+const KITTY_IMAGE_ID = 1;
+const KITTY_DELETE = `${ESC}_Ga=d,d=i,i=${KITTY_IMAGE_ID}${ESC}\\`;
 
 // --- pure helpers (unit-tested) ---
 
@@ -82,15 +86,40 @@ export function consoleTail(entries, n = 8) {
   return entries.slice(-n).map(e => e.text);
 }
 
-// Render-mode precedence: explicit config > kitty probe > symbols.
+// Render-mode precedence: explicit config > kitty probe > symbols > text.
 // probeResponse is the raw bytes the terminal answered to a kitty graphics
-// query; empty/undefined means no answer (not supported).
+// query; empty/undefined means no answer (not supported). Kitty mode emits
+// the PNG directly (f=100) and needs no chafa; symbols mode does.
 export function pickRenderMode(env, configDirValue, probeResponse, chafaAvailable) {
   const explicit = env.HERDR_BROWSER_RENDER || configDirValue;
-  if (explicit && ['kitty', 'symbols', 'text'].includes(explicit)) return explicit;
-  if (!chafaAvailable) return 'text';
+  if (explicit && ['kitty', 'symbols', 'text'].includes(explicit)) {
+    return explicit === 'symbols' && !chafaAvailable ? 'text' : explicit;
+  }
   if (probeResponse && probeResponse.includes('Gi=31;OK')) return 'kitty';
+  if (!chafaAvailable) return 'text';
   return 'symbols';
+}
+
+// Kitty graphics sequence for a PNG frame, transmitted as-is (f=100) in
+// <=4KiB base64 chunks with m=1/m=0 continuations. The frame replaces the
+// previous one in place (fixed image id) and is scaled by the terminal into
+// a cell box that preserves pixel aspect with the same ~1:2 cell geometry
+// chafa uses — so mapClickToPage math holds for both render modes.
+export function kittyImageSequence(pngBuf, pngW, pngH, cols, imageRows) {
+  const scale = Math.min(cols / pngW, (imageRows * 2) / pngH);
+  if (!(scale > 0)) return '';
+  const c = Math.max(1, Math.floor(pngW * scale));
+  const r = Math.max(1, Math.floor((pngH * scale) / 2));
+  const b64 = pngBuf.toString('base64');
+  const CHUNK = 4096;
+  const first = `a=T,f=100,i=${KITTY_IMAGE_ID},c=${c},r=${r},q=2`;
+  let out = '';
+  for (let off = 0; off < b64.length; off += CHUNK) {
+    const part = b64.slice(off, off + CHUNK);
+    const more = off + CHUNK < b64.length ? 1 : 0;
+    out += `${ESC}_G${off === 0 ? `${first},` : ''}m=${more};${part}${ESC}\\`;
+  }
+  return out;
 }
 
 // Display-cell width: enough wcwidth for header truncation — CJK wide
@@ -190,37 +219,64 @@ export function makeBrowser(session, bin = 'agent-browser') {
   // Console rings on noisy pages reach several MB — Node's 1 MiB default
   // maxBuffer would throw on every tick and freeze the pane for good.
   const maxBuffer = 16 * 1024 * 1024;
+  // If a call is the one that spawns the session daemon, the daemon
+  // self-reaps after idle instead of living forever. No-op for daemons an
+  // agent already owns (read at daemon spawn only).
+  const abEnv = () => ({
+    ...process.env,
+    AGENT_BROWSER_IDLE_TIMEOUT_MS:
+      process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS || '1800000',
+  });
+  const parse = (stdout, what) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      throw new Error(`agent-browser returned non-JSON ${what} (${stdout.length} bytes)`);
+    }
+    return parsed;
+  };
+  // batch --json returns an array of {command, error, result, success};
+  // --bail shortens the array after the first failure.
+  const batch = async (cmds, timeout = 10_000) => {
+    const { stdout } = await pExecFile(
+      bin, ['--session', session, 'batch', '--bail', '--json', ...cmds],
+      { timeout, maxBuffer, env: abEnv() });
+    const arr = parse(stdout, 'batch output');
+    for (const r of arr) {
+      if (r.success === false) throw new Error(r.error || 'agent-browser error');
+    }
+    if (arr.length < cmds.length) throw new Error('agent-browser batch incomplete');
+    return arr.map(r => r.result);
+  };
   const run = async (...args) => {
     const { stdout } = await pExecFile(
       bin, ['--session', session, ...args, '--json'], {
         timeout: 10_000,
         maxBuffer,
-        env: {
-          ...process.env,
-          // If this call is the one that spawns the session daemon, the
-          // daemon self-reaps after idle instead of living forever. No-op
-          // for daemons an agent already owns (read at daemon spawn only).
-          AGENT_BROWSER_IDLE_TIMEOUT_MS:
-            process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS || '1800000',
-        },
+        env: abEnv(),
       });
-    let parsed;
-    try {
-      parsed = JSON.parse(stdout);
-    } catch {
-      throw new Error(`agent-browser returned non-JSON output (${stdout.length} bytes)`);
-    }
+    const parsed = parse(stdout, 'output');
     if (parsed.success === false) throw new Error(parsed.error || 'agent-browser error');
     return parsed.data;
   };
   return {
-    url: async () => (await run('get', 'url')).url,
-    title: async () => (await run('get', 'title')).title ?? '',
-    console: async () => {
-      const d = await run('console');
-      return Array.isArray(d) ? d : (d.messages ?? []);
+    // One subprocess per tick instead of four: url + title + console +
+    // screenshot in a single batch call.
+    snapshot: async file => {
+      const [url, title, cons] = await batch(
+        ['get url', 'get title', 'console', `screenshot ${file}`], 15_000);
+      return {
+        url: url?.url ?? '',
+        title: title?.title ?? '',
+        entries: Array.isArray(cons) ? cons : (cons?.messages ?? []),
+      };
     },
-    screenshot: async file => { await run('screenshot', file); },
+    // A real CDP mouse click at page pixel coordinates — what you click is
+    // what Chrome clicks (overlays, canvas targets, shadow DOM included).
+    click: async (x, y) => {
+      await batch([`mouse move ${x} ${y}`, 'mouse down', 'mouse up']);
+    },
     open: async u => { await run('open', u); },
     back: async () => { await run('back'); },
     forward: async () => { await run('forward'); },
@@ -229,7 +285,6 @@ export function makeBrowser(session, bin = 'agent-browser') {
     // 'keyboard type' takes raw text; plain 'type' expects a selector first,
     // so the prompt's free-form input only works through the keyboard path.
     type: async text => { await run('keyboard', 'type', text); },
-    eval: async js => { await run('eval', js); },
     sessionExists: async () => {
       try {
         const { stdout } = await pExecFile(
@@ -286,6 +341,7 @@ export class Renderer {
     this.chafaFails = 0;
     this.chafaCooldownUntil = 0;
     this.stdoutBlocked = false;
+    this.inputBuf = '';
   }
 
   // Serialize all screen-writing work: ticks and resize redraws must never
@@ -348,25 +404,36 @@ export class Renderer {
     if (this.mode === 'text' || imageRows < 3 || !fs.existsSync(this.shot)) return;
     // Backpressure: a stalled consumer must not buffer whole frames per tick.
     if (this.stdoutBlocked) return;
+    if (this.mode === 'kitty') {
+      // No chafa, no RGBA re-encode: the PNG goes to the terminal as-is
+      // (typically 10-100x fewer bytes than chafa's kitty output).
+      try {
+        const buf = fs.readFileSync(this.shot);
+        const dims = pngDims(buf);
+        if (!dims) return;
+        const flushed = process.stdout.write(
+          `${ESC}[3;1H${kittyImageSequence(buf, dims.w, dims.h, cols, imageRows)}`);
+        if (!flushed && !this.stdoutBlocked) {
+          this.stdoutBlocked = true;
+          process.stdout.once('drain', () => { this.stdoutBlocked = false; });
+        }
+      } catch { /* shot vanished mid-read: next tick repaints */ }
+      return;
+    }
     // Circuit breaker: a persistently hanging chafa would otherwise burn its
     // 15s timeout on every changed frame, freezing the pane's image forever.
     if (this.chafaFails >= 3 && Date.now() < this.chafaCooldownUntil) return;
-    const fmt = this.mode === 'kitty' ? 'kitty' : 'symbols';
     try {
       const { stdout } = await pExecFile(
-        'chafa', ['-f', fmt, '-s', `${cols}x${imageRows}`, '--animate', 'off',
+        'chafa', ['-f', 'symbols', '-s', `${cols}x${imageRows}`, '--animate', 'off',
           '--probe', 'off', '--polite', 'on', '-c', 'full', this.shot],
         { maxBuffer: 32 * 1024 * 1024, timeout: 15_000 },
       );
       this.chafaFails = 0;
-      if (this.mode === 'kitty') {
-        process.stdout.write(KITTY_DELETE);
-      } else {
-        // chafa emits only the rows the scaled image needs; erase the rest
-        // of the box or a shrinking frame leaves stale rows of the last one.
-        for (let r = 3; r < 3 + imageRows; r++) {
-          process.stdout.write(`${ESC}[${r};1H${ESC}[K`);
-        }
+      // chafa emits only the rows the scaled image needs; erase the rest
+      // of the box or a shrinking frame leaves stale rows of the last one.
+      for (let r = 3; r < 3 + imageRows; r++) {
+        process.stdout.write(`${ESC}[${r};1H${ESC}[K`);
       }
       process.stdout.write(`${ESC}[3;1H`);
       const flushed = process.stdout.write(stdout);
@@ -430,22 +497,19 @@ export class Renderer {
     }
     let failed = false;
     try {
-      const [url, title, entries] = await Promise.all([
-        this.browser.url(), this.browser.title(), this.browser.console(),
-      ]);
-      this.lastUrl = sanitizeText(url);
-      this.lastTitle = sanitizeText(title);
-      const { newEntries, marker } = reconcileConsole(this.consoleState, entries);
+      // Unique tmp name: a duplicate pane in this workspace must not be
+      // able to rename (and corrupt) this renderer's in-flight frame.
+      const tmp = `${this.shot}.${process.pid}.tmp`;
+      const snap = await this.browser.snapshot(tmp);
+      this.lastUrl = sanitizeText(snap.url);
+      this.lastTitle = sanitizeText(snap.title);
+      const { newEntries, marker } = reconcileConsole(this.consoleState, snap.entries);
       if (newEntries.length || marker) {
         this.pushConsole(newEntries, marker);
         this.renderConsole();
       }
-      this.consoleState = { count: entries.length, tail: consoleTail(entries) };
+      this.consoleState = { count: snap.entries.length, tail: consoleTail(snap.entries) };
 
-      // Unique tmp name: a duplicate pane in this workspace must not be
-      // able to rename (and corrupt) this renderer's in-flight frame.
-      const tmp = `${this.shot}.${process.pid}.tmp`;
-      await this.browser.screenshot(tmp);
       const buf = fs.readFileSync(tmp);
       if (!pngComplete(buf)) throw new Error('incomplete screenshot frame');
       const hash = createHash('md5').update(buf).digest('hex');
@@ -500,7 +564,7 @@ export class Renderer {
           `data sink=${!!this.probeSink} s=${JSON.stringify(s)}\n`);
       }
       if (this.probeSink) this.probeSink(s);
-      else this.onInput(s);
+      else this.feed(s);
     });
   }
 
@@ -522,19 +586,44 @@ export class Renderer {
     });
   }
 
-  onInput(s) {
+  // stdin arrives in arbitrary chunks: a mouse report can straddle two
+  // reads and several keypresses can arrive coalesced. Buffer partial
+  // escape tails and split everything into single events before dispatch.
+  feed(s) {
+    s = this.inputBuf + s;
+    const tail = /\x1b\[<<?[\d;]*$/.exec(s);
+    this.inputBuf = tail ? tail[0] : '';
+    s = s.slice(0, s.length - this.inputBuf.length);
+    if (!s) return;
+    if (this.promptState) { this.promptInput(s); return; }
+    const mouseRe = /\x1b\[<\d+;\d+;\d+[Mm]/g;
+    let m;
+    let last = 0;
+    const parts = [];
+    const mice = [];
+    while ((m = mouseRe.exec(s))) {
+      parts.push(s.slice(last, m.index));
+      mice.push(m[0]);
+      last = m.index + m[0].length;
+    }
+    parts.push(s.slice(last));
+    for (let i = 0; i < parts.length; i++) {
+      for (const ch of parts[i]) this.onKey(ch);
+      if (i < mice.length) this.onMouse(parseSgrMouse(mice[i]));
+    }
+  }
+
+  onMouse(mouse) {
+    if (!mouse || mouse.release || mouse.button !== 0 || !this.attached) return;
+    this.userAction(() => this.clickAt(mouse.col, mouse.row));
+  }
+
+  onKey(ch) {
     // A prompt owns the keyboard; clicks while typing must not drive the
     // page behind the prompt.
-    if (this.promptState) { this.promptInput(s); return; }
-    const mouse = parseSgrMouse(s);
-    if (mouse) {
-      if (!mouse.release && mouse.button === 0 && this.attached) {
-        this.userAction(() => this.clickAt(mouse.col, mouse.row));
-      }
-      return;
-    }
-    if (!this.attached && !['u', 'q', '\x03'].includes(s)) return;
-    switch (s) {
+    if (this.promptState) { this.promptInput(ch); return; }
+    if (!this.attached && !['u', 'q', '\x03'].includes(ch)) return;
+    switch (ch) {
       case 'u': this.openPrompt('URL: ', v => this.navigate(v)); break;
       case 'i': this.openPrompt('type: ', v => this.browser.type(v)); break;
       case 'b': this.userAction(() => this.browser.back()); break;
@@ -628,8 +717,7 @@ export class Renderer {
     if (!dims) return;
     const pt = mapClickToPage(col, row, { cols, imageRows, imageTopRow, pngW: dims.w, pngH: dims.h });
     if (!pt) return;
-    await this.browser.eval(
-      `(() => { const el = document.elementFromPoint(${pt.x}, ${pt.y}); if (!el) return; if (el.focus) el.focus(); el.click(); })()`);
+    await this.browser.click(pt.x, pt.y);
   }
 
   async redrawAll() {

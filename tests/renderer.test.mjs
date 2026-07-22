@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   deriveSession, reconcileConsole, consoleTail, pickRenderMode, truncate,
   pngDims, pngComplete, parseSgrMouse, mapClickToPage, sanitizeText, Renderer,
-  makeBrowser, pollDelay, safeWsId,
+  makeBrowser, pollDelay, safeWsId, kittyImageSequence,
 } from '../bin/renderer.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -80,7 +80,11 @@ test('pickRenderMode precedence', () => {
   assert.equal(pickRenderMode({}, undefined, '\x1b_Gi=31;OK\x1b\\\x1b[?62c', true), 'kitty');
   assert.equal(pickRenderMode({}, undefined, '\x1b[?62c', true), 'symbols');
   assert.equal(pickRenderMode({}, undefined, '', true), 'symbols');
-  assert.equal(pickRenderMode({}, undefined, 'Gi=31;OK', false), 'text');
+  // Kitty mode emits the PNG directly (f=100) — no chafa needed.
+  assert.equal(pickRenderMode({}, undefined, 'Gi=31;OK', false), 'kitty');
+  assert.equal(pickRenderMode({}, 'symbols', '', false), 'text',
+    'explicit symbols without chafa degrades to text');
+  assert.equal(pickRenderMode({}, undefined, '', false), 'text');
 });
 
 test('deriveSession precedence: env > config > workspace > cwd', () => {
@@ -333,14 +337,11 @@ test('tick stays passive when the session is missing', async () => {
   const calls = [];
   r.browser = {
     sessionExists: async () => { calls.push('sessionExists'); return false; },
-    url: async () => { calls.push('url'); return ''; },
-    title: async () => { calls.push('title'); return ''; },
-    console: async () => { calls.push('console'); return []; },
-    screenshot: async () => { calls.push('screenshot'); },
+    snapshot: async () => { calls.push('snapshot'); },
   };
   await r.tick();
   assert.deepEqual(calls, ['sessionExists'],
-    'get/console/screenshot would auto-create a headless Chrome — never call them unattached');
+    'snapshot would auto-create a headless Chrome — never call it unattached');
   assert.match(r.banner, /waiting for session/);
 });
 
@@ -382,8 +383,10 @@ test('tick promotes only changed, complete frames', async () => {
   r.renderImage = async () => { renders++; };
   let shot = PNG_1PX;
   r.browser = {
-    url: async () => 'https://x', title: async () => 't', console: async () => [],
-    screenshot: async f => { fs.writeFileSync(f, shot); },
+    snapshot: async f => {
+      fs.writeFileSync(f, shot);
+      return { url: 'https://x', title: 't', entries: [] };
+    },
     sessionExists: async () => true,
   };
   await r.tick();
@@ -465,22 +468,23 @@ test('clickAt maps in-image clicks and ignores out-of-image clicks', async () =>
   const r = quiet(mkRenderer());
   r.size = () => ({ cols: 100, rows: 37, imageRows: 30, consoleRows: 7, imageTopRow: 3, bottomRow: 37 });
   fs.writeFileSync(r.shot, PNG_1PX);
-  const evals = [];
-  r.browser = { eval: async js => evals.push(js) };
+  const clicks = [];
+  r.browser = { click: async (x, y) => clicks.push([x, y]) };
   await r.clickAt(1, 1);
   await r.clickAt(1, 33);
   await r.clickAt(1, 36);
-  assert.equal(evals.length, 0, 'header/console rows never eval into the page');
+  assert.equal(clicks.length, 0, 'header/console rows never click the page');
   fs.rmSync(r.shot);
   await r.clickAt(5, 10);
-  assert.equal(evals.length, 0, 'missing screenshot never evals');
+  assert.equal(clicks.length, 0, 'missing screenshot never clicks');
   fs.writeFileSync(r.shot, 'junk');
   await r.clickAt(5, 10);
-  assert.equal(evals.length, 0, 'corrupt screenshot never evals');
+  assert.equal(clicks.length, 0, 'corrupt screenshot never clicks');
   fs.writeFileSync(r.shot, PNG_1PX);
   await r.clickAt(1, 3);
-  assert.equal(evals.length, 1);
-  assert.match(evals[0], /elementFromPoint\(\d+, \d+\)/);
+  assert.equal(clicks.length, 1);
+  assert.deepEqual(clicks[0].map(Number.isInteger), [true, true],
+    'page-pixel integer coordinates');
 });
 
 test('cleanup closes only self-created sessions and removes shot files', () => {
@@ -546,15 +550,15 @@ test('prompt mode swallows mouse reports without cancelling', () => {
   assert.equal(r.promptState.value, 'abcd', 'report bytes never enter the value');
 });
 
-test('onInput gates keys and clicks while unattached', async () => {
+test('feed gates keys and clicks while unattached', async () => {
   const r = quiet(mkRenderer());
   const calls = [];
   r.browser = new Proxy({}, { get: () => async () => calls.push('call') });
-  r.onInput('b'); r.onInput('r'); r.onInput('j');
-  r.onInput('\x1b[<0;10;5M');
+  r.feed('b'); r.feed('r'); r.feed('j');
+  r.feed('\x1b[<0;10;5M');
   await flush();
   assert.equal(calls.length, 0, 'unattached pane ignores drive keys and clicks');
-  r.onInput('u');
+  r.feed('u');
   assert.notEqual(r.promptState, null, 'u always opens the address bar');
 });
 
@@ -591,4 +595,107 @@ test('reconcile edge matrix: empty tail, ring boundary, duplicate texts', () => 
   assert.equal(r2.marker, false, 'no rotation at the boundary');
   const r3 = reconcileConsole({ count: 2, tail: ['x', 'x'] }, e(['x', 'x', 'x', 'x']), 1000);
   assert.deepEqual(r3.newEntries.map(x => x.text), ['x', 'x']);
+});
+
+// --- Wave 2a: batch ticks, real CDP clicks, kitty f=100, input reassembly ---
+
+test('kittyImageSequence chunks the PNG and preserves aspect geometry', () => {
+  // 1280x720 into a 100x30 cell box: same scale math as mapClickToPage.
+  const payload = Buffer.alloc(10_000, 7); // forces 2+ chunks in base64
+  const seq = kittyImageSequence(payload, 1280, 720, 100, 30);
+  const packets = seq.split('\x1b\\').filter(Boolean);
+  assert.ok(packets.length >= 2, 'multi-chunk transmission');
+  assert.match(packets[0], /^\x1b_Ga=T,f=100,i=1,c=100,r=28,q=2,m=1;/);
+  assert.match(packets.at(-1), /m=0;/);
+  for (const p of packets) {
+    const payloadB64 = p.replace(/^\x1b_G[^;]*;/, '');
+    assert.ok(payloadB64.length <= 4096, 'chunk payload within spec');
+  }
+  assert.equal(kittyImageSequence(payload, 1280, 720, 100, 0), '', 'no box, no image');
+});
+
+test('kittyImageSequence geometry matches mapClickToPage letterboxing', () => {
+  // A click at the bottom-right of the fitted box must map to the png corner.
+  const geom = { cols: 100, imageRows: 30, imageTopRow: 3, pngW: 1280, pngH: 720 };
+  const pt = mapClickToPage(100, 3 + 27, geom); // r=28 drawn rows
+  assert.ok(pt.x > 1200 && pt.y > 700, `corner maps deep into the page: ${pt.x},${pt.y}`);
+});
+
+test('feed processes coalesced keypresses individually', async () => {
+  const r = quiet(mkRenderer());
+  r.attached = true;
+  const scrolls = [];
+  r.browser = { scroll: async dir => scrolls.push(dir) };
+  r.feed('jjk');
+  await flush();
+  assert.deepEqual(scrolls, ['down', 'down', 'up'],
+    'coalesced keys must each dispatch, not match nothing as a whole chunk');
+});
+
+test('feed reassembles a mouse report split across chunks', async () => {
+  const r = quiet(mkRenderer());
+  r.attached = true;
+  r.size = () => ({ cols: 100, rows: 37, imageRows: 30, consoleRows: 7, imageTopRow: 3, bottomRow: 37 });
+  fs.writeFileSync(r.shot, PNG_1PX);
+  const clicks = [];
+  r.browser = { click: async (x, y) => clicks.push([x, y]) };
+  r.feed('\x1b[<0;40;1');
+  await flush();
+  assert.equal(clicks.length, 0, 'partial report must not fire');
+  r.feed('0M');
+  await flush();
+  assert.equal(clicks.length, 1, 'completed report fires once');
+});
+
+test('makeBrowser.snapshot parses the batch array shape', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-batch-'));
+  const stub = path.join(dir, 'ab-stub');
+  fs.writeFileSync(stub, `#!/usr/bin/env bash
+printf '%s' '[{"command":["get","url"],"error":null,"result":{"url":"https://x/"},"success":true},{"command":["get","title"],"error":null,"result":{"title":"T"},"success":true},{"command":["console"],"error":null,"result":{"messages":[{"text":"hi","type":"log"}]},"success":true},{"command":["screenshot","/tmp/x"],"error":null,"result":{"path":"/tmp/x"},"success":true}]'
+`);
+  fs.chmodSync(stub, 0o755);
+  const snap = await makeBrowser('s', stub).snapshot('/tmp/x');
+  assert.deepEqual(snap, { url: 'https://x/', title: 'T', entries: [{ text: 'hi', type: 'log' }] });
+});
+
+test('makeBrowser.snapshot surfaces the first batch error', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-batcherr-'));
+  const stub = path.join(dir, 'ab-stub');
+  fs.writeFileSync(stub, `#!/usr/bin/env bash
+printf '%s' '[{"command":["get","url"],"error":"session gone","result":null,"success":false}]'
+`);
+  fs.chmodSync(stub, 0o755);
+  await assert.rejects(makeBrowser('s', stub).snapshot('/tmp/x'), /session gone/);
+});
+
+test('makeBrowser.click batches move/down/up in one call', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-click-'));
+  const logf = path.join(dir, 'log');
+  const stub = path.join(dir, 'ab-stub');
+  fs.writeFileSync(stub, `#!/usr/bin/env bash
+echo "$@" >> "${logf}"
+printf '%s' '[{"success":true,"result":{}},{"success":true,"result":{}},{"success":true,"result":{}}]'
+`);
+  fs.chmodSync(stub, 0o755);
+  await makeBrowser('s', stub).click(634, 371);
+  const logged = fs.readFileSync(logf, 'utf8');
+  assert.match(logged, /batch --bail --json mouse move 634 371 mouse down mouse up/);
+});
+
+test('reconcileConsole property: append-only streams yield exactly the suffix', () => {
+  // Deterministic LCG so failures reproduce.
+  let seed = 42;
+  const rnd = n => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const vocab = ['a', 'b', 'c', 'x', 'x', 'x']; // heavy duplicates on purpose
+  for (let iter = 0; iter < 200; iter++) {
+    const before = Array.from({ length: rnd(40) }, () => vocab[rnd(vocab.length)]);
+    const added = Array.from({ length: rnd(15) }, () => vocab[rnd(vocab.length)]);
+    const all = [...before, ...added];
+    const prev = { count: before.length, tail: consoleTail(e(before)) };
+    const { newEntries, marker } = reconcileConsole(prev, e(all));
+    if (!marker) {
+      assert.deepEqual(newEntries.map(x => x.text), added,
+        `iter ${iter}: appended entries must arrive exactly once`);
+    }
+  }
 });

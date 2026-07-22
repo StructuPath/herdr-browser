@@ -25,8 +25,9 @@ herdr plugin install StructuPath/herdr-browser
   npm install -g agent-browser && agent-browser install
   ```
 
-- **chafa** — renders screenshots into the terminal (optional but strongly
-  recommended; without it the pane runs text-only):
+- **chafa** — renders screenshots into the terminal in `symbols` mode
+  (optional; `kitty` mode transmits the PNG directly and `text` mode needs
+  nothing):
 
   ```sh
   brew install chafa        # macOS
@@ -76,17 +77,18 @@ shared session directly (your agent sees the same browser state):
 | Input | Action |
 | ------- | -------- |
 | `u` | address bar — type any URL, Enter to go (`https://` assumed) |
-| click on the screenshot | clicks the real page at that spot |
+| click on the screenshot | clicks the real page at that spot (real Chrome mouse events) |
 | `i` | type text into the focused element |
 | `b` / `f` | history back / forward |
 | `r` | reload |
 | `j` / `k` / space | scroll down / up |
 | `q` | close the pane (session keeps running) |
 
-Clicks map through the screenshot geometry to page coordinates, so what you
-click is what Chrome clicks. Expect roughly a one-second round trip per
-interaction — this is browsing-by-snapshot, built for dev verification, not
-for reading Twitter.
+Clicks map through the screenshot geometry to page coordinates and are sent
+as real CDP mouse press/release events, so what you click is what Chrome
+clicks — overlays, canvas targets, and shadow DOM included. Expect roughly a
+one-second round trip per interaction — this is browsing-by-snapshot, built
+for dev verification, not for reading Twitter.
 
 ## Real-pixel screenshots (optional)
 
@@ -152,7 +154,8 @@ state you no longer need.
 - **Pane says "session … is not running"** — nothing has started that
   workspace's browser yet. Invoke Open with a URL, click a localhost link, or
   have your agent use the session name in the header.
-- **Text-only mode** — chafa isn't installed (`brew install chafa`).
+- **Text-only mode** — chafa isn't installed and your terminal doesn't
+  support Kitty graphics (`brew install chafa` for symbols mode).
 - **No image, garbled block art** — your outer terminal doesn't support Kitty
   graphics; the renderer should fall back to `symbols` automatically. Force it:
   `echo symbols > "$(herdr plugin config-dir structupath.browser)/render"`.

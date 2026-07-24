@@ -8,6 +8,8 @@ human-visible view of that same session in another. You can inspect the page,
 watch console output and page errors, click real browser coordinates, type,
 scroll, navigate, and record the flow without leaving Herdr.
 
+![herdr-browser demo: driving a page from a herdr pane](assets/herdr-browser-demo.gif)
+
 **Docs:** the [StructuPath Herdr Plugins wiki](https://github.com/StructuPath/herdr-browser/wiki)
 is the practical guide to this plugin and its three siblings (Guard, Swarm,
 Conductor).

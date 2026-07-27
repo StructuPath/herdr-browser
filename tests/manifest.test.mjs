@@ -9,7 +9,9 @@ import { validateRepository } from "../scripts/check-manifest.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function fixture(t) {
-	const base = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-browser-manifest-"));
+	const base = fs.mkdtempSync(
+		path.join(os.tmpdir(), "herdr-browser-manifest-"),
+	);
 	const dir = path.join(base, "repository");
 	fs.mkdirSync(path.join(dir, "scripts"), { recursive: true });
 	fs.writeFileSync(
@@ -77,7 +79,10 @@ test("manifest validation rejects lexical and symlink repository escapes", (t) =
 
 test("manifest validation reports invalid TOML", (t) => {
 	const { dir } = fixture(t);
-	fs.writeFileSync(path.join(dir, "herdr-plugin.toml"), 'version = "unterminated\n');
+	fs.writeFileSync(
+		path.join(dir, "herdr-plugin.toml"),
+		'version = "unterminated\n',
+	);
 
 	assert.ok(
 		validateRepository(dir).errors.some((error) =>

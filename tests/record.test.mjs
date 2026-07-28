@@ -305,9 +305,13 @@ function writeLockOwner(f, value) {
 	const runs = path.join(f.state, "runs");
 	const lock = path.join(runs, ".record-workspace_1.lock");
 	fs.mkdirSync(lock, { recursive: true, mode: 0o700 });
-	fs.writeFileSync(path.join(lock, "owner.json"), `${JSON.stringify(value)}\n`, {
-		mode: 0o600,
-	});
+	fs.writeFileSync(
+		path.join(lock, "owner.json"),
+		`${JSON.stringify(value)}\n`,
+		{
+			mode: 0o600,
+		},
+	);
 	return lock;
 }
 
@@ -326,32 +330,104 @@ test("Stop rejects every incompatible pointer and manifest field before engine s
 		["pointer schema", "pointer", (value) => (value.schema_version = 999)],
 		["pointer unknown field", "pointer", (value) => (value.extra = true)],
 		["pointer run", "pointer", (value) => (value.run_id = "foreign-run")],
-		["pointer workspace", "pointer", (value) => (value.workspace_id = "foreign")],
-		["pointer session", "pointer", (value) => (value.browser_session = "foreign")],
-		["pointer stop flag", "pointer", (value) => (value.engine_stopped = "false")],
+		[
+			"pointer workspace",
+			"pointer",
+			(value) => (value.workspace_id = "foreign"),
+		],
+		[
+			"pointer session",
+			"pointer",
+			(value) => (value.browser_session = "foreign"),
+		],
+		[
+			"pointer stop flag",
+			"pointer",
+			(value) => (value.engine_stopped = "false"),
+		],
 		["manifest schema", "manifest", (value) => (value.schema_version = 999)],
 		["manifest unknown field", "manifest", (value) => (value.extra = true)],
-		["manifest evidence type", "manifest", (value) => (value.evidence_type = "not-browser")],
+		[
+			"manifest evidence type",
+			"manifest",
+			(value) => (value.evidence_type = "not-browser"),
+		],
 		["manifest run", "manifest", (value) => (value.run_id = "foreign-run")],
 		["plugin id", "manifest", (value) => (value.plugin.id = "foreign")],
 		["plugin version", "manifest", (value) => (value.plugin.version = "999")],
-		["plugin unknown field", "manifest", (value) => (value.plugin.extra = true)],
-		["manifest workspace", "manifest", (value) => (value.workspace_id = "foreign")],
-		["manifest session", "manifest", (value) => (value.browser_session = "foreign")],
+		[
+			"plugin unknown field",
+			"manifest",
+			(value) => (value.plugin.extra = true),
+		],
+		[
+			"manifest workspace",
+			"manifest",
+			(value) => (value.workspace_id = "foreign"),
+		],
+		[
+			"manifest session",
+			"manifest",
+			(value) => (value.browser_session = "foreign"),
+		],
 		["manifest status", "manifest", (value) => (value.status = "failed")],
-		["start timestamp", "manifest", (value) => (value.started_at = "yesterday")],
-		["premature completion timestamp", "manifest", (value) => (value.completed_at = new Date().toISOString())],
-		["context reset", "manifest", (value) => (value.recording_context_reset = false)],
-		["artifact path", "manifest", (value) => (value.artifact.path = "../../outside")],
-		["artifact media", "manifest", (value) => (value.artifact.media_type = "text/plain")],
+		[
+			"start timestamp",
+			"manifest",
+			(value) => (value.started_at = "yesterday"),
+		],
+		[
+			"premature completion timestamp",
+			"manifest",
+			(value) => (value.completed_at = new Date().toISOString()),
+		],
+		[
+			"context reset",
+			"manifest",
+			(value) => (value.recording_context_reset = false),
+		],
+		[
+			"artifact path",
+			"manifest",
+			(value) => (value.artifact.path = "../../outside"),
+		],
+		[
+			"artifact media",
+			"manifest",
+			(value) => (value.artifact.media_type = "text/plain"),
+		],
 		["artifact bytes", "manifest", (value) => (value.artifact.bytes = 14)],
-		["artifact digest", "manifest", (value) => (value.artifact.sha256 = "a".repeat(64))],
-		["artifact unknown field", "manifest", (value) => (value.artifact.extra = true)],
-		["review status", "manifest", (value) => (value.review.status = "reviewed")],
+		[
+			"artifact digest",
+			"manifest",
+			(value) => (value.artifact.sha256 = "a".repeat(64)),
+		],
+		[
+			"artifact unknown field",
+			"manifest",
+			(value) => (value.artifact.extra = true),
+		],
+		[
+			"review status",
+			"manifest",
+			(value) => (value.review.status = "reviewed"),
+		],
 		["review required", "manifest", (value) => (value.review.required = false)],
-		["review attestation", "manifest", (value) => (value.review.attestation = "self-attested")],
-		["review unknown field", "manifest", (value) => (value.review.extra = true)],
-		["error type", "manifest", (value) => (value.error = { message: "hostile" })],
+		[
+			"review attestation",
+			"manifest",
+			(value) => (value.review.attestation = "self-attested"),
+		],
+		[
+			"review unknown field",
+			"manifest",
+			(value) => (value.review.extra = true),
+		],
+		[
+			"error type",
+			"manifest",
+			(value) => (value.error = { message: "hostile" }),
+		],
 	];
 
 	for (const [name, target, mutate] of mutations) {
@@ -389,7 +465,10 @@ test("one run ID is atomically claimed across different workspaces", async (t) =
 	]);
 	assert.deepEqual([first.status, second.status].sort(), [0, 3]);
 	const calls = fs.readFileSync(f.calls, "utf8").trim().split("\n");
-	assert.equal(calls.filter((line) => line.includes(" record start ")).length, 1);
+	assert.equal(
+		calls.filter((line) => line.includes(" record start ")).length,
+		1,
+	);
 	const pointers = fs
 		.readdirSync(path.join(f.state, "runs"))
 		.filter((name) => name.startsWith("active-"));
@@ -397,7 +476,10 @@ test("one run ID is atomically claimed across different workspaces", async (t) =
 	const b = bundle(f, "shared-run");
 	const manifest = json(b.manifest);
 	assert.ok(["workspace_a", "workspace_b"].includes(manifest.workspace_id));
-	assert.equal(manifest.browser_session, manifest.workspace_id === "workspace_a" ? "session-a" : "session-b");
+	assert.equal(
+		manifest.browser_session,
+		manifest.workspace_id === "workspace_a" ? "session-a" : "session-b",
+	);
 	assert.equal(fs.readFileSync(b.artifact, "utf8"), "webm-test-data");
 });
 
@@ -425,7 +507,10 @@ test("failed post-start validation compensates and only then records terminal fa
 });
 
 test("failed compensation retains truthful retryable needs-attention state", (t) => {
-	const outside = path.join(os.tmpdir(), `herdr-outside-${crypto.randomUUID()}`);
+	const outside = path.join(
+		os.tmpdir(),
+		`herdr-outside-${crypto.randomUUID()}`,
+	);
 	const active = path.join(os.tmpdir(), `herdr-active-${crypto.randomUUID()}`);
 	const f = fixture(t, {
 		AB_ACTIVE: active,
@@ -610,7 +695,10 @@ test("workspace locks fail closed for live and malformed owners", async (t) => {
 		const result = invoke(f, "start");
 		assert.equal(result.status, 3);
 		assert.match(result.stderr, /cannot be safely reclaimed/);
-		assert.match(result.stderr, /inspect .*\.record-workspace_1\.lock manually/);
+		assert.match(
+			result.stderr,
+			/inspect .*\.record-workspace_1\.lock manually/,
+		);
 		assert.equal(fs.existsSync(lock), true);
 		assert.equal(fs.existsSync(f.calls), false);
 	});
@@ -634,7 +722,10 @@ test("concurrent stale-lock reclamation still permits only one workspace action"
 	]);
 	assert.deepEqual([first.status, second.status].sort(), [0, 3]);
 	const calls = fs.readFileSync(f.calls, "utf8").trim().split("\n");
-	assert.equal(calls.filter((line) => line.includes(" record start ")).length, 1);
+	assert.equal(
+		calls.filter((line) => line.includes(" record start ")).length,
+		1,
+	);
 	const pointers = fs
 		.readdirSync(path.join(f.state, "runs"))
 		.filter((name) => name.startsWith("active-"));

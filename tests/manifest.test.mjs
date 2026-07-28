@@ -44,10 +44,7 @@ test("Wave 0 drift contracts stay represented in source and hosted CI", () => {
 		"utf8",
 	);
 	assert.equal(renderer.includes(0), false);
-	assert.match(
-		renderer.toString("utf8"),
-		/stays passive until explicit pane input/,
-	);
+	assert.match(renderer.toString("utf8"), /stays passive until explicit pane input/);
 	assert.match(browsePane, /npm install -g carbonyl@next/);
 	assert.match(workflow, /run: shellcheck scripts\/\*\.sh/);
 });

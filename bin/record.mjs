@@ -70,8 +70,7 @@ function canonicalState(rawState) {
 }
 
 function assertSafeParent(root, target, kind) {
-	if (!isContained(root, target))
-		throw new Error(`${kind} escapes plugin state`);
+	if (!isContained(root, target)) throw new Error(`${kind} escapes plugin state`);
 	const parent = fs.realpathSync(path.dirname(target));
 	if (parent !== root && !isContained(root, parent))
 		throw new Error(`${kind} parent escapes plugin state`);
@@ -167,9 +166,7 @@ export function readJsonFile(root, target, label, hooks = {}) {
 		if (!before.isFile() || before.size > BigInt(JSON_LIMIT))
 			throw new Error(`${label} must be a bounded regular file`);
 		hooks.afterOpen?.();
-		const parsed = JSON.parse(
-			readDescriptor(fd, Number(before.size)).toString("utf8"),
-		);
+		const parsed = JSON.parse(readDescriptor(fd, Number(before.size)).toString("utf8"));
 		const after = descriptorStat(fd);
 		if (!sameDescriptorGeneration(before, after))
 			throw new Error(`${label} changed while it was being read`);
@@ -192,12 +189,8 @@ function runIdFromEnvironment() {
 		const configRoot = fs.realpathSync(configDir);
 		const source = path.join(configRoot, "run-id");
 		if (pathEntryExists(source)) {
-			const firstLine = readBoundedText(
-				configRoot,
-				source,
-				"run-id config",
-				1024,
-			).split(/\r?\n/, 1)[0];
+			const firstLine = readBoundedText(configRoot, source, "run-id config", 1024)
+				.split(/\r?\n/, 1)[0];
 			if (firstLine) return validateRunId(firstLine);
 		}
 	}
@@ -303,10 +296,7 @@ function assertExactKeys(value, keys, label) {
 		throw new Error(`${label} must be an object`);
 	const actual = Object.keys(value).sort();
 	const expected = [...keys].sort();
-	if (
-		actual.length !== expected.length ||
-		actual.some((key, index) => key !== expected[index])
-	)
+	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index]))
 		throw new Error(`${label} has incompatible fields`);
 }
 
@@ -323,9 +313,7 @@ function assertIsoTimestamp(value, label) {
 function assertErrorField(value) {
 	if (
 		value !== null &&
-		(typeof value !== "string" ||
-			value.length > 512 ||
-			/[\u0000-\u001f\u007f]/.test(value))
+		(typeof value !== "string" || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value))
 	) {
 		throw new Error("evidence manifest error is invalid");
 	}
@@ -334,13 +322,7 @@ function assertErrorField(value) {
 function validatePointer(pointer, identity) {
 	assertExactKeys(
 		pointer,
-		[
-			"schema_version",
-			"run_id",
-			"workspace_id",
-			"browser_session",
-			"engine_stopped",
-		],
+		["schema_version", "run_id", "workspace_id", "browser_session", "engine_stopped"],
 		"active recording pointer",
 	);
 	if (pointer.schema_version !== SCHEMA_VERSION)
@@ -377,11 +359,7 @@ function validateManifest(manifest, identity, expectedStatus) {
 		],
 		"evidence manifest",
 	);
-	assertExactKeys(
-		manifest.plugin,
-		["id", "version"],
-		"evidence manifest plugin",
-	);
+	assertExactKeys(manifest.plugin, ["id", "version"], "evidence manifest plugin");
 	assertExactKeys(
 		manifest.artifact,
 		["path", "media_type", "bytes", "sha256"],
@@ -459,9 +437,7 @@ function validateLockOwner(owner) {
 		owner.hostname !== os.hostname() ||
 		!LOCK_NONCE_RE.test(owner.nonce)
 	) {
-		throw new Error(
-			"recording lock owner is malformed or belongs to another host",
-		);
+		throw new Error("recording lock owner is malformed or belongs to another host");
 	}
 	assertIsoTimestamp(owner.started_at, "recording lock started_at");
 }
@@ -509,9 +485,7 @@ function acquireWorkspaceLock(root, workspaceId) {
 			);
 		}
 		if (!processIsProvenDead(owner.pid))
-			throw new Error(
-				"another recording action is in progress for this workspace",
-			);
+			throw new Error("another recording action is in progress for this workspace");
 
 		const tombstone = `${lock}.stale-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
 		try {
@@ -582,11 +556,7 @@ function privatizeArtifactIfPresent(root, target) {
 		if (!stat.isFile())
 			throw new Error("recording artifact must be a regular file");
 		fs.fchmodSync(fd, 0o600);
-		assertPathMatchesDescriptor(
-			target,
-			descriptorStat(fd),
-			"recording artifact",
-		);
+		assertPathMatchesDescriptor(target, descriptorStat(fd), "recording artifact");
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -726,9 +696,7 @@ function recoverComplete(root, paths, pointer, manifest) {
 		artifact.bytes !== manifest.artifact.bytes ||
 		artifact.sha256 !== manifest.artifact.sha256
 	) {
-		throw new Error(
-			"completed recording artifact no longer matches its manifest",
-		);
+		throw new Error("completed recording artifact no longer matches its manifest");
 	}
 	durableUnlink(paths.pointer, paths.runs);
 	console.log(

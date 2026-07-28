@@ -6,7 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { atomicWriteJson, MAX_RECORDING_BYTES, validateRunId } from "../bin/record.mjs";
+import {
+	atomicWriteJson,
+	MAX_RECORDING_BYTES,
+	validateRunId,
+} from "../bin/record.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -18,7 +22,9 @@ function fixture(t, overrides = {}) {
 	const calls = path.join(base, "calls");
 	fs.mkdirSync(bin);
 	fs.mkdirSync(config);
-	fs.writeFileSync(path.join(bin, "agent-browser"), `#!/usr/bin/env bash
+	fs.writeFileSync(
+		path.join(bin, "agent-browser"),
+		`#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$AB_CALLS"
 if [ "$4" = "start" ]; then
   [ "${"$"}{AB_START_FAIL:-0}" = 1 ] && exit 9
@@ -31,7 +37,9 @@ else
   [ "${"$"}{AB_STOP_FAIL:-0}" = 1 ] && exit 8
 fi
 exit 0
-`, { mode: 0o755 });
+`,
+		{ mode: 0o755 },
+	);
 	const env = {
 		...process.env,
 		PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
@@ -50,7 +58,8 @@ exit 0
 
 function invoke(f, mode, overrides = {}) {
 	return spawnSync("bash", [path.join(root, "scripts/record.sh"), mode], {
-		env: { ...f.env, ...overrides }, encoding: "utf8",
+		env: { ...f.env, ...overrides },
+		encoding: "utf8",
 	});
 }
 
@@ -64,7 +73,9 @@ function bundle(f, runId = "suite-run-1") {
 	};
 }
 
-function json(file) { return JSON.parse(fs.readFileSync(file, "utf8")); }
+function json(file) {
+	return JSON.parse(fs.readFileSync(file, "utf8"));
+}
 
 test("explicit run creates a private contained recording bundle and complete digest", (t) => {
 	const f = fixture(t);
@@ -80,7 +91,10 @@ test("explicit run creates a private contained recording bundle and complete dig
 	assert.equal(recording.review.attestation, "none");
 	assert.equal(recording.artifact.path, "recording.webm");
 	assert.ok(fs.existsSync(b.pointer));
-	assert.match(fs.readFileSync(f.calls, "utf8"), /--session browser-session record start .*recording\.webm/);
+	assert.match(
+		fs.readFileSync(f.calls, "utf8"),
+		/--session browser-session record start .*recording\.webm/,
+	);
 	assert.equal(fs.statSync(b.dir).mode & 0o777, 0o700);
 	assert.equal(fs.statSync(b.manifest).mode & 0o777, 0o600);
 	assert.equal(fs.statSync(b.pointer).mode & 0o777, 0o600);
@@ -89,7 +103,10 @@ test("explicit run creates a private contained recording bundle and complete dig
 	const complete = json(b.manifest);
 	assert.equal(complete.status, "complete");
 	assert.equal(complete.artifact.bytes, 14);
-	assert.equal(complete.artifact.sha256, crypto.createHash("sha256").update("webm-test-data").digest("hex"));
+	assert.equal(
+		complete.artifact.sha256,
+		crypto.createHash("sha256").update("webm-test-data").digest("hex"),
+	);
 	assert.equal(complete.review.attestation, "none");
 	assert.equal(fs.existsSync(b.pointer), false);
 	assert.equal(fs.statSync(b.artifact).mode & 0o777, 0o600);
@@ -97,7 +114,13 @@ test("explicit run creates a private contained recording bundle and complete dig
 });
 
 test("invalid, traversal, control, and oversized run IDs fail before the engine", (t) => {
-	for (const id of ["../escape", "bad/name", "bad\nname", `a${"x".repeat(128)}`]) assert.throws(() => validateRunId(id));
+	for (const id of [
+		"../escape",
+		"bad/name",
+		"bad\nname",
+		`a${"x".repeat(128)}`,
+	])
+		assert.throws(() => validateRunId(id));
 	const f = fixture(t, { HERDR_BROWSER_RUN_ID: "../../escape" });
 	const result = invoke(f, "start");
 	assert.equal(result.status, 3);
@@ -114,12 +137,24 @@ test("config run ID is used when the environment is absent", (t) => {
 });
 
 test("generated run IDs are valid and distinct", (t) => {
-	const first = fixture(t, { HERDR_BROWSER_RUN_ID: "", HERDR_WORKSPACE_ID: "a" });
-	const second = fixture(t, { HERDR_BROWSER_RUN_ID: "", HERDR_WORKSPACE_ID: "b" });
+	const first = fixture(t, {
+		HERDR_BROWSER_RUN_ID: "",
+		HERDR_WORKSPACE_ID: "a",
+	});
+	const second = fixture(t, {
+		HERDR_BROWSER_RUN_ID: "",
+		HERDR_WORKSPACE_ID: "b",
+	});
 	assert.equal(invoke(first, "start").status, 0);
 	assert.equal(invoke(second, "start").status, 0);
-	const id1 = fs.readdirSync(path.join(first.state, "runs")).find((name) => name.startsWith("run-")).slice(4);
-	const id2 = fs.readdirSync(path.join(second.state, "runs")).find((name) => name.startsWith("run-")).slice(4);
+	const id1 = fs
+		.readdirSync(path.join(first.state, "runs"))
+		.find((name) => name.startsWith("run-"))
+		.slice(4);
+	const id2 = fs
+		.readdirSync(path.join(second.state, "runs"))
+		.find((name) => name.startsWith("run-"))
+		.slice(4);
 	assert.equal(validateRunId(id1), id1);
 	assert.notEqual(id1, id2);
 });
@@ -129,7 +164,10 @@ test("session text never participates in paths and stop uses the pinned session"
 	assert.equal(invoke(f, "start").status, 0);
 	const b = bundle(f);
 	assert.equal(json(b.manifest).browser_session, "../../escape");
-	const stopped = invoke(f, "stop", { HERDR_BROWSER_SESSION: "changed-session", HERDR_BROWSER_RUN_ID: "changed-run" });
+	const stopped = invoke(f, "stop", {
+		HERDR_BROWSER_SESSION: "changed-session",
+		HERDR_BROWSER_RUN_ID: "changed-run",
+	});
 	assert.equal(stopped.status, 0, stopped.stderr);
 	const calls = fs.readFileSync(f.calls, "utf8");
 	assert.match(calls, /--session \.\.\/\.\.\/escape record stop/);
@@ -174,8 +212,20 @@ test("missing, empty, special, and oversized artifacts cannot complete", async (
 	for (const [name, mutate, mode = "data"] of [
 		["missing", (b) => fs.rmSync(b.artifact), "data"],
 		["empty", () => {}, "empty"],
-		["directory", (b) => { fs.rmSync(b.artifact); fs.mkdirSync(b.artifact); }],
-		["symlink", (b, f) => { fs.rmSync(b.artifact); fs.symlinkSync(path.join(f.base, "outside"), b.artifact); }],
+		[
+			"directory",
+			(b) => {
+				fs.rmSync(b.artifact);
+				fs.mkdirSync(b.artifact);
+			},
+		],
+		[
+			"symlink",
+			(b, f) => {
+				fs.rmSync(b.artifact);
+				fs.symlinkSync(path.join(f.base, "outside"), b.artifact);
+			},
+		],
 		["oversized", (b) => fs.truncateSync(b.artifact, MAX_RECORDING_BYTES + 1)],
 	]) {
 		await t.test(name, (st) => {

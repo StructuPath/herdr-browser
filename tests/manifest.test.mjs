@@ -34,12 +34,19 @@ test("repository manifest passes CI validation", () => {
 });
 
 test("release version and existing action IDs remain stable", () => {
-	const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-	const manifest = fs.readFileSync(path.join(root, "herdr-plugin.toml"), "utf8");
+	const packageJson = JSON.parse(
+		fs.readFileSync(path.join(root, "package.json"), "utf8"),
+	);
+	const manifest = fs.readFileSync(
+		path.join(root, "herdr-plugin.toml"),
+		"utf8",
+	);
 	assert.equal(packageJson.version, "0.6.0");
 	assert.match(manifest, /^version = "0\.6\.0"$/m);
 	assert.deepEqual(
-		[...manifest.matchAll(/^id = "([^"]+)"$/gm)].slice(1, 6).map((match) => match[1]),
+		[...manifest.matchAll(/^id = "([^"]+)"$/gm)]
+			.slice(1, 6)
+			.map((match) => match[1]),
 		["open", "close", "browse", "record-start", "record-stop"],
 	);
 });

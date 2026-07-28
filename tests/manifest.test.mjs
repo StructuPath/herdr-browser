@@ -33,6 +33,22 @@ test("repository manifest passes CI validation", () => {
 	assert.deepEqual(validateRepository(root).errors, []);
 });
 
+test("Wave 0 drift contracts stay represented in source and hosted CI", () => {
+	const renderer = fs.readFileSync(path.join(root, "bin", "renderer.mjs"));
+	const browsePane = fs.readFileSync(
+		path.join(root, "scripts", "browse-pane.sh"),
+		"utf8",
+	);
+	const workflow = fs.readFileSync(
+		path.join(root, ".github", "workflows", "ci.yml"),
+		"utf8",
+	);
+	assert.equal(renderer.includes(0), false);
+	assert.match(renderer.toString("utf8"), /stays passive until explicit pane input/);
+	assert.match(browsePane, /npm install -g carbonyl@next/);
+	assert.match(workflow, /run: shellcheck scripts\/\*\.sh/);
+});
+
 test("release version and existing action IDs remain stable", () => {
 	const packageJson = JSON.parse(
 		fs.readFileSync(path.join(root, "package.json"), "utf8"),

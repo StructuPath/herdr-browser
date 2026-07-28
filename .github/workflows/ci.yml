@@ -1,6 +1,7 @@
+---
 name: CI
 
-on:
+"on":
   pull_request:
   push:
 
@@ -24,5 +25,7 @@ jobs:
         run: npm test
       - name: Validate shell syntax
         run: bash -n scripts/*.sh
+      - name: Run ShellCheck
+        run: shellcheck scripts/*.sh
       - name: Validate plugin manifest
         run: node scripts/check-manifest.mjs

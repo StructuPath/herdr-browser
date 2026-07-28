@@ -7,7 +7,7 @@ cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 
 if ! command -v carbonyl >/dev/null 2>&1; then
 	echo "herdr-browser: carbonyl not found."
-	echo "Install it with: npm install -g carbonyl"
+	echo "Install it with: npm install -g carbonyl@next"
 	echo "Then reopen this pane."
 	sleep 600
 	exit 1

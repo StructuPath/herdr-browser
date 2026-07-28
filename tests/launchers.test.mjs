@@ -552,46 +552,47 @@ test("record start/stop drive the workspace session and name the file", () => {
 	assert.equal(runScript("record.sh", ["bogus"]).status, 2);
 });
 
-test('with_timeout kills a hung command and returns 137', () => {
-  const r = spawnSync('bash', ['-c',
-    `. "${repoRoot}/scripts/lib.sh" && with_timeout 1 sleep 30; echo "rc=$?"`],
-    { env: freshEnv(), encoding: 'utf8', timeout: 10_000 });
-  assert.match(r.stdout, /rc=137/);
+test("with_timeout kills a hung command and returns 137", () => {
+	const r = spawnSync(
+		"bash",
+		[
+			"-c",
+			`. "${repoRoot}/scripts/lib.sh" && with_timeout 1 sleep 30; echo "rc=$?"`,
+		],
+		{ env: freshEnv(), encoding: "utf8", timeout: 10_000 },
+	);
+	assert.match(r.stdout, /rc=137/);
 });
 
-test(
-	"a live holder is never stolen from, even after the wait budget",
-	{ timeout: 20_000 },
-	async () => {
-		fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
-		fs.rmSync(path.join(stateDir, "open-lock-w9"), {
-			recursive: true,
-			force: true,
+test("a live holder is never stolen from, even after the wait budget", {
+	timeout: 20_000,
+}, async () => {
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+	fs.rmSync(path.join(stateDir, "open-lock-w9"), {
+		recursive: true,
+		force: true,
+	});
+	const lock = path.join(stateDir, "open-lock-w9");
+	fs.mkdirSync(lock, { recursive: true });
+	const holder = spawn("sleep", ["3"], { stdio: "ignore" });
+	fs.writeFileSync(path.join(lock, "pid"), `${holder.pid}\n`);
+	const started = Date.now();
+	const env = freshEnv({ HERDR_BROWSER_LOCK_TRIES: "5" });
+	const result = await new Promise((resolve) => {
+		const child = spawn("bash", [path.join(repoRoot, "scripts", "open.sh")], {
+			env,
 		});
-		const lock = path.join(stateDir, "open-lock-w9");
-		fs.mkdirSync(lock, { recursive: true });
-		const holder = spawn("sleep", ["3"], { stdio: "ignore" });
-		fs.writeFileSync(path.join(lock, "pid"), `${holder.pid}\n`);
-		const started = Date.now();
-		const env = freshEnv({ HERDR_BROWSER_LOCK_TRIES: "5" });
-		const result = await new Promise((resolve) => {
-			const child = spawn(
-				"bash",
-				[path.join(repoRoot, "scripts", "open.sh")],
-				{ env },
-			);
-			let stderr = "";
-			child.stderr.on("data", (chunk) => {
-				stderr += chunk;
-			});
-			child.on("close", (status) => resolve({ status, stderr }));
+		let stderr = "";
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk;
 		});
-		holder.kill();
-		assert.equal(result.status, 0, result.stderr);
-		assert.ok(
-			Date.now() - started > 2_500,
-			"waiter waited for the live holder instead of stealing",
-		);
-		assert.equal(fs.existsSync(lock), false, "lock released after holder exit");
-	},
-);
+		child.on("close", (status) => resolve({ status, stderr }));
+	});
+	holder.kill();
+	assert.equal(result.status, 0, result.stderr);
+	assert.ok(
+		Date.now() - started > 2_500,
+		"waiter waited for the live holder instead of stealing",
+	);
+	assert.equal(fs.existsSync(lock), false, "lock released after holder exit");
+});

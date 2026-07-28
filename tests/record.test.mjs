@@ -44,6 +44,10 @@ if [ "$4" = "start" ]; then
   [ -n "${"$"}{AB_ACTIVE:-}" ] && printf active > "$AB_ACTIVE"
 else
   [ "${"$"}{AB_STOP_FAIL:-0}" = 1 ] && exit 8
+  if [ "${"$"}{AB_NON_IDEMPOTENT_STOP:-0}" = 1 ] && [ -n "${"$"}{AB_ACTIVE:-}" ] && [ ! -e "$AB_ACTIVE" ]; then
+    printf 'No recording in progress\n' >&2
+    exit 10
+  fi
   [ -n "${"$"}{AB_ACTIVE:-}" ] && rm -f "$AB_ACTIVE"
 fi
 exit 0
@@ -329,6 +333,15 @@ test("Stop rejects every incompatible pointer and manifest field before engine s
 		["pointer workspace", "pointer", (value) => (value.workspace_id = "foreign")],
 		["pointer session", "pointer", (value) => (value.browser_session = "foreign")],
 		["pointer stop flag", "pointer", (value) => (value.engine_stopped = "false")],
+		["pointer pending flag", "pointer", (value) => (value.stop_pending = "false")],
+		[
+			"pointer contradictory stop state",
+			"pointer",
+			(value) => {
+				value.engine_stopped = true;
+				value.stop_pending = true;
+			},
+		],
 		["manifest schema", "manifest", (value) => (value.schema_version = 999)],
 		["manifest unknown field", "manifest", (value) => (value.extra = true)],
 		["manifest evidence type", "manifest", (value) => (value.evidence_type = "not-browser")],
@@ -463,6 +476,16 @@ function withMainEnvironment(f, callback) {
 		HERDR_PLUGIN_CONFIG_DIR: f.config,
 		AB_CALLS: f.calls,
 	};
+	for (const key of [
+		"AB_ACTIVE",
+		"AB_ARTIFACT_MODE",
+		"AB_NON_IDEMPOTENT_STOP",
+		"AB_OUTSIDE",
+		"AB_START_FAIL",
+		"AB_STOP_FAIL",
+	]) {
+		if (f.env[key] !== undefined) values[key] = f.env[key];
+	}
 	const previous = Object.fromEntries(
 		Object.keys(values).map((key) => [key, process.env[key]]),
 	);
@@ -522,6 +545,105 @@ test("manifest and pointer write/fsync faults occur before the engine can start"
 			assert.equal(fs.existsSync(bundle(f, runId).pointer), false);
 		});
 	}
+});
+
+function failFirstOperationAfterConfirmedStop(f, method, callback) {
+	const original = fs[method];
+	let injected = false;
+	fs[method] = (...args) => {
+		const stopped =
+			!fs.existsSync(f.env.AB_ACTIVE) &&
+			fs.existsSync(f.calls) &&
+			fs.readFileSync(f.calls, "utf8").includes(" record stop");
+		if (!injected && stopped) {
+			injected = true;
+			const error = new Error(`injected post-stop ${method} failure`);
+			error.code = "EIO";
+			throw error;
+		}
+		return original(...args);
+	};
+	try {
+		callback();
+	} finally {
+		fs[method] = original;
+	}
+	assert.equal(injected, true, `${method} fault was not injected`);
+}
+
+function countStopCalls(f) {
+	return fs
+		.readFileSync(f.calls, "utf8")
+		.trim()
+		.split("\n")
+		.filter((line) => line.endsWith(" record stop")).length;
+}
+
+test("confirmed Stop finalizes through stopped-pointer publication faults", async (t) => {
+	for (const method of ["writeFileSync", "fsyncSync", "renameSync"]) {
+		await t.test(method, (st) => {
+			const f = fixture(st, { AB_NON_IDEMPOTENT_STOP: "1" });
+			const active = path.join(f.base, `active-${method}`);
+			f.env.AB_ACTIVE = active;
+			assert.equal(invoke(f, "start").status, 0);
+			failFirstOperationAfterConfirmedStop(f, method, () =>
+				withMainEnvironment(f, () => main("stop")),
+			);
+			const b = bundle(f);
+			assert.equal(json(b.manifest).status, "complete");
+			assert.equal(fs.existsSync(b.pointer), false);
+			assert.equal(fs.existsSync(active), false);
+			assert.equal(countStopCalls(f), 1);
+		});
+	}
+});
+
+test("confirmed Start compensation finalizes through stopped-pointer publication faults", async (t) => {
+	for (const method of ["writeFileSync", "fsyncSync", "renameSync"]) {
+		await t.test(method, (st) => {
+			const f = fixture(st, {
+				AB_ARTIFACT_MODE: "symlink",
+				AB_NON_IDEMPOTENT_STOP: "1",
+			});
+			const active = path.join(f.base, `active-${method}`);
+			const outside = path.join(f.base, `outside-${method}`);
+			fs.writeFileSync(outside, "outside", { mode: 0o644 });
+			f.env.AB_ACTIVE = active;
+			f.env.AB_OUTSIDE = outside;
+			failFirstOperationAfterConfirmedStop(f, method, () =>
+				assert.throws(
+					() => withMainEnvironment(f, () => main("start")),
+					/ELOOP|recording artifact must be a regular file/,
+				),
+			);
+			const b = bundle(f);
+			assert.equal(json(b.manifest).status, "failed");
+			assert.equal(fs.existsSync(b.pointer), false);
+			assert.equal(fs.existsSync(active), false);
+			assert.equal(countStopCalls(f), 1);
+		});
+	}
+});
+
+test("interrupted stop state fails closed without inferring engine success", (t) => {
+	const f = fixture(t, { AB_NON_IDEMPOTENT_STOP: "1" });
+	const active = path.join(f.base, "active-interrupted");
+	f.env.AB_ACTIVE = active;
+	assert.equal(invoke(f, "start").status, 0);
+	const b = bundle(f);
+	const pointer = json(b.pointer);
+	pointer.stop_pending = true;
+	fs.writeFileSync(b.pointer, `${JSON.stringify(pointer, null, 2)}\n`);
+	fs.rmSync(active);
+	const calls = fs.readFileSync(f.calls);
+
+	const retry = invoke(f, "stop");
+	assert.equal(retry.status, 3);
+	assert.match(retry.stderr, /outcome is unknown/);
+	assert.equal(json(b.manifest).status, "recording");
+	assert.match(json(b.manifest).error, /inspect the recording manually/);
+	assert.equal(fs.existsSync(b.pointer), true);
+	assert.deepEqual(fs.readFileSync(f.calls), calls);
 });
 
 test("complete-manifest crash recovery verifies the artifact and unlinks without stopping twice", (t) => {

@@ -250,7 +250,11 @@ The bundle is an **unreviewed, operator-reviewable observation**, not a test
 result, acceptance decision, provenance claim, or cryptographic attestation.
 Its digest detects later content changes but does not identify who recorded or
 reviewed it. A missing, empty, non-regular, symlinked, or oversized WebM is not
-marked complete. Failed stops retain the active pointer so Stop can be retried.
+marked complete. A confirmed failed Stop retains a retryable active pointer.
+Before invoking Stop, Browser durably marks the attempt pending; if the process
+is interrupted while its outcome is unknown, later Stop actions fail closed
+without calling the non-idempotent engine again or marking evidence complete.
+That pending pointer remains occupied for manual inspection and reconciliation.
 
 Starting a recording creates a fresh browser context: the page reloads, while
 cookies and localStorage are preserved. Start recording before the flow you

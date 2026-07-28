@@ -322,7 +322,14 @@ function assertErrorField(value) {
 function validatePointer(pointer, identity) {
 	assertExactKeys(
 		pointer,
-		["schema_version", "run_id", "workspace_id", "browser_session", "engine_stopped"],
+		[
+			"schema_version",
+			"run_id",
+			"workspace_id",
+			"browser_session",
+			"engine_stopped",
+			"stop_pending",
+		],
 		"active recording pointer",
 	);
 	if (pointer.schema_version !== SCHEMA_VERSION)
@@ -333,7 +340,9 @@ function validatePointer(pointer, identity) {
 		pointer.workspace_id !== identity.workspaceId ||
 		typeof pointer.browser_session !== "string" ||
 		!pointer.browser_session ||
-		typeof pointer.engine_stopped !== "boolean"
+		typeof pointer.engine_stopped !== "boolean" ||
+		typeof pointer.stop_pending !== "boolean" ||
+		(pointer.engine_stopped && pointer.stop_pending)
 	) {
 		throw new Error("active recording pointer identity is invalid");
 	}
@@ -542,6 +551,7 @@ function pointerFor(runId, workspaceId, session) {
 		workspace_id: workspaceId,
 		browser_session: session,
 		engine_stopped: false,
+		stop_pending: false,
 	};
 }
 
@@ -661,23 +671,41 @@ function start() {
 		} catch (startError) {
 			let compensationError;
 			try {
+				pointer.stop_pending = true;
+				atomicWriteJson(root, paths.pointer, pointer);
 				engine(session, ["stop"]);
 			} catch (error) {
 				compensationError = error;
 			}
 			if (compensationError) {
+				pointer.stop_pending = false;
+				let retryStateError;
+				try {
+					atomicWriteJson(root, paths.pointer, pointer);
+				} catch (error) {
+					retryStateError = error;
+				}
 				const attention = new Error(
-					`recording start needs attention: ${safeError(startError)}; compensating stop failed: ${safeError(compensationError)}`,
+					`recording start needs attention: ${safeError(startError)}; compensating stop was not confirmed: ${safeError(compensationError)}${
+						retryStateError
+							? `; retry state could not be published: ${safeError(retryStateError)}; inspect the recording manually`
+							: ""
+					}`,
 				);
 				try {
 					recordRetryError(root, paths.manifest, manifest, attention);
 				} catch {
-					// The durable pre-engine journal and pointer remain retryable.
+					// The durable pre-engine journal and pointer remain conservative.
 				}
 				throw attention;
 			}
 			pointer.engine_stopped = true;
-			atomicWriteJson(root, paths.pointer, pointer);
+			pointer.stop_pending = false;
+			try {
+				atomicWriteJson(root, paths.pointer, pointer);
+			} catch {
+				// Stop succeeded here; terminal publication and pointer removal continue.
+			}
 			manifest.status = "failed";
 			manifest.error = safeError(startError);
 			atomicWriteJson(root, paths.manifest, manifest);
@@ -728,17 +756,82 @@ function stop() {
 		}
 		validateManifest(manifest, identity, "recording");
 
+		if (pointer.stop_pending) {
+			const interrupted = new Error(
+				"recording stop outcome is unknown after an interrupted stop; no engine action or evidence completion was attempted; inspect the recording manually",
+			);
+			try {
+				recordRetryError(root, paths.manifest, manifest, interrupted);
+			} catch {
+				// The stop-pending pointer remains the authoritative manual state.
+			}
+			throw interrupted;
+		}
+
+		let stoppedPublicationError;
+		if (!pointer.engine_stopped) {
+			pointer.stop_pending = true;
+			try {
+				atomicWriteJson(root, paths.pointer, pointer);
+			} catch (error) {
+				pointer.stop_pending = false;
+				let retryStateError;
+				try {
+					atomicWriteJson(root, paths.pointer, pointer);
+				} catch (stateError) {
+					retryStateError = stateError;
+				}
+				const publicationError = retryStateError
+					? new Error(
+							`recording stop did not start because its pending state could not be published: ${safeError(error)}; retry state could not be restored: ${safeError(retryStateError)}; inspect the recording manually`,
+						)
+					: error;
+				recordRetryError(root, paths.manifest, manifest, publicationError);
+				throw publicationError;
+			}
+			try {
+				engine(pointer.browser_session, ["stop"]);
+			} catch (error) {
+				pointer.stop_pending = false;
+				let retryStateError;
+				try {
+					atomicWriteJson(root, paths.pointer, pointer);
+				} catch (stateError) {
+					retryStateError = stateError;
+				}
+				const stopError = retryStateError
+					? new Error(
+							`recording stop was not confirmed: ${safeError(error)}; retry state could not be published: ${safeError(retryStateError)}; inspect the recording manually`,
+						)
+					: error;
+				recordRetryError(root, paths.manifest, manifest, stopError);
+				throw stopError;
+			}
+			pointer.engine_stopped = true;
+			pointer.stop_pending = false;
+			try {
+				atomicWriteJson(root, paths.pointer, pointer);
+			} catch (error) {
+				stoppedPublicationError = error;
+			}
+		}
+
 		let artifact;
 		try {
-			if (!pointer.engine_stopped) {
-				engine(pointer.browser_session, ["stop"]);
-				pointer.engine_stopped = true;
-				atomicWriteJson(root, paths.pointer, pointer);
-			}
 			artifact = inspectArtifact(root, paths.artifact);
 		} catch (error) {
-			recordRetryError(root, paths.manifest, manifest, error);
-			throw error;
+			let retryError = error;
+			if (stoppedPublicationError) {
+				try {
+					atomicWriteJson(root, paths.pointer, pointer);
+				} catch (stateError) {
+					retryError = new Error(
+						`recording engine stopped, but its retry state could not be published: ${safeError(stateError)}; inspect the recording manually`,
+					);
+				}
+			}
+			recordRetryError(root, paths.manifest, manifest, retryError);
+			throw retryError;
 		}
 
 		manifest.status = "complete";

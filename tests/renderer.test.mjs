@@ -1194,10 +1194,17 @@ test("polling tick tries goLive once, then respects the cooldown", async () => {
 		},
 		sessionExists: async () => true,
 	};
-	await r.tick();
-	assert.equal(enables, 1, "one live attempt on the first attached tick");
-	await r.tick();
-	assert.equal(enables, 1, "cooldown suppresses immediate retries");
+	const saved = global.WebSocket;
+	global.WebSocket = class {};
+	try {
+		await r.tick();
+		assert.equal(enables, 1, "one live attempt on the first attached tick");
+		await r.tick();
+		assert.equal(enables, 1, "cooldown suppresses immediate retries");
+	} finally {
+		if (saved === undefined) delete global.WebSocket;
+		else global.WebSocket = saved;
+	}
 });
 
 // End-to-end against a real agent-browser session; skips when the engine is
@@ -1401,6 +1408,9 @@ test('goLive rejects hostile or malformed ports without throwing', async () => {
 
 test('userAction surfaces failures in the banner (live mode has no tick report)', async () => {
   const r = quiet(mkRenderer());
+  r.attached = true;
+  r.live = { ws: { close: () => {} } };
+  r.lastLiveCheck = Date.now();
   let headers = 0;
   r.header = () => { headers++; };
   r.userAction(async () => { throw new Error('daemon hung'); });

@@ -24,6 +24,9 @@ import {
 	safeWsId,
 	kittyImageSequence,
 	viewportForPane,
+	newNetworkState,
+	diffNetworkFailures,
+	formatNetworkFailure,
 } from "../bin/renderer.mjs";
 
 const repoRoot = path.resolve(
@@ -1488,4 +1491,136 @@ test("empty console gives its rows to the browser until output arrives", () => {
 	const visible = r.size();
 	assert.ok(visible.consoleRows >= 4);
 	assert.equal(visible.imageRows, empty.imageRows - visible.consoleRows);
+});
+
+// --- Wave 3: failed network requests in the console region ---
+
+const req = (id, over = {}) => ({
+	requestId: id,
+	url: `https://api.test/${id}`,
+	method: "GET",
+	resourceType: "Fetch",
+	timestamp: 1_000_000,
+	...over,
+});
+const T0 = 1_000_000;
+
+test("network diff: new 404 reported once, then seen", () => {
+	const st = newNetworkState();
+	const first = diffNetworkFailures(st, [req("a", { status: 404 })], T0 + 10);
+	assert.equal(first.failures.length, 1);
+	assert.equal(first.failures[0].status, 404);
+	const second = diffNetworkFailures(st, [req("a", { status: 404 })], T0 + 20);
+	assert.equal(second.failures.length, 0, "same entry must not re-report");
+});
+
+test("network diff: null status ages into no-response, 200 never reports", () => {
+	const st = newNetworkState();
+	const young = diffNetworkFailures(st, [req("a")], T0 + 5_000);
+	assert.equal(young.failures.length, 0, "5s old in-flight is not a failure");
+	const aged = diffNetworkFailures(st, [req("a")], T0 + 20_000);
+	assert.equal(aged.failures.length, 1);
+	assert.equal(aged.failures[0].status, null);
+	const st2 = newNetworkState();
+	diffNetworkFailures(st2, [req("b")], T0 + 5_000);
+	const ok = diffNetworkFailures(st2, [req("b", { status: 200 })], T0 + 9_000);
+	assert.equal(ok.failures.length, 0);
+	const later = diffNetworkFailures(st2, [req("b", { status: 200 })], T0 + 60_000);
+	assert.equal(later.failures.length, 0, "resolved-OK id stays swallowed");
+});
+
+test("network diff: failure status arriving one poll late still reports", () => {
+	const st = newNetworkState();
+	const inflight = diffNetworkFailures(st, [req("a")], T0 + 1_000);
+	assert.equal(inflight.failures.length, 0);
+	const landed = diffNetworkFailures(st, [req("a", { status: 500 })], T0 + 3_000);
+	assert.equal(landed.failures.length, 1, "late 500 must not be swallowed");
+	assert.equal(landed.failures[0].status, 500);
+});
+
+test("network diff: log wipe prunes state without replay", () => {
+	const st = newNetworkState();
+	diffNetworkFailures(st, [req("a", { status: 404 })], T0 + 10);
+	assert.ok(st.seen.has("a"));
+	// Wipe: log now holds only a fresh id; 'a' evaporates from state.
+	const after = diffNetworkFailures(st, [req("z", { status: 200 })], T0 + 20);
+	assert.equal(after.failures.length, 0);
+	assert.ok(!st.seen.has("a"), "seen pruned to current log");
+	// Reused id after relaunch is a new request, judged on its own status —
+	// dedupe by shape (not id) is what suppresses the repeat line.
+	const reused = diffNetworkFailures(
+		st,
+		[req("z", { status: 200 }), req("a", { status: 404 })],
+		T0 + 30,
+	);
+	assert.equal(reused.failures.length, 0, "same shape within window dedupes");
+	assert.ok(st.seen.has("a"), "reused id still classified and tracked");
+});
+
+test("network diff: nav-retry burst dedupes to one line", () => {
+	const st = newNetworkState();
+	const out = diffNetworkFailures(
+		st,
+		[
+			req("r1", { url: "https://x.invalid/", timestamp: T0 - 60_000 }),
+			req("r2", { url: "https://x.invalid/", timestamp: T0 - 60_000 }),
+			req("r3", { url: "https://x.invalid/", timestamp: T0 - 60_000 }),
+		],
+		T0,
+	);
+	assert.equal(out.failures.length, 1, "3 retry entries paint one line");
+	assert.equal(out.overflow, 0, "deduped entries are not overflow");
+});
+
+test("network diff: cross-poll retry loop stays suppressed within window", () => {
+	const st = newNetworkState();
+	let lines = 0;
+	for (let i = 0; i < 5; i++) {
+		const out = diffNetworkFailures(
+			st,
+			[req(`try${i}`, { url: "https://api.test/beacon", status: 502 })],
+			T0 + i * 5_000,
+		);
+		lines += out.failures.length;
+	}
+	assert.equal(lines, 1, "steady 5s retry loop paints once inside 60s window");
+});
+
+test("network diff: per-poll cap emits overflow count", () => {
+	const st = newNetworkState();
+	const entries = [];
+	for (let i = 0; i < 12; i++)
+		entries.push(req(`e${i}`, { url: `https://api.test/${i}`, status: 500 }));
+	const out = diffNetworkFailures(st, entries, T0);
+	assert.equal(out.failures.length, 5);
+	assert.equal(out.overflow, 7);
+});
+
+test("network diff: baseline swallows everything silently", () => {
+	const st = newNetworkState();
+	const out = diffNetworkFailures(
+		st,
+		[req("a", { status: 404 }), req("b"), req("c", { status: 500 })],
+		T0,
+		{ baseline: true },
+	);
+	assert.equal(out.failures.length, 0);
+	const next = diffNetworkFailures(
+		st,
+		[req("a", { status: 404 }), req("b"), req("c", { status: 500 })],
+		T0 + 1_000,
+	);
+	assert.equal(next.failures.length, 0, "baselined ids never replay");
+});
+
+test("network format: sanitizes and hard-caps page-controlled URLs", () => {
+	const nasty = `https://api.test/${"\x1b[2J"}${"x".repeat(5000)}`;
+	const line = formatNetworkFailure({ method: "GET", url: nasty, status: 404 });
+	assert.ok(line.startsWith("404 GET https://api.test/"));
+	assert.ok(!line.includes("\x1b"), "escape bytes stripped");
+	assert.ok(line.length <= 220, "stored line is capped");
+	assert.equal(
+		formatNetworkFailure({ method: "POST", url: "http://l:3000/a", status: null }),
+		"no response POST http://l:3000/a",
+	);
 });

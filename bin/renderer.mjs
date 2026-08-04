@@ -312,6 +312,89 @@ export function viewportForPane(frameWidth, { cols, imageRows }) {
 	return { w, h };
 }
 
+// Failed-request diffing over `network requests --json`. The daemon's log is
+// append-only from the pane's perspective but can be wiped without notice
+// (browser relaunch, external --clear), and pid.N-format requestIds can
+// restart after a relaunch — so membership sets are pruned to the ids present
+// in the current log every poll instead of trusting counts or id uniqueness.
+// Seen-set membership means "already reported OR resolved to a non-failure
+// status": an in-flight request must stay classifiable until its status
+// lands, or a 500 arriving one poll late would be swallowed forever.
+export function newNetworkState() {
+	return {
+		seen: new Set(), // requestIds reported or resolved 2xx/3xx
+		pending: new Set(), // requestIds observed with no status yet
+		recent: new Map(), // dedupe key -> last emit/suppress time (ms)
+	};
+}
+
+export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
+	const ageThresholdMs = opts.ageThresholdMs ?? 15_000;
+	const dedupeWindowMs = opts.dedupeWindowMs ?? 60_000;
+	const maxPerPoll = opts.maxPerPoll ?? 5;
+	const currentIds = new Set();
+	const candidates = [];
+	for (const e of entries) {
+		const id = e?.requestId;
+		if (typeof id !== "string" || !id) continue;
+		currentIds.add(id);
+		if (opts.baseline) {
+			state.seen.add(id);
+			continue;
+		}
+		if (state.seen.has(id)) continue;
+		const status = typeof e.status === "number" ? e.status : null;
+		if (status !== null) {
+			state.pending.delete(id);
+			state.seen.add(id);
+			if (status >= 400 && status <= 599)
+				candidates.push({ method: e.method ?? "GET", url: e.url ?? "", status });
+			continue;
+		}
+		state.pending.add(id);
+		// No error detail exists anywhere for connection-level failures (the
+		// daemon drops loadingFailed), so age past threshold is the only signal
+		// — and it must be entry age, not poll count: pollDelay stretches ticks.
+		if (typeof e.timestamp === "number" && nowMs - e.timestamp > ageThresholdMs) {
+			state.pending.delete(id);
+			state.seen.add(id);
+			candidates.push({
+				method: e.method ?? "GET",
+				url: e.url ?? "",
+				status: null,
+			});
+		}
+	}
+	// Prune both sets to the live log so wipes and id reuse stay harmless.
+	for (const id of state.seen) if (!currentIds.has(id)) state.seen.delete(id);
+	for (const id of state.pending)
+		if (!currentIds.has(id)) state.pending.delete(id);
+	for (const [k, t] of state.recent)
+		if (nowMs - t > dedupeWindowMs) state.recent.delete(k);
+	// Chrome retries a failed navigation with fresh requestIds and app retry
+	// loops mint new ids per attempt — dedupe by shape, refreshing the window
+	// on suppressed hits so a steady loop paints once, not once per minute.
+	const failures = [];
+	let overflow = 0;
+	for (const c of candidates) {
+		const key = `${c.method} ${c.url} ${c.status ?? "no response"}`;
+		const last = state.recent.get(key);
+		state.recent.set(key, nowMs);
+		if (last !== undefined && nowMs - last <= dedupeWindowMs) continue;
+		if (failures.length < maxPerPoll) failures.push(c);
+		else overflow++;
+	}
+	return { failures, overflow };
+}
+
+// Display text for one failure ("✖ " comes from pushConsole's error prefix).
+// URLs are page-controlled and unbounded (data: URLs carry payloads) —
+// sanitize and hard-cap before the line enters the 500-line store.
+export function formatNetworkFailure({ method, url, status }) {
+	const shownUrl = truncate(sanitizeText(url), 200);
+	return `${status ?? "no response"} ${method} ${shownUrl}`;
+}
+
 // --- agent-browser access ---
 
 export function makeBrowser(session, bin = "agent-browser") {

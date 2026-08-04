@@ -730,6 +730,38 @@ export class Renderer {
 		}
 	}
 
+	// Live mode has no snapshot tick and the push stream carries no network
+	// events, so failures need their own low-cadence poll. pollDelay-style
+	// backoff keeps an unwatched live pane near-free; the idle counter resets
+	// on stream activity AND on painted failures — a background retry loop on
+	// a visually static page produces neither frames nor console entries, so
+	// the failures themselves must hold the base cadence.
+	startNetworkTimer(baseMs = 4_000) {
+		if (this.networkTimer || typeof this.browser.network !== "function")
+			return;
+		const fire = async () => {
+			this.networkTimer = null;
+			if (!this.live || !this.attached || this.networkOff) return;
+			if (await this.pollNetwork()) this.networkIdleTicks = 0;
+			else this.networkIdleTicks++;
+			if (!this.live || this.networkOff) return; // dropped or latched mid-poll
+			this.networkTimer = setTimeout(
+				fire,
+				pollDelay(baseMs, this.networkIdleTicks),
+			);
+			this.networkTimer.unref?.();
+		};
+		this.networkTimer = setTimeout(fire, baseMs);
+		this.networkTimer.unref?.();
+	}
+
+	stopNetworkTimer() {
+		if (this.networkTimer) {
+			clearTimeout(this.networkTimer);
+			this.networkTimer = null;
+		}
+	}
+
 	queueConsolePaint(hadConsole) {
 		const layoutChanged =
 			this.mode !== "text" && !hadConsole && this.consoleLines.length > 0;
@@ -1291,10 +1323,15 @@ export class Renderer {
 		ws.onclose = drop;
 		ws.onerror = drop;
 		this.banner = "";
+		this.networkIdleTicks = 0;
+		this.startNetworkTimer();
 		return true;
 	}
 
 	dropLive(note) {
+		// First: a timer poll must not fire into the poll-mode transition and
+		// race tick's poll over the same diff state.
+		this.stopNetworkTimer();
 		const wasLive = !!this.live;
 		if (this.live) {
 			try {
@@ -1334,6 +1371,7 @@ export class Renderer {
 				}
 				this.shotFormat = "jpg";
 				this.frameSeq++;
+				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
 				this.enqueue(async () => {
 					await this.renderImage();
 					await this.fitViewport(dims.w, dims.h);
@@ -1341,6 +1379,7 @@ export class Renderer {
 				break;
 			}
 			case "console": {
+				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
 				const hadConsole = this.consoleLines.length > 0;
 				this.pushConsole(
 					[{ text: m.text ?? "", type: m.level ?? "log" }],
@@ -1489,6 +1528,7 @@ export class Renderer {
 
 	cleanup() {
 		if (this.mode === "kitty") process.stdout.write(KITTY_DELETE_ALL);
+		this.stopNetworkTimer();
 		try {
 			this.live?.ws.close();
 		} catch {

@@ -24,6 +24,9 @@ import {
 	safeWsId,
 	kittyImageSequence,
 	viewportForPane,
+	newNetworkState,
+	diffNetworkFailures,
+	formatNetworkFailure,
 } from "../bin/renderer.mjs";
 
 const repoRoot = path.resolve(
@@ -1488,4 +1491,443 @@ test("empty console gives its rows to the browser until output arrives", () => {
 	const visible = r.size();
 	assert.ok(visible.consoleRows >= 4);
 	assert.equal(visible.imageRows, empty.imageRows - visible.consoleRows);
+});
+
+// --- Wave 3: failed network requests in the console region ---
+
+const req = (id, over = {}) => ({
+	requestId: id,
+	url: `https://api.test/${id}`,
+	method: "GET",
+	resourceType: "Fetch",
+	timestamp: 1_000_000,
+	...over,
+});
+const T0 = 1_000_000;
+
+test("network diff: new 404 reported once, then seen", () => {
+	const st = newNetworkState();
+	const first = diffNetworkFailures(st, [req("a", { status: 404 })], T0 + 10);
+	assert.equal(first.failures.length, 1);
+	assert.equal(first.failures[0].status, 404);
+	const second = diffNetworkFailures(st, [req("a", { status: 404 })], T0 + 20);
+	assert.equal(second.failures.length, 0, "same entry must not re-report");
+});
+
+test("network diff: null status ages into no-response, 200 never reports", () => {
+	const st = newNetworkState();
+	const young = diffNetworkFailures(st, [req("a")], T0 + 5_000);
+	assert.equal(young.failures.length, 0, "5s old in-flight is not a failure");
+	const aged = diffNetworkFailures(st, [req("a")], T0 + 20_000);
+	assert.equal(aged.failures.length, 1);
+	assert.equal(aged.failures[0].status, null);
+	const st2 = newNetworkState();
+	diffNetworkFailures(st2, [req("b")], T0 + 5_000);
+	const ok = diffNetworkFailures(st2, [req("b", { status: 200 })], T0 + 9_000);
+	assert.equal(ok.failures.length, 0);
+	const later = diffNetworkFailures(st2, [req("b", { status: 200 })], T0 + 60_000);
+	assert.equal(later.failures.length, 0, "resolved-OK id stays swallowed");
+});
+
+test("network diff: failure status arriving one poll late still reports", () => {
+	const st = newNetworkState();
+	const inflight = diffNetworkFailures(st, [req("a")], T0 + 1_000);
+	assert.equal(inflight.failures.length, 0);
+	const landed = diffNetworkFailures(st, [req("a", { status: 500 })], T0 + 3_000);
+	assert.equal(landed.failures.length, 1, "late 500 must not be swallowed");
+	assert.equal(landed.failures[0].status, 500);
+});
+
+test("network diff: log wipe prunes state without replay", () => {
+	const st = newNetworkState();
+	diffNetworkFailures(st, [req("a", { status: 404 })], T0 + 10);
+	assert.ok(st.seen.has("a"));
+	// Wipe: log now holds only a fresh id; 'a' evaporates from state.
+	const after = diffNetworkFailures(st, [req("z", { status: 200 })], T0 + 20);
+	assert.equal(after.failures.length, 0);
+	assert.ok(!st.seen.has("a"), "seen pruned to current log");
+	// Reused id after relaunch is a new request, judged on its own status —
+	// dedupe by shape (not id) is what suppresses the repeat line.
+	const reused = diffNetworkFailures(
+		st,
+		[req("z", { status: 200 }), req("a", { status: 404 })],
+		T0 + 30,
+	);
+	assert.equal(reused.failures.length, 0, "same shape within window dedupes");
+	assert.ok(st.seen.has("a"), "reused id still classified and tracked");
+});
+
+test("network diff: nav-retry burst dedupes to one line", () => {
+	const st = newNetworkState();
+	const out = diffNetworkFailures(
+		st,
+		[
+			req("r1", { url: "https://x.invalid/", timestamp: T0 - 60_000 }),
+			req("r2", { url: "https://x.invalid/", timestamp: T0 - 60_000 }),
+			req("r3", { url: "https://x.invalid/", timestamp: T0 - 60_000 }),
+		],
+		T0,
+	);
+	assert.equal(out.failures.length, 1, "3 retry entries paint one line");
+	assert.equal(out.overflow, 0, "deduped entries are not overflow");
+});
+
+test("network diff: cross-poll retry loop stays suppressed within window", () => {
+	const st = newNetworkState();
+	let lines = 0;
+	for (let i = 0; i < 5; i++) {
+		const out = diffNetworkFailures(
+			st,
+			[req(`try${i}`, { url: "https://api.test/beacon", status: 502 })],
+			T0 + i * 5_000,
+		);
+		lines += out.failures.length;
+	}
+	assert.equal(lines, 1, "steady 5s retry loop paints once inside 60s window");
+});
+
+test("network diff: per-poll cap emits overflow count", () => {
+	const st = newNetworkState();
+	const entries = [];
+	for (let i = 0; i < 12; i++)
+		entries.push(req(`e${i}`, { url: `https://api.test/${i}`, status: 500 }));
+	const out = diffNetworkFailures(st, entries, T0);
+	assert.equal(out.failures.length, 5);
+	assert.equal(out.overflow, 7);
+});
+
+test("network diff: baseline swallows everything silently", () => {
+	const st = newNetworkState();
+	const out = diffNetworkFailures(
+		st,
+		[req("a", { status: 404 }), req("b"), req("c", { status: 500 })],
+		T0,
+		{ baseline: true },
+	);
+	assert.equal(out.failures.length, 0);
+	const next = diffNetworkFailures(
+		st,
+		[req("a", { status: 404 }), req("b"), req("c", { status: 500 })],
+		T0 + 1_000,
+	);
+	assert.equal(next.failures.length, 0, "baselined ids never replay");
+});
+
+test("network format: sanitizes and hard-caps page-controlled URLs", () => {
+	const nasty = `https://api.test/${"\x1b[2J"}${"x".repeat(5000)}`;
+	const line = formatNetworkFailure({ method: "GET", url: nasty, status: 404 });
+	assert.ok(line.startsWith("404 GET https://api.test/"));
+	assert.ok(!line.includes("\x1b"), "escape bytes stripped");
+	assert.ok(line.length <= 220, "stored line is capped");
+	assert.equal(
+		formatNetworkFailure({ method: "POST", url: "http://l:3000/a", status: null }),
+		"no response POST http://l:3000/a",
+	);
+});
+
+test("makeBrowser.network passes the type filter, never --clear", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-net-"));
+	const logf = path.join(dir, "log");
+	const stub = path.join(dir, "ab-stub");
+	fs.writeFileSync(
+		stub,
+		`#!/usr/bin/env bash
+echo "$@" >> "${logf}"
+printf '%s' '{"success":true,"data":{"requests":[{"requestId":"r1","url":"https://x/a","method":"GET","status":404,"timestamp":1000,"resourceType":"Fetch"}]}}'
+`,
+	);
+	fs.chmodSync(stub, 0o755);
+	const reqs = await makeBrowser("s", stub).network();
+	assert.equal(reqs.length, 1);
+	assert.equal(reqs[0].requestId, "r1");
+	const logged = fs.readFileSync(logf, "utf8");
+	assert.match(
+		logged,
+		/--session s network requests --type xhr,fetch,document --json/,
+	);
+	assert.ok(!logged.includes("--clear"), "pane must never clear the shared log");
+});
+
+test("makeBrowser.network rejects on malformed output so callers degrade", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-netbad-"));
+	const stub = path.join(dir, "ab-stub");
+	fs.writeFileSync(stub, `#!/usr/bin/env bash\nprintf 'not json'\n`);
+	fs.chmodSync(stub, 0o755);
+	await assert.rejects(makeBrowser("s", stub).network(), /non-JSON/);
+});
+
+// U3: poll-mode failure feed integration.
+
+const netEntry = (id, over = {}) => ({
+	requestId: id,
+	url: `https://api.test/${id}`,
+	method: "GET",
+	resourceType: "Fetch",
+	timestamp: Date.now(),
+	...over,
+});
+const pollFake = (netQueue, calls = []) => ({
+	sessionExists: async () => {
+		calls.push("sessionExists");
+		return true;
+	},
+	snapshot: async (f) => {
+		calls.push("snapshot");
+		fs.writeFileSync(f, PNG_1PX);
+		return { url: "https://x/", title: "T", entries: [] };
+	},
+	network: async () => {
+		calls.push("network");
+		const next = netQueue.length > 1 ? netQueue.shift() : netQueue[0];
+		if (next instanceof Error) throw next;
+		return next;
+	},
+});
+const quietPoll = (r) => {
+	quiet(r);
+	r.redrawAll = async () => {};
+	r.fitViewport = async () => false;
+	r.streamCooldownUntil = Number.MAX_SAFE_INTEGER; // stay in poll mode
+	return r;
+};
+
+test("tick: first poll baselines silently, later failure paints with ✖", async () => {
+	const r = quietPoll(mkRenderer());
+	r.browser = pollFake([
+		[netEntry("old", { status: 404 })],
+		[netEntry("old", { status: 404 }), netEntry("fresh", { status: 500 })],
+	]);
+	await r.tick(); // attach + baseline: 'old' swallowed
+	await flush();
+	assert.deepEqual(r.consoleLines, [], "baseline paints nothing");
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /^✖ 500 GET https:\/\/api\.test\/fresh/);
+});
+
+test("tick: broken network feed degrades silently, pane keeps painting", async () => {
+	const r = quietPoll(mkRenderer());
+	r.browser = pollFake([new Error("weird transient failure")]);
+	await r.tick();
+	await r.tick();
+	await flush();
+	assert.deepEqual(r.consoleLines, []);
+	assert.equal(r.banner, "", "no banner for a best-effort feature");
+	assert.equal(r.failures, 0, "tick failure counter untouched");
+	assert.ok(r.networkPollErrors >= 2);
+});
+
+test("tick: maxBuffer-class failure latches the feed off with one line", async () => {
+	const r = quietPoll(mkRenderer());
+	const calls = [];
+	r.browser = pollFake(
+		[new Error("stdout maxBuffer length exceeded")],
+		calls,
+	);
+	await r.tick();
+	await r.tick();
+	await r.tick();
+	await flush();
+	assert.equal(r.networkOff, true);
+	assert.deepEqual(
+		r.consoleLines,
+		["✖ network reporting off — request log too large"],
+		"exactly one visible off note",
+	);
+	assert.equal(
+		calls.filter((c) => c === "network").length,
+		1,
+		"no retries after the latch",
+	);
+});
+
+test("tick: re-attach re-baselines instead of replaying", async () => {
+	const r = quietPoll(mkRenderer());
+	let alive = true;
+	const netQueue = [[netEntry("preexisting", { status: 503 })]];
+	r.browser = {
+		...pollFake(netQueue),
+		sessionExists: async () => alive,
+	};
+	await r.tick(); // attach + baseline
+	await flush();
+	// Session dies: three failed snapshots detach the pane.
+	const goodSnapshot = r.browser.snapshot;
+	r.browser.snapshot = async () => {
+		throw new Error("session gone");
+	};
+	alive = false;
+	await r.tick();
+	await r.tick();
+	await r.tick();
+	assert.equal(r.attached, false, "death detaches");
+	// Session comes back under the same name with old failures in its log.
+	alive = true;
+	r.browser.snapshot = goodSnapshot;
+	await r.tick(); // re-attach: baseline swallows 'preexisting' again
+	await flush();
+	assert.deepEqual(r.consoleLines, [], "no replay across re-attach");
+	netQueue[0] = [netEntry("preexisting", { status: 503 }), netEntry("new1", { status: 404 })];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /404 GET https:\/\/api\.test\/new1/);
+});
+
+test("navigate: existing session baselines before open; nav failure still reports", async () => {
+	const r = quietPoll(mkRenderer());
+	const calls = [];
+	const netQueue = [[netEntry("stale", { status: 500 })]];
+	r.browser = {
+		...pollFake(netQueue, calls),
+		open: async () => {
+			calls.push("open");
+		},
+	};
+	await r.navigate("https://localhost:3000/");
+	assert.ok(
+		calls.indexOf("network") < calls.indexOf("open"),
+		"baseline read fires before open on an existing session",
+	);
+	assert.deepEqual(r.consoleLines, [], "stale failure swallowed");
+	netQueue[0] = [netEntry("stale", { status: 500 }), netEntry("nav", { status: 404 })];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /404 GET https:\/\/api\.test\/nav/);
+});
+
+test("navigate: fresh session gets no pre-open network call, nav failure reports", async () => {
+	const r = quietPoll(mkRenderer());
+	const calls = [];
+	let exists = false;
+	const netQueue = [[]];
+	r.browser = {
+		...pollFake(netQueue, calls),
+		sessionExists: async () => {
+			calls.push("sessionExists");
+			return exists;
+		},
+		open: async () => {
+			calls.push("open");
+			exists = true;
+		},
+	};
+	await r.navigate("https://localhost:3000/");
+	assert.ok(
+		!calls.slice(0, calls.indexOf("open")).includes("network"),
+		"no session-creating read before open",
+	);
+	assert.equal(r.selfCreated, true);
+	netQueue[0] = [netEntry("nav", { status: null, timestamp: Date.now() - 20_000 })];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /^✖ no response GET/);
+});
+
+test("network lines in consoleLines do not perturb console reconcile", async () => {
+	const r = quietPoll(mkRenderer());
+	let consoleEntries = [];
+	const netQueue = [[]];
+	r.browser = {
+		...pollFake(netQueue),
+		snapshot: async (f) => {
+			fs.writeFileSync(f, PNG_1PX);
+			return { url: "https://x/", title: "T", entries: consoleEntries };
+		},
+	};
+	await r.tick(); // baseline
+	netQueue[0] = [netEntry("bad", { status: 500 })];
+	await r.tick(); // paints the failure line
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	consoleEntries = [{ text: "page says hi", type: "log" }];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 2, "console entry appended once");
+	assert.equal(r.consoleLines.at(-1), "  page says hi");
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 2, "no duplicate on the next tick");
+});
+
+// U4: live-mode network timer.
+
+test("live timer: fires the shared poll and paints while streaming", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.live = { ws: { close: () => {} } };
+	r.networkBaselinePending = false;
+	const calls = [];
+	r.browser = pollFake([[netEntry("bad", { status: 500 })]], calls);
+	r.startNetworkTimer(5);
+	await new Promise((res) => setTimeout(res, 60));
+	r.stopNetworkTimer();
+	await flush();
+	assert.ok(calls.includes("network"), "timer polled the daemon");
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /^✖ 500 GET/);
+});
+
+test("live timer: painted polls hold base cadence, empty polls back off", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.live = { ws: { close: () => {} } };
+	r.browser = { network: async () => [] };
+	let painted = true;
+	r.pollNetwork = async () => painted;
+	r.startNetworkTimer(5);
+	await new Promise((res) => setTimeout(res, 40));
+	assert.equal(r.networkIdleTicks, 0, "painted failures reset the counter");
+	painted = false;
+	await new Promise((res) => setTimeout(res, 40));
+	r.stopNetworkTimer();
+	assert.ok(r.networkIdleTicks > 0, "quiet polls accumulate idle ticks");
+});
+
+test("live timer: dropLive clears it first; no fire after drop", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.live = { ws: { close: () => {} } };
+	r.networkBaselinePending = false;
+	const calls = [];
+	r.browser = pollFake([[]], calls);
+	r.startNetworkTimer(20);
+	r.dropLive();
+	assert.equal(r.networkTimer, null, "timer cleared on drop");
+	await new Promise((res) => setTimeout(res, 60));
+	assert.ok(!calls.includes("network"), "no poll after the stream dropped");
+});
+
+test("live timer: in-flight guard collapses concurrent polls", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.networkBaselinePending = false;
+	let netCalls = 0;
+	let release;
+	r.browser = {
+		network: async () => {
+			netCalls++;
+			await new Promise((res) => {
+				release = res;
+			});
+			return [];
+		},
+	};
+	const p1 = r.pollNetwork();
+	const p2 = r.pollNetwork();
+	release([]);
+	const [r1, r2] = await Promise.all([p1, p2]);
+	assert.equal(netCalls, 1, "second poll skipped while one is in flight");
+	assert.equal(r2, false);
+	assert.equal(r1, false);
+});
+
+test("live timer: never starts for browsers without network()", () => {
+	const r = quietPoll(mkRenderer());
+	r.browser = { sessionExists: async () => true };
+	r.startNetworkTimer(5);
+	assert.equal(r.networkTimer, null);
 });

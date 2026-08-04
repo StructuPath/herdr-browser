@@ -312,6 +312,85 @@ export function viewportForPane(frameWidth, { cols, imageRows }) {
 	return { w, h };
 }
 
+// Failed-request diffing over `network requests --json`. The daemon's log is
+// append-only from the pane's perspective but can be wiped without notice
+// (browser relaunch, external --clear), and pid.N-format requestIds can
+// restart after a relaunch — so membership sets are pruned to the ids present
+// in the current log every poll instead of trusting counts or id uniqueness.
+// Seen-set membership means "already reported OR resolved to a non-failure
+// status": an in-flight request must stay classifiable until its status
+// lands, or a 500 arriving one poll late would be swallowed forever.
+export function newNetworkState() {
+	return {
+		seen: new Set(), // requestIds reported or resolved 2xx/3xx
+		recent: new Map(), // dedupe key -> last emit/suppress time (ms)
+	};
+}
+
+export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
+	const ageThresholdMs = opts.ageThresholdMs ?? 15_000;
+	const dedupeWindowMs = opts.dedupeWindowMs ?? 60_000;
+	const maxPerPoll = opts.maxPerPoll ?? 5;
+	const currentIds = new Set();
+	const candidates = [];
+	for (const e of entries) {
+		const id = e?.requestId;
+		if (typeof id !== "string" || !id) continue;
+		currentIds.add(id);
+		if (opts.baseline) {
+			state.seen.add(id);
+			continue;
+		}
+		if (state.seen.has(id)) continue;
+		const status = typeof e.status === "number" ? e.status : null;
+		if (status !== null) {
+			state.seen.add(id);
+			if (status >= 400 && status <= 599)
+				candidates.push({ method: e.method ?? "GET", url: e.url ?? "", status });
+			continue;
+		}
+		// Null status = still in flight OR failed at the connection level; the
+		// daemon drops loadingFailed detail, so entry age past the threshold is
+		// the only failure signal — and it must be entry age, not poll count:
+		// pollDelay stretches ticks. Unaged ids stay out of `seen` so a status
+		// arriving on a later poll is still classified.
+		if (typeof e.timestamp === "number" && nowMs - e.timestamp > ageThresholdMs) {
+			state.seen.add(id);
+			candidates.push({
+				method: e.method ?? "GET",
+				url: e.url ?? "",
+				status: null,
+			});
+		}
+	}
+	// Prune to the live log so wipes and id reuse stay harmless.
+	for (const id of state.seen) if (!currentIds.has(id)) state.seen.delete(id);
+	for (const [k, t] of state.recent)
+		if (nowMs - t > dedupeWindowMs) state.recent.delete(k);
+	// Chrome retries a failed navigation with fresh requestIds and app retry
+	// loops mint new ids per attempt — dedupe by shape, refreshing the window
+	// on suppressed hits so a steady loop paints once, not once per minute.
+	const failures = [];
+	let overflow = 0;
+	for (const c of candidates) {
+		const key = `${c.method} ${c.url} ${c.status ?? "no response"}`;
+		const last = state.recent.get(key);
+		state.recent.set(key, nowMs);
+		if (last !== undefined && nowMs - last <= dedupeWindowMs) continue;
+		if (failures.length < maxPerPoll) failures.push(c);
+		else overflow++;
+	}
+	return { failures, overflow };
+}
+
+// Display text for one failure ("✖ " comes from pushConsole's error prefix).
+// URLs are page-controlled and unbounded (data: URLs carry payloads) —
+// sanitize and hard-cap before the line enters the 500-line store.
+export function formatNetworkFailure({ method, url, status }) {
+	const shownUrl = truncate(sanitizeText(url), 200);
+	return `${status ?? "no response"} ${method} ${shownUrl}`;
+}
+
 // --- agent-browser access ---
 
 export function makeBrowser(session, bin = "agent-browser") {
@@ -421,6 +500,20 @@ export function makeBrowser(session, bin = "agent-browser") {
 			}
 		},
 		streamStatus: async () => run("stream", "status"),
+		// Failed-request source (agent-browser >= 0.33). Read-only: never pass
+		// --clear — external agents share the daemon's request log. --type
+		// bounds payload (data: URLs and SSE/WS noise stay out) and is the
+		// signal filter: failed xhr/fetch/document is what a dev wants to see.
+		network: async () => {
+			const data = await run(
+				"network",
+				"requests",
+				"--type",
+				"xhr,fetch,document",
+			);
+			if (Array.isArray(data?.requests)) return data.requests;
+			return Array.isArray(data) ? data : [];
+		},
 		sessionExists: async () => {
 			try {
 				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
@@ -505,6 +598,18 @@ export class Renderer {
 			`shot-${safeWsId(env.HERDR_WORKSPACE_ID)}.jpg`,
 		);
 		this.lastLiveCheck = 0;
+		// Failed-request feed (see pollNetwork). The baseline flag makes the
+		// first read after an attach swallow pre-attach history silently; the
+		// off latch stops polling for the rest of the attach once the daemon's
+		// unbounded log outgrows the exec limits — retrying a known-fatal
+		// multi-MiB read every tick would waste CPU forever with no output.
+		this.networkState = newNetworkState();
+		this.networkBaselinePending = true;
+		this.networkOff = false;
+		this.networkPollBusy = false;
+		this.networkPollErrors = 0;
+		this.networkTimer = null; // live-mode cadence (see goLive/dropLive)
+		this.networkIdleTicks = 0;
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
 		this.lastImageDims = null;
 		this.lastViewportRequest = "";
@@ -560,6 +665,96 @@ export class Renderer {
 		} catch {
 			this.lastViewportRequest = "";
 			return false;
+		}
+	}
+
+	// Shared failure-feed poll for both modes (tick calls it after a healthy
+	// snapshot; the live-mode timer calls it directly). Returns true when it
+	// painted failures, so the live timer can hold its base cadence on a page
+	// whose only activity is failing requests. The in-flight guard prevents a
+	// timer poll and a tick poll from racing the same state across the
+	// dropLive transition. Never throws.
+	async pollNetwork(baseline = false) {
+		if (this.networkOff || this.networkPollBusy || !this.attached)
+			return false;
+		if (typeof this.browser.network !== "function") return false; // test doubles / older engines
+		this.networkPollBusy = true;
+		try {
+			const entries = await this.browser.network();
+			const { failures, overflow } = diffNetworkFailures(
+				this.networkState,
+				entries,
+				Date.now(),
+				{ baseline: baseline || this.networkBaselinePending },
+			);
+			this.networkBaselinePending = false;
+			this.networkPollErrors = 0;
+			if (!failures.length) return false;
+			const hadConsole = this.consoleLines.length > 0;
+			const lines = failures.map((f) => ({
+				text: formatNetworkFailure(f),
+				type: "error",
+			}));
+			if (overflow)
+				lines.push({
+					text: `…and ${overflow} more failed requests`,
+					type: "error",
+				});
+			this.pushConsole(lines, false);
+			this.queueConsolePaint(hadConsole);
+			return true;
+		} catch (err) {
+			// The daemon log is unbounded and --clear is not ours to send: once
+			// the payload exceeds maxBuffer or the exec timeout, every retry is
+			// guaranteed to fail the same way. Latch off with one visible line.
+			const fatal =
+				/maxBuffer/i.test(err?.message ?? "") || err?.killed === true;
+			if (fatal) {
+				this.networkOff = true;
+				const hadConsole = this.consoleLines.length > 0;
+				this.pushConsole(
+					[{ text: "network reporting off — request log too large", type: "error" }],
+					false,
+				);
+				this.queueConsolePaint(hadConsole);
+			} else {
+				this.networkPollErrors++;
+			}
+			return false;
+		} finally {
+			this.networkPollBusy = false;
+		}
+	}
+
+	// Live mode has no snapshot tick and the push stream carries no network
+	// events, so failures need their own low-cadence poll. pollDelay-style
+	// backoff keeps an unwatched live pane near-free; the idle counter resets
+	// on stream activity AND on painted failures — a background retry loop on
+	// a visually static page produces neither frames nor console entries, so
+	// the failures themselves must hold the base cadence.
+	startNetworkTimer(baseMs = 4_000) {
+		if (this.networkTimer || typeof this.browser.network !== "function")
+			return;
+		const fire = async () => {
+			this.networkTimer = null;
+			if (!this.live || !this.attached || this.networkOff) return;
+			if (await this.pollNetwork()) this.networkIdleTicks = 0;
+			else this.networkIdleTicks++;
+			if (!this.live || this.networkOff) return; // dropped or latched mid-poll
+			this.networkTimer = setTimeout(
+				fire,
+				pollDelay(baseMs, this.networkIdleTicks),
+			);
+			this.networkTimer.unref?.();
+		};
+		this.networkTimer = setTimeout(fire, baseMs);
+		this.networkTimer.unref?.();
+	}
+
+	stopNetworkTimer() {
+		if (this.networkTimer) {
+			clearTimeout(this.networkTimer);
+			this.networkTimer = null;
 		}
 	}
 
@@ -774,6 +969,11 @@ export class Renderer {
 			this.banner = "";
 			this.streamCooldownUntil = 0; // try the live stream right away
 			this.lastViewportRequest = ""; // fit the new session once
+			// A (re-)attach may be a different session under the same name:
+			// start the failure feed from a clean silent baseline every time.
+			this.networkState = newNetworkState();
+			this.networkBaselinePending = true;
+			this.networkOff = false;
 		}
 		if (this.live) {
 			// Event-driven: the stream paints everything; the poll loop only
@@ -851,6 +1051,9 @@ export class Renderer {
 			failed = true;
 			this.failures++;
 		}
+		// Best-effort by design: a broken failure feed must never take the
+		// frame/console paint path down with it (pollNetwork never throws).
+		if (!failed) await this.pollNetwork();
 		if (failed && this.failures >= 3) {
 			if (await this.browser.sessionExists()) {
 				this.banner = "agent-browser not responding — retrying";
@@ -1116,10 +1319,15 @@ export class Renderer {
 		ws.onclose = drop;
 		ws.onerror = drop;
 		this.banner = "";
+		this.networkIdleTicks = 0;
+		this.startNetworkTimer();
 		return true;
 	}
 
 	dropLive(note) {
+		// First: a timer poll must not fire into the poll-mode transition and
+		// race tick's poll over the same diff state.
+		this.stopNetworkTimer();
 		const wasLive = !!this.live;
 		if (this.live) {
 			try {
@@ -1159,6 +1367,7 @@ export class Renderer {
 				}
 				this.shotFormat = "jpg";
 				this.frameSeq++;
+				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
 				this.enqueue(async () => {
 					await this.renderImage();
 					await this.fitViewport(dims.w, dims.h);
@@ -1166,6 +1375,7 @@ export class Renderer {
 				break;
 			}
 			case "console": {
+				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
 				const hadConsole = this.consoleLines.length > 0;
 				this.pushConsole(
 					[{ text: m.text ?? "", type: m.level ?? "log" }],
@@ -1260,6 +1470,22 @@ export class Renderer {
 		// and ownership is claimed only after the open actually succeeds, so a
 		// failed navigate can never make us kill someone else's session.
 		const existed = await this.browser.sessionExists();
+		// Failure-feed baseline splits on the same check: an existing session
+		// gets a real silent-baseline read before open (so only the navigation's
+		// own failures paint), while a not-yet-existing session gets state-only
+		// seeding — a pre-open network read would auto-create the session and
+		// break the ownership rule below. Fresh daemons arm request tracking at
+		// spawn, so the navigation's failures are in the log for the first
+		// post-attach poll either way.
+		this.networkState = newNetworkState();
+		this.networkOff = false;
+		if (existed) {
+			this.networkBaselinePending = false;
+			this.attached = true; // pollNetwork requires it; the session exists
+			await this.pollNetwork(true);
+		} else {
+			this.networkBaselinePending = false; // nothing to swallow: empty log
+		}
 		await this.browser.open(u);
 		if (!existed) this.selfCreated = true;
 		this.attached = true; // the user is explicitly starting/driving the session
@@ -1298,6 +1524,7 @@ export class Renderer {
 
 	cleanup() {
 		if (this.mode === "kitty") process.stdout.write(KITTY_DELETE_ALL);
+		this.stopNetworkTimer();
 		try {
 			this.live?.ws.close();
 		} catch {

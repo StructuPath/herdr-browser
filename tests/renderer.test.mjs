@@ -1842,3 +1842,82 @@ test("network lines in consoleLines do not perturb console reconcile", async () 
 	await flush();
 	assert.equal(r.consoleLines.length, 2, "no duplicate on the next tick");
 });
+
+// U4: live-mode network timer.
+
+test("live timer: fires the shared poll and paints while streaming", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.live = { ws: { close: () => {} } };
+	r.networkBaselinePending = false;
+	const calls = [];
+	r.browser = pollFake([[netEntry("bad", { status: 500 })]], calls);
+	r.startNetworkTimer(5);
+	await new Promise((res) => setTimeout(res, 60));
+	r.stopNetworkTimer();
+	await flush();
+	assert.ok(calls.includes("network"), "timer polled the daemon");
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /^✖ 500 GET/);
+});
+
+test("live timer: painted polls hold base cadence, empty polls back off", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.live = { ws: { close: () => {} } };
+	r.browser = { network: async () => [] };
+	let painted = true;
+	r.pollNetwork = async () => painted;
+	r.startNetworkTimer(5);
+	await new Promise((res) => setTimeout(res, 40));
+	assert.equal(r.networkIdleTicks, 0, "painted failures reset the counter");
+	painted = false;
+	await new Promise((res) => setTimeout(res, 40));
+	r.stopNetworkTimer();
+	assert.ok(r.networkIdleTicks > 0, "quiet polls accumulate idle ticks");
+});
+
+test("live timer: dropLive clears it first; no fire after drop", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.live = { ws: { close: () => {} } };
+	r.networkBaselinePending = false;
+	const calls = [];
+	r.browser = pollFake([[]], calls);
+	r.startNetworkTimer(20);
+	r.dropLive();
+	assert.equal(r.networkTimer, null, "timer cleared on drop");
+	await new Promise((res) => setTimeout(res, 60));
+	assert.ok(!calls.includes("network"), "no poll after the stream dropped");
+});
+
+test("live timer: in-flight guard collapses concurrent polls", async () => {
+	const r = quietPoll(mkRenderer());
+	r.attached = true;
+	r.networkBaselinePending = false;
+	let netCalls = 0;
+	let release;
+	r.browser = {
+		network: async () => {
+			netCalls++;
+			await new Promise((res) => {
+				release = res;
+			});
+			return [];
+		},
+	};
+	const p1 = r.pollNetwork();
+	const p2 = r.pollNetwork();
+	release([]);
+	const [r1, r2] = await Promise.all([p1, p2]);
+	assert.equal(netCalls, 1, "second poll skipped while one is in flight");
+	assert.equal(r2, false);
+	assert.equal(r1, false);
+});
+
+test("live timer: never starts for browsers without network()", () => {
+	const r = quietPoll(mkRenderer());
+	r.browser = { sessionExists: async () => true };
+	r.startNetworkTimer(5);
+	assert.equal(r.networkTimer, null);
+});

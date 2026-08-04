@@ -1645,3 +1645,200 @@ test("makeBrowser.network rejects on malformed output so callers degrade", async
 	fs.chmodSync(stub, 0o755);
 	await assert.rejects(makeBrowser("s", stub).network(), /non-JSON/);
 });
+
+// U3: poll-mode failure feed integration.
+
+const netEntry = (id, over = {}) => ({
+	requestId: id,
+	url: `https://api.test/${id}`,
+	method: "GET",
+	resourceType: "Fetch",
+	timestamp: Date.now(),
+	...over,
+});
+const pollFake = (netQueue, calls = []) => ({
+	sessionExists: async () => {
+		calls.push("sessionExists");
+		return true;
+	},
+	snapshot: async (f) => {
+		calls.push("snapshot");
+		fs.writeFileSync(f, PNG_1PX);
+		return { url: "https://x/", title: "T", entries: [] };
+	},
+	network: async () => {
+		calls.push("network");
+		const next = netQueue.length > 1 ? netQueue.shift() : netQueue[0];
+		if (next instanceof Error) throw next;
+		return next;
+	},
+});
+const quietPoll = (r) => {
+	quiet(r);
+	r.redrawAll = async () => {};
+	r.fitViewport = async () => false;
+	r.streamCooldownUntil = Number.MAX_SAFE_INTEGER; // stay in poll mode
+	return r;
+};
+
+test("tick: first poll baselines silently, later failure paints with ✖", async () => {
+	const r = quietPoll(mkRenderer());
+	r.browser = pollFake([
+		[netEntry("old", { status: 404 })],
+		[netEntry("old", { status: 404 }), netEntry("fresh", { status: 500 })],
+	]);
+	await r.tick(); // attach + baseline: 'old' swallowed
+	await flush();
+	assert.deepEqual(r.consoleLines, [], "baseline paints nothing");
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /^✖ 500 GET https:\/\/api\.test\/fresh/);
+});
+
+test("tick: broken network feed degrades silently, pane keeps painting", async () => {
+	const r = quietPoll(mkRenderer());
+	r.browser = pollFake([new Error("weird transient failure")]);
+	await r.tick();
+	await r.tick();
+	await flush();
+	assert.deepEqual(r.consoleLines, []);
+	assert.equal(r.banner, "", "no banner for a best-effort feature");
+	assert.equal(r.failures, 0, "tick failure counter untouched");
+	assert.ok(r.networkPollErrors >= 2);
+});
+
+test("tick: maxBuffer-class failure latches the feed off with one line", async () => {
+	const r = quietPoll(mkRenderer());
+	const calls = [];
+	r.browser = pollFake(
+		[new Error("stdout maxBuffer length exceeded")],
+		calls,
+	);
+	await r.tick();
+	await r.tick();
+	await r.tick();
+	await flush();
+	assert.equal(r.networkOff, true);
+	assert.deepEqual(
+		r.consoleLines,
+		["✖ network reporting off — request log too large"],
+		"exactly one visible off note",
+	);
+	assert.equal(
+		calls.filter((c) => c === "network").length,
+		1,
+		"no retries after the latch",
+	);
+});
+
+test("tick: re-attach re-baselines instead of replaying", async () => {
+	const r = quietPoll(mkRenderer());
+	let alive = true;
+	const netQueue = [[netEntry("preexisting", { status: 503 })]];
+	r.browser = {
+		...pollFake(netQueue),
+		sessionExists: async () => alive,
+	};
+	await r.tick(); // attach + baseline
+	await flush();
+	// Session dies: three failed snapshots detach the pane.
+	const goodSnapshot = r.browser.snapshot;
+	r.browser.snapshot = async () => {
+		throw new Error("session gone");
+	};
+	alive = false;
+	await r.tick();
+	await r.tick();
+	await r.tick();
+	assert.equal(r.attached, false, "death detaches");
+	// Session comes back under the same name with old failures in its log.
+	alive = true;
+	r.browser.snapshot = goodSnapshot;
+	await r.tick(); // re-attach: baseline swallows 'preexisting' again
+	await flush();
+	assert.deepEqual(r.consoleLines, [], "no replay across re-attach");
+	netQueue[0] = [netEntry("preexisting", { status: 503 }), netEntry("new1", { status: 404 })];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /404 GET https:\/\/api\.test\/new1/);
+});
+
+test("navigate: existing session baselines before open; nav failure still reports", async () => {
+	const r = quietPoll(mkRenderer());
+	const calls = [];
+	const netQueue = [[netEntry("stale", { status: 500 })]];
+	r.browser = {
+		...pollFake(netQueue, calls),
+		open: async () => {
+			calls.push("open");
+		},
+	};
+	await r.navigate("https://localhost:3000/");
+	assert.ok(
+		calls.indexOf("network") < calls.indexOf("open"),
+		"baseline read fires before open on an existing session",
+	);
+	assert.deepEqual(r.consoleLines, [], "stale failure swallowed");
+	netQueue[0] = [netEntry("stale", { status: 500 }), netEntry("nav", { status: 404 })];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /404 GET https:\/\/api\.test\/nav/);
+});
+
+test("navigate: fresh session gets no pre-open network call, nav failure reports", async () => {
+	const r = quietPoll(mkRenderer());
+	const calls = [];
+	let exists = false;
+	const netQueue = [[]];
+	r.browser = {
+		...pollFake(netQueue, calls),
+		sessionExists: async () => {
+			calls.push("sessionExists");
+			return exists;
+		},
+		open: async () => {
+			calls.push("open");
+			exists = true;
+		},
+	};
+	await r.navigate("https://localhost:3000/");
+	assert.ok(
+		!calls.slice(0, calls.indexOf("open")).includes("network"),
+		"no session-creating read before open",
+	);
+	assert.equal(r.selfCreated, true);
+	netQueue[0] = [netEntry("nav", { status: null, timestamp: Date.now() - 20_000 })];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	assert.match(r.consoleLines[0], /^✖ no response GET/);
+});
+
+test("network lines in consoleLines do not perturb console reconcile", async () => {
+	const r = quietPoll(mkRenderer());
+	let consoleEntries = [];
+	const netQueue = [[]];
+	r.browser = {
+		...pollFake(netQueue),
+		snapshot: async (f) => {
+			fs.writeFileSync(f, PNG_1PX);
+			return { url: "https://x/", title: "T", entries: consoleEntries };
+		},
+	};
+	await r.tick(); // baseline
+	netQueue[0] = [netEntry("bad", { status: 500 })];
+	await r.tick(); // paints the failure line
+	await flush();
+	assert.equal(r.consoleLines.length, 1);
+	consoleEntries = [{ text: "page says hi", type: "log" }];
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 2, "console entry appended once");
+	assert.equal(r.consoleLines.at(-1), "  page says hi");
+	await r.tick();
+	await flush();
+	assert.equal(r.consoleLines.length, 2, "no duplicate on the next tick");
+});

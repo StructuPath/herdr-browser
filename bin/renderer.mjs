@@ -323,7 +323,6 @@ export function viewportForPane(frameWidth, { cols, imageRows }) {
 export function newNetworkState() {
 	return {
 		seen: new Set(), // requestIds reported or resolved 2xx/3xx
-		pending: new Set(), // requestIds observed with no status yet
 		recent: new Map(), // dedupe key -> last emit/suppress time (ms)
 	};
 }
@@ -345,18 +344,17 @@ export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
 		if (state.seen.has(id)) continue;
 		const status = typeof e.status === "number" ? e.status : null;
 		if (status !== null) {
-			state.pending.delete(id);
 			state.seen.add(id);
 			if (status >= 400 && status <= 599)
 				candidates.push({ method: e.method ?? "GET", url: e.url ?? "", status });
 			continue;
 		}
-		state.pending.add(id);
-		// No error detail exists anywhere for connection-level failures (the
-		// daemon drops loadingFailed), so age past threshold is the only signal
-		// — and it must be entry age, not poll count: pollDelay stretches ticks.
+		// Null status = still in flight OR failed at the connection level; the
+		// daemon drops loadingFailed detail, so entry age past the threshold is
+		// the only failure signal — and it must be entry age, not poll count:
+		// pollDelay stretches ticks. Unaged ids stay out of `seen` so a status
+		// arriving on a later poll is still classified.
 		if (typeof e.timestamp === "number" && nowMs - e.timestamp > ageThresholdMs) {
-			state.pending.delete(id);
 			state.seen.add(id);
 			candidates.push({
 				method: e.method ?? "GET",
@@ -365,10 +363,8 @@ export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
 			});
 		}
 	}
-	// Prune both sets to the live log so wipes and id reuse stay harmless.
+	// Prune to the live log so wipes and id reuse stay harmless.
 	for (const id of state.seen) if (!currentIds.has(id)) state.seen.delete(id);
-	for (const id of state.pending)
-		if (!currentIds.has(id)) state.pending.delete(id);
 	for (const [k, t] of state.recent)
 		if (nowMs - t > dedupeWindowMs) state.recent.delete(k);
 	// Chrome retries a failed navigation with fresh requestIds and app retry

@@ -504,6 +504,20 @@ export function makeBrowser(session, bin = "agent-browser") {
 			}
 		},
 		streamStatus: async () => run("stream", "status"),
+		// Failed-request source (agent-browser >= 0.33). Read-only: never pass
+		// --clear — external agents share the daemon's request log. --type
+		// bounds payload (data: URLs and SSE/WS noise stay out) and is the
+		// signal filter: failed xhr/fetch/document is what a dev wants to see.
+		network: async () => {
+			const data = await run(
+				"network",
+				"requests",
+				"--type",
+				"xhr,fetch,document",
+			);
+			if (Array.isArray(data?.requests)) return data.requests;
+			return Array.isArray(data) ? data : [];
+		},
 		sessionExists: async () => {
 			try {
 				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {

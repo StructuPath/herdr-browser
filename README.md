@@ -19,6 +19,9 @@ Conductor).
 - **Shared agent sessions** — one isolated browser session per Herdr workspace.
 - **Live push streaming** — frames, URL/title changes, console messages, and
   page errors arrive over WebSocket, with transparent polling fallback.
+- **Failed network requests** — 4xx/5xx and no-response xhr/fetch/document
+  requests appear in the console region as `✖ 404 GET <url>` lines, in both
+  streaming and polling modes.
 - **Pane-aware layout** — the browser viewport fits the pane without stretching
   or changing its responsive width; the console opens only when output exists.
 - **Real interaction** — clicks use Chrome mouse events rather than DOM selector
@@ -197,8 +200,17 @@ viewport width—and therefore its responsive breakpoint—while fitting only th
 height to the pane's image area. The frame fills that area without stretching.
 
 On a quiet page, the image uses all rows between the header and controls. The
-console region appears only after a console message or page error arrives; the
-viewport then refits to the remaining image area.
+console region appears only after a console message, page error, or failed
+network request arrives; the viewport then refits to the remaining image area.
+
+Failed network requests paint as `✖ 404 GET <url>` (HTTP 400–599) or
+`✖ no response GET <url>` (connection-level failures, detected after ~15
+seconds without a status). Only xhr, fetch, and document requests are watched —
+images, stylesheets, and held-open streams (SSE, WebSocket) stay out. Failures
+from before the pane attached are intentionally not replayed, repeated
+identical failures are collapsed within a 60-second window, and on very long
+sessions the feed turns itself off with a one-time note once the daemon's
+request log outgrows the pane's read buffer.
 
 ## Session model
 

@@ -38,7 +38,7 @@ Conductor).
 | --- | --- | --- |
 | Herdr | `>= 0.7.0` | Tested with Herdr 0.7.4 |
 | Node.js | `>= 20` | Node 22+ enables live WebSocket streaming |
-| agent-browser | Required | Tested with agent-browser 0.28.x |
+| agent-browser | Required | Tested with agent-browser 0.33.x; failed-request reporting needs the `network requests` command |
 | chafa | Optional | ANSI rendering and streamed JPEGs in Kitty mode |
 | carbonyl | Optional | Only required for the separate interactive Browse action |
 
@@ -207,8 +207,9 @@ Failed network requests paint as `✖ 404 GET <url>` (HTTP 400–599) or
 `✖ no response GET <url>` (connection-level failures, detected after ~15
 seconds without a status). Only xhr, fetch, and document requests are watched —
 images, stylesheets, and held-open streams (SSE, WebSocket) stay out. Failures
-from before the pane attached are intentionally not replayed, repeated
-identical failures are collapsed within a 60-second window, and on very long
+from before the pane attached are intentionally not replayed, a repeating
+identical failure paints once and stays collapsed until it has been quiet for
+60 seconds, and on very long
 sessions the feed turns itself off with a one-time note once the daemon's
 request log outgrows the pane's read buffer.
 

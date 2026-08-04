@@ -23,9 +23,21 @@ function parseManifest(manifestPath) {
 		);
 	}
 	if (result.status !== 0) {
-		throw new Error(`manifest is not valid TOML: ${result.stderr.trim()}`);
+		const stderr = (result.stderr ?? "").trim();
+		if (/No module named ['"]tomllib['"]/.test(stderr)) {
+			throw new Error(
+				"python3 >= 3.11 is required to parse herdr-plugin.toml (tomllib missing)",
+			);
+		}
+		throw new Error(`manifest is not valid TOML: ${stderr}`);
 	}
-	return JSON.parse(result.stdout);
+	try {
+		return JSON.parse(result.stdout);
+	} catch (error) {
+		throw new Error(
+			`manifest parser returned non-JSON output: ${error.message}`,
+		);
+	}
 }
 
 function manifestCommands(manifest, errors) {

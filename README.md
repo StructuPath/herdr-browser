@@ -210,6 +210,8 @@ images, stylesheets, and held-open streams (SSE, WebSocket) stay out. Failures
 from before the pane attached are intentionally not replayed, a repeating
 identical failure paints once and stays collapsed until it has been quiet for
 60 seconds, and on very long
+from before the pane attached are intentionally not replayed, repeated
+identical failures are collapsed within a 60-second window, and on very long
 sessions the feed turns itself off with a one-time note once the daemon's
 request log outgrows the pane's read buffer.
 
@@ -242,16 +244,38 @@ echo "my-agent-session" \
 
 ## Recording
 
-Start and stop recording through the two recording actions. Files are written
-to:
+Start and stop recording through the existing recording actions. Each new
+capture is a run-scoped observation bundle:
 
 ```text
-<Herdr plugin state>/recordings/herdr-ws-<id>-YYYYMMDD-HHMMSS.webm
+<Herdr plugin state>/runs/run-<run-id>/browser/
+  evidence.json
+  recording.webm
 ```
+
+Set `HERDR_BROWSER_RUN_ID`, or put a run ID on the first line of
+`<plugin config>/run-id`. IDs must be 1–128 ASCII letters, digits, dots,
+underscores, or hyphens and must start with a letter or digit. When neither is
+set, Browser generates an ID. One active recording is allowed per workspace;
+Stop always uses the run and browser session pinned by Start, even if the
+current environment changed.
+
+On successful Stop, `evidence.json` records the WebM byte count and SHA-256.
+The bundle is an **unreviewed, operator-reviewable observation**, not a test
+result, acceptance decision, provenance claim, or cryptographic attestation.
+Its digest detects later content changes but does not identify who recorded or
+reviewed it. A missing, empty, non-regular, symlinked, or oversized WebM is not
+marked complete. A confirmed failed Stop retains a retryable active pointer.
+Before invoking Stop, Browser durably marks the attempt pending; if the process
+is interrupted while its outcome is unknown, later Stop actions fail closed
+without calling the non-idempotent engine again or marking evidence complete.
+That pending pointer remains occupied for manual inspection and reconciliation.
 
 Starting a recording creates a fresh browser context: the page reloads, while
 cookies and localStorage are preserved. Start recording before the flow you
-want to capture. Recordings persist until you delete them.
+want to capture. Bundles persist until you delete them. Files created by 0.5
+under `recordings/*.webm` remain untouched as legacy, unscoped recordings and
+are not relabeled or migrated.
 
 ## Configuration
 
@@ -260,6 +284,7 @@ Plugin config files contain one value on their first line:
 | File | Values | Default | Purpose |
 | --- | --- | --- | --- |
 | `session` | Session name | `herdr-ws-<workspace-id>` | Watch a different agent-browser session |
+| `run-id` | Valid run ID | Generated | Correlate a recording bundle with an external run |
 | `render` | `kitty`, `symbols`, `text` | Automatic probe | Force a rendering mode |
 
 Equivalent environment controls:
@@ -267,6 +292,7 @@ Equivalent environment controls:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `HERDR_BROWSER_SESSION` | Workspace session | Override the watched session |
+| `HERDR_BROWSER_RUN_ID` | Config or generated ID | Select the recording run ID |
 | `HERDR_BROWSER_RENDER` | Automatic probe | Override the rendering mode |
 | `HERDR_BROWSER_INTERVAL_MS` | `1000` | Polling interval; clamped to safe bounds |
 | `AGENT_BROWSER_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for plugin-created browser daemons |
@@ -280,6 +306,7 @@ Environment variables take precedence over config files.
 - Workspace identifiers are sanitized before they are used in state paths.
 - Polling frames are cached as PNG; streamed frames are cached as JPEG. Frame
   files are mode `0600` and removed when the pane exits.
+- Recording bundles use private directories (`0700`) and files (`0600`), and session names are metadata only—never path components.
 - WebM recordings are intentionally retained under the plugin state directory.
 - Browser sessions are a trusted local boundary: any local process that knows a
   session name can drive it, including authenticated pages.

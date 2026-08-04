@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// herdr-browser pane renderer: a passive viewer of an agent-browser session.
-// It never navigates, never clears the console buffer, and never creates or
-// destroys the browser session — those belong to the user and their agent.
+// herdr-browser pane renderer: an attached view of an agent-browser session.
+// It stays passive until explicit pane input, never clears the console buffer,
+// and closes only sessions that its own successful navigation created.
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
@@ -1250,7 +1250,7 @@ export class Renderer {
 			this.lastHash,
 			this.consolePushes,
 			this.frameSeq,
-		].join(" ");
+		].join("\0");
 	}
 
 	// --- live stream (push) ---
@@ -1484,6 +1484,7 @@ export class Renderer {
 			// poll is in flight, the busy guard skips this read, and clearing
 			// the flag here would let the next poll replay the whole log.
 			this.networkBaselinePending = true;
+			this.networkBaselinePending = false;
 			this.attached = true; // pollNetwork requires it; the session exists
 			await this.pollNetwork(true);
 		} else {

@@ -1480,6 +1480,10 @@ export class Renderer {
 		this.networkState = newNetworkState();
 		this.networkOff = false;
 		if (existed) {
+			// Stays pending until a read actually completes: if a live-timer
+			// poll is in flight, the busy guard skips this read, and clearing
+			// the flag here would let the next poll replay the whole log.
+			this.networkBaselinePending = true;
 			this.networkBaselinePending = false;
 			this.attached = true; // pollNetwork requires it; the session exists
 			await this.pollNetwork(true);

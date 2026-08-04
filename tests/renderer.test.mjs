@@ -1624,3 +1624,34 @@ test("network format: sanitizes and hard-caps page-controlled URLs", () => {
 		"no response POST http://l:3000/a",
 	);
 });
+
+test("makeBrowser.network passes the type filter, never --clear", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-net-"));
+	const logf = path.join(dir, "log");
+	const stub = path.join(dir, "ab-stub");
+	fs.writeFileSync(
+		stub,
+		`#!/usr/bin/env bash
+echo "$@" >> "${logf}"
+printf '%s' '{"success":true,"data":{"requests":[{"requestId":"r1","url":"https://x/a","method":"GET","status":404,"timestamp":1000,"resourceType":"Fetch"}]}}'
+`,
+	);
+	fs.chmodSync(stub, 0o755);
+	const reqs = await makeBrowser("s", stub).network();
+	assert.equal(reqs.length, 1);
+	assert.equal(reqs[0].requestId, "r1");
+	const logged = fs.readFileSync(logf, "utf8");
+	assert.match(
+		logged,
+		/--session s network requests --type xhr,fetch,document --json/,
+	);
+	assert.ok(!logged.includes("--clear"), "pane must never clear the shared log");
+});
+
+test("makeBrowser.network rejects on malformed output so callers degrade", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-netbad-"));
+	const stub = path.join(dir, "ab-stub");
+	fs.writeFileSync(stub, `#!/usr/bin/env bash\nprintf 'not json'\n`);
+	fs.chmodSync(stub, 0o755);
+	await assert.rejects(makeBrowser("s", stub).network(), /non-JSON/);
+});

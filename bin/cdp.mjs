@@ -251,6 +251,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 export function makeCdpBrowser(endpointInput, opts = {}) {
 	const quality = opts.quality ?? 60;
 	const maxDim = opts.maxDim ?? 1280;
+	const consoleTier = opts.consoleTier === "log-only" ? "log-only" : "runtime+log";
 	let session = null;
 	let endpoint = null;
 	let pageSessionId = null;
@@ -282,6 +283,17 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		return g;
 	};
 
+	// Console/error/network feed. Log is always on: it carries network
+	// failures with Chrome's real error text (net::ERR_*), detail the
+	// agent-browser daemon drops entirely. Runtime is opt-out because
+	// Runtime.enable is page-observable — stealth automation stacks avoid it,
+	// and observing a run must not be able to change its outcome.
+	const enableFeed = async (sessionId) => {
+		await session.send("Log.enable", {}, sessionId);
+		if (consoleTier !== "log-only")
+			await session.send("Runtime.enable", {}, sessionId);
+	};
+
 	const pinTarget = async (targetId) => {
 		const { sessionId } = await session.send("Target.attachToTarget", {
 			targetId,
@@ -290,6 +302,20 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		pinnedTargetId = targetId;
 		pageSessionId = sessionId;
 		await session.send("Page.enable", {}, sessionId);
+		await enableFeed(sessionId);
+		// Events-only auto-attach: OOPIFs and workers deliver their console and
+		// network failures on their own sessions, and a broken embedded frame
+		// with a silent console is exactly the case this feature exists for.
+		// Rendering and input stay pinned to the page target.
+		try {
+			await session.send(
+				"Target.setAutoAttach",
+				{ autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+				sessionId,
+			);
+		} catch {
+			/* older engines: page-level feed only */
+		}
 		await startScreencast();
 	};
 
@@ -330,8 +356,63 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		}
 		if (m.method === "Inspector.targetCrashed" && m.sessionId === pageSessionId) {
 			emit({ type: "page_error", text: "page crashed — waiting for reload" });
+			return;
+		}
+		// A newly auto-attached OOPIF/worker session needs its own feed.
+		if (m.method === "Target.attachedToTarget") {
+			const sid = m.params.sessionId;
+			enableFeed(sid).catch(() => {});
+			return;
+		}
+		if (m.method === "Runtime.consoleAPICalled") {
+			if (isReplay(m.params.timestamp)) return;
+			emit({
+				type: "console",
+				level: m.params.type === "warning" ? "warn" : m.params.type,
+				text: consoleArgsText(m.params.args),
+			});
+			return;
+		}
+		if (m.method === "Runtime.exceptionThrown") {
+			if (isReplay(m.params.timestamp)) return;
+			const d = m.params.exceptionDetails ?? {};
+			emit({
+				type: "page_error",
+				text: d.exception?.description ?? d.text ?? "uncaught exception",
+			});
+			return;
+		}
+		if (m.method === "Log.entryAdded") {
+			const e = m.params.entry ?? {};
+			if (isReplay(e.timestamp)) return;
+			emit({
+				type: "log_entry",
+				source: e.source,
+				level: e.level,
+				text: e.text ?? "",
+				url: e.url ?? "",
+			});
 		}
 	};
+
+	// Chrome flushes buffered console/log history when the domains are
+	// enabled — the same wall-of-history problem the network feed's silent
+	// baseline solves. CDP timestamps are ms since epoch.
+	const isReplay = (ts) =>
+		typeof ts === "number" && attachTimeMs > 0 && ts < attachTimeMs;
+
+	// Console args are page-controlled and can be huge; take the shallow text
+	// only. No Runtime.getProperties — that would both bloat the pane and
+	// deepen the observable footprint on the page.
+	const consoleArgsText = (args) =>
+		(args ?? [])
+			.map((a) => {
+				if (a.unserializableValue !== undefined) return String(a.unserializableValue);
+				if (a.value !== undefined) return typeof a.value === "string" ? a.value : JSON.stringify(a.value);
+				return a.description ?? a.className ?? a.type ?? "";
+			})
+			.join(" ")
+			.slice(0, 2_000);
 
 	return {
 		// Identity of what we're attached to; the Renderer compares guid across

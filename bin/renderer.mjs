@@ -835,6 +835,10 @@ export class Renderer {
 			this.onStreamMessage(m);
 			return;
 		}
+		if (m.type === "log_entry") {
+			this.pushLogEntry(m);
+			return;
+		}
 		if (m.type === "target_gone") {
 			this.banner = "the observed page closed — waiting";
 			this.header();
@@ -845,6 +849,29 @@ export class Renderer {
 			this.banner = "browser endpoint closed — waiting";
 			this.header();
 		}
+	}
+
+	// Log-domain entries. Network-source entries are the attach-mode
+	// equivalent of the polling failure feed and share its dedupe window, so a
+	// retry loop paints once in either mode; other sources (violation,
+	// security, deprecation) paint at their own level.
+	pushLogEntry(entry) {
+		const text = entry.url
+			? `${entry.text} ${truncate(sanitizeText(entry.url), 200)}`
+			: entry.text;
+		if (entry.source === "network") {
+			const key = `log ${entry.url} ${entry.text}`;
+			const now = Date.now();
+			const last = this.networkState.recent.get(key);
+			this.networkState.recent.set(key, now);
+			if (last !== undefined && now - last <= 60_000) return;
+		}
+		const hadConsole = this.consoleLines.length > 0;
+		this.pushConsole(
+			[{ text, type: entry.level === "warning" ? "warn" : entry.level }],
+			false,
+		);
+		this.queueConsolePaint(hadConsole);
 	}
 
 	// Pane cell -> frame pixel -> page CSS pixel. The frame is scaled by both

@@ -2112,3 +2112,24 @@ test("attach mode: endpoint tokens never reach the banner", async () => {
 	assert.match(r.banner, /127\.0\.0\.1:9222/);
 	assert.ok(!r.banner.includes("SECRET-TOKEN"), "capability token redacted");
 });
+
+test("attach mode: network log entries dedupe on the shared window", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	const entry = {
+		type: "log_entry",
+		source: "network",
+		level: "error",
+		text: "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+		url: "http://127.0.0.1:1/beacon",
+	};
+	for (let i = 0; i < 5; i++) r.onCdpMessage(entry);
+	await flush();
+	assert.equal(r.consoleLines.length, 1, "retry loop paints once");
+	assert.match(r.consoleLines[0], /^✖ Failed to load resource: net::ERR_CONNECTION_REFUSED/);
+	r.onCdpMessage({ ...entry, source: "violation", level: "warn", text: "slow handler", url: "" });
+	await flush();
+	assert.equal(r.consoleLines.length, 2, "non-network sources are not deduped away");
+	assert.match(r.consoleLines[1], /^⚠ slow handler/);
+});

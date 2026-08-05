@@ -389,3 +389,86 @@ test("adapter input: click is press+release, type is insertText, scroll is mouse
 	assert.equal(wheel.params.type, "mouseWheel");
 	assert.equal(wheel.params.deltaY, 300);
 });
+
+test("adapter feed: log-only tier never sends Runtime.enable", async () => {
+	const fake = makeFakeCdp();
+	const b = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", {
+		consoleTier: "log-only",
+		wsFactory: () => {
+			queueMicrotask(() => fake.ws.onopen?.());
+			return fake.ws;
+		},
+	});
+	b.onMessage(() => {});
+	await b.connect();
+	assert.equal(fake.calls("Log.enable").length, 1, "Log always on");
+	assert.equal(
+		fake.calls("Runtime.enable").length,
+		0,
+		"Runtime.enable is page-observable — the opt-out must really opt out",
+	);
+	assert.equal(fake.calls("Target.setAutoAttach").length, 1, "OOPIF feed still armed");
+});
+
+test("adapter feed: default tier enables Runtime and swallows pre-attach replay", async () => {
+	const fake = makeFakeCdp();
+	const { b, got } = await attachBrowser(fake);
+	assert.equal(fake.calls("Runtime.enable").length, 1);
+	const before = b.attachTime() - 5_000;
+	const after = b.attachTime() + 5_000;
+	fake.deliver({
+		method: "Runtime.consoleAPICalled",
+		sessionId: "sess-T1",
+		params: { type: "log", timestamp: before, args: [{ value: "ancient history" }] },
+	});
+	fake.deliver({
+		method: "Log.entryAdded",
+		sessionId: "sess-T1",
+		params: { entry: { source: "network", level: "error", timestamp: before, text: "old failure" } },
+	});
+	assert.equal(got.filter((m) => m.type === "console" || m.type === "log_entry").length, 0,
+		"buffered backlog swallowed on both domains");
+	fake.deliver({
+		method: "Runtime.consoleAPICalled",
+		sessionId: "sess-T1",
+		params: { type: "warning", timestamp: after, args: [{ value: "live" }, { value: 42 }] },
+	});
+	const line = got.find((m) => m.type === "console");
+	assert.equal(line.level, "warn");
+	assert.equal(line.text, "live 42");
+});
+
+test("adapter feed: exceptions and network log entries surface with their detail", async () => {
+	const fake = makeFakeCdp();
+	const { b, got } = await attachBrowser(fake);
+	const t = b.attachTime() + 1_000;
+	fake.deliver({
+		method: "Runtime.exceptionThrown",
+		sessionId: "sess-T1",
+		params: { timestamp: t, exceptionDetails: { exception: { description: "TypeError: x is not a function" } } },
+	});
+	assert.equal(got.at(-1).type, "page_error");
+	assert.match(got.at(-1).text, /TypeError/);
+	fake.deliver({
+		method: "Log.entryAdded",
+		sessionId: "sess-T1",
+		params: { entry: { source: "network", level: "error", timestamp: t, text: "Failed to load resource: net::ERR_CONNECTION_REFUSED", url: "http://127.0.0.1:1/x" } },
+	});
+	const ne = got.at(-1);
+	assert.equal(ne.type, "log_entry");
+	assert.match(ne.text, /ERR_CONNECTION_REFUSED/, "real error text, not just a status");
+});
+
+test("adapter feed: auto-attached OOPIF sessions get their own feed enabled", async () => {
+	const fake = makeFakeCdp();
+	await attachBrowser(fake);
+	fake.deliver({
+		method: "Target.attachedToTarget",
+		params: { sessionId: "sess-IFRAME", targetInfo: { targetId: "IF1", type: "iframe" } },
+	});
+	await new Promise((r) => setTimeout(r, 10));
+	assert.ok(
+		fake.calls("Log.enable").some((m) => m.sessionId === "sess-IFRAME"),
+		"embedded frame failures must not be silent",
+	);
+});

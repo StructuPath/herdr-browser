@@ -1921,3 +1921,194 @@ test("live timer: never starts for browsers without network()", () => {
 	r.startNetworkTimer(5);
 	assert.equal(r.networkTimer, null);
 });
+
+// --- Wave 4: CDP attach mode ---
+
+const attachRenderer = (over = {}) => {
+	const r = mkRenderer({ HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222", ...over });
+	quiet(r);
+	r.redrawAll = async () => {};
+	r.fitViewport = async () => false;
+	return r;
+};
+const fakeCdpBackend = (over = {}) => {
+	const calls = [];
+	let handler = null;
+	return {
+		calls,
+		emit: (m) => handler?.(m),
+		onMessage: (fn) => {
+			handler = fn;
+		},
+		connect: async () => {
+			calls.push("connect");
+			return {
+				host: "127.0.0.1",
+				port: "9222",
+				guid: "guid-1",
+				browser: "Chrome/150",
+				url: "https://x/",
+				title: "X",
+				rediscoverable: true,
+				...(over.identity ?? {}),
+			};
+		},
+		sessionExists: async () => over.alive !== false,
+		ackFrame: async (ackId, gen) => calls.push(`ack:${ackId}:${gen}`),
+		restartScreencast: async () => calls.push("restart"),
+		click: async (x, y) => calls.push(`click:${x},${y}`),
+		close: () => calls.push("close"),
+	};
+};
+
+test("attach mode: CDP endpoint wins over agent-browser and disables owning paths", () => {
+	const r = attachRenderer();
+	assert.equal(r.mode, "attach");
+	assert.equal(r.ownershipEnabled, false);
+	assert.equal(r.backendName, "browser endpoint");
+	// The duck-type omissions are the contract: no viewport fitting, no
+	// polling failure feed, no goLive.
+	assert.equal(typeof r.browser.setViewport, "undefined");
+	assert.equal(typeof r.browser.network, "undefined");
+	assert.equal(typeof r.browser.streamEnable, "undefined");
+	const plain = mkRenderer();
+	assert.equal(plain.mode, "agent-browser");
+	assert.equal(plain.ownershipEnabled, true);
+});
+
+test("attach mode: tick connects, then only watches liveness", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	assert.equal(r.attached, true);
+	assert.equal(r.lastUrl, "https://x/");
+	r.lastLiveCheck = Date.now(); // fresh check
+	await r.tick();
+	assert.deepEqual(r.browser.calls, ["connect"], "no polling while attached");
+});
+
+test("attach mode: frames paint and ack with the integer id after the paint settles", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	let renders = 0;
+	r.renderImage = async () => {
+		renders++;
+	};
+	await r.tick();
+	r.browser.emit({
+		type: "frame",
+		data: jpeg(1280, 720).toString("base64"),
+		metadata: { deviceWidth: 1280, deviceHeight: 720 },
+		ackId: 42,
+		gen: 1,
+	});
+	await flush();
+	assert.equal(renders, 1, "frame painted");
+	assert.ok(r.browser.calls.includes("ack:42:1"), "acked after paint");
+});
+
+test("attach mode: clicks scale from frame pixels to page pixels per frame", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	// Frame is 800px wide but the page is 1600 CSS px (retina / maxWidth scale).
+	r.lastFrameMeta = { deviceWidth: 1600, deviceHeight: 900 };
+	const scaled = r.cdpPagePoint({ x: 100, y: 50 }, { w: 800, h: 450 });
+	assert.deepEqual(scaled, { x: 200, y: 100 });
+	// Metadata changing mid-session (window resized) is picked up immediately.
+	r.lastFrameMeta = { deviceWidth: 800, deviceHeight: 450 };
+	assert.deepEqual(r.cdpPagePoint({ x: 100, y: 50 }, { w: 800, h: 450 }), {
+		x: 100,
+		y: 50,
+	});
+});
+
+test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend({ alive: false });
+	await r.tick();
+	r.lastLiveCheck = 0;
+	await r.tick();
+	assert.equal(r.attached, false);
+	assert.match(r.banner, /went away — retrying/);
+
+	const raw = attachRenderer();
+	raw.browser = fakeCdpBackend({ alive: false, identity: { rediscoverable: false } });
+	await raw.tick();
+	raw.lastLiveCheck = 0;
+	await raw.tick();
+	assert.match(raw.banner, /restart the pane/);
+	assert.equal(raw.streamCooldownUntil, Number.MAX_SAFE_INTEGER, "no retry loop");
+});
+
+test("attach mode: reattach to a different browser resets state with a marker", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	r.consoleLines.push("  stale line from the old browser");
+	r.attached = false;
+	r.browser = fakeCdpBackend({ identity: { guid: "guid-2" } });
+	r.browser.onMessage((m) => r.onCdpMessage(m));
+	r.streamCooldownUntil = 0;
+	await r.tick();
+	assert.ok(
+		r.consoleLines.some((l) => /reattached to a different browser/.test(l)),
+		"discontinuity marker pushed",
+	);
+	assert.equal(r.lastHash, "", "frame state reset");
+});
+
+test("attach mode: stale frames banner once and trigger one restart", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	r.lastFrameAt = Date.now() - 30_000;
+	r.checkFrameStaleness();
+	r.checkFrameStaleness();
+	assert.match(r.banner, /frame stale/);
+	assert.equal(
+		r.browser.calls.filter((c) => c === "restart").length,
+		1,
+		"exactly one restart attempt",
+	);
+});
+
+test("attach mode: cleanup closes the socket and spawns no agent-browser", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	// Even if a navigate had wrongly flagged ownership, attach mode must not
+	// shell out to close somebody else's session.
+	r.selfCreated = true;
+	r.cleanup();
+	assert.ok(r.browser.calls.includes("close"));
+	assert.equal(r.ownershipEnabled, false);
+});
+
+test("attach mode: Node without global WebSocket banners instead of crashing", async () => {
+	const saved = global.WebSocket;
+	delete global.WebSocket;
+	try {
+		const r = attachRenderer();
+		const ok = await r.attachCdp();
+		assert.equal(ok, false);
+		assert.match(r.banner, /Node 22\+/);
+	} finally {
+		if (saved === undefined) delete global.WebSocket;
+		else global.WebSocket = saved;
+	}
+});
+
+test("attach mode: endpoint tokens never reach the banner", async () => {
+	const r = attachRenderer({
+		HERDR_BROWSER_CDP_URL: "ws://127.0.0.1:9222/devtools/browser/SECRET-TOKEN",
+	});
+	r.browser = fakeCdpBackend();
+	r.browser.connect = async () => {
+		throw new Error("refused");
+	};
+	r.browser.onMessage(() => {});
+	await r.attachCdp();
+	assert.match(r.banner, /127\.0\.0\.1:9222/);
+	assert.ok(!r.banner.includes("SECRET-TOKEN"), "capability token redacted");
+});

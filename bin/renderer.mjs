@@ -757,6 +757,33 @@ export class Renderer {
 		return value || null;
 	}
 
+	// Switch this pane to attach mode at runtime. Everything the old backend
+	// reconciled against is meaningless afterwards, so state resets and the
+	// console carries one discontinuity line.
+	async attachTo(value) {
+		const endpoint = String(value ?? "").trim();
+		if (!/^(wss?|https?):\/\//i.test(endpoint)) {
+			this.banner =
+				"not an endpoint — use http://host:port or ws://… (u navigates, a attaches)";
+			this.header();
+			return;
+		}
+		if (this.mode === "agent-browser" && this.live) this.dropLive();
+		this.stopNetworkTimer();
+		this.cdpEndpoint = endpoint;
+		this.mode = "attach";
+		this.ownershipEnabled = false;
+		this.backendName = "browser endpoint";
+		this.selfCreated = false; // never inherit ownership across a switch
+		this.browser = makeCdpBrowser(endpoint);
+		this.attached = false;
+		this.cdpGuid = null;
+		this.resetBackendState();
+		this.pushConsole([{ text: "— switched to attach mode —", type: "log" }], false);
+		this.streamCooldownUntil = 0;
+		await this.tick();
+	}
+
 	// Attach: connect, wire the event bridge, and take the R9 baseline. All
 	// failures land in a banner — a bad endpoint must never crash the pane.
 	async attachCdp() {
@@ -781,6 +808,7 @@ export class Renderer {
 			this.cdpGuid = id.guid;
 			this.cdpIdentity = id;
 			this.attached = true;
+			this.startNavigateWatch();
 			this.lastUrl = sanitizeText(id.url ?? "");
 			this.lastTitle = sanitizeText(id.title ?? "");
 			this.lastFrameAt = Date.now();
@@ -800,6 +828,38 @@ export class Renderer {
 			this.header();
 			return false;
 		}
+	}
+
+	// Cmd+click hand-off from open.sh. Watched rather than polled: the attach
+	// tick backs off, and a click that navigates 30 s later reads as broken.
+	// The tick-time read stays as the fallback for platforms where fs.watch
+	// misses events (some network filesystems).
+	startNavigateWatch() {
+		if (this.mode !== "attach" || this.navigateWatcher) return;
+		this.navigateFile = path.join(
+			this.stateDir,
+			`navigate-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`,
+		);
+		const consume = () => {
+			let url;
+			try {
+				url = fs.readFileSync(this.navigateFile, "utf8").split("\n")[0].trim();
+				fs.unlinkSync(this.navigateFile);
+			} catch {
+				return; // nothing pending
+			}
+			if (url) this.userAction(() => this.browser.open(url));
+		};
+		this.consumeNavigateFile = consume;
+		try {
+			this.navigateWatcher = fs.watch(this.stateDir, (_e, name) => {
+				if (name && name === path.basename(this.navigateFile)) consume();
+			});
+			this.navigateWatcher.unref?.();
+		} catch {
+			/* watch unsupported: the tick-time read still picks it up */
+		}
+		consume(); // a click may have landed before the pane started
 	}
 
 	resetBackendState() {
@@ -1148,6 +1208,7 @@ export class Renderer {
 				}
 			}
 			this.checkFrameStaleness();
+			this.consumeNavigateFile?.();
 			return;
 		}
 		// Stay truly passive: any get/console/screenshot call would auto-create
@@ -1379,6 +1440,12 @@ export class Renderer {
 		switch (ch) {
 			case "u":
 				this.openPrompt("URL: ", (v) => this.navigate(v));
+				break;
+			// Attach gets its own key: "localhost:9222" is already a valid
+			// navigation target, so overloading the URL prompt would force a
+			// heuristic that guesses wrong on exactly the common case.
+			case "a":
+				this.openPrompt("attach to endpoint: ", (v) => this.attachTo(v));
 				break;
 			case "i":
 				this.openPrompt("type: ", (v) => this.browser.type(v));

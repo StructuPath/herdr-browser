@@ -2133,3 +2133,56 @@ test("attach mode: network log entries dedupe on the shared window", async () =>
 	assert.equal(r.consoleLines.length, 2, "non-network sources are not deduped away");
 	assert.match(r.consoleLines[1], /^⚠ slow handler/);
 });
+
+test("attach mode: config-dir cdp-url is a valid endpoint source", () => {
+	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-cfg-cdp-"));
+	fs.writeFileSync(path.join(cfg, "cdp-url"), "http://127.0.0.1:9333\n");
+	const r = mkRenderer({ HERDR_PLUGIN_CONFIG_DIR: cfg });
+	assert.equal(r.mode, "attach");
+	assert.equal(r.cdpEndpoint, "http://127.0.0.1:9333");
+	// Env wins over the file.
+	const r2 = mkRenderer({
+		HERDR_PLUGIN_CONFIG_DIR: cfg,
+		HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9444",
+	});
+	assert.equal(r2.cdpEndpoint, "http://127.0.0.1:9444");
+});
+
+test("attach prompt refuses navigation-shaped input and keeps u for URLs", async () => {
+	const r = quiet(mkRenderer());
+	await r.attachTo("localhost:9222");
+	assert.match(r.banner, /not an endpoint/);
+	assert.equal(r.mode, "agent-browser", "bad input must not switch modes");
+});
+
+test("attach switch resets reconciliation state and drops ownership", async () => {
+	const r = quiet(mkRenderer());
+	r.selfCreated = true;
+	r.consoleState = { count: 9, tail: ["x"] };
+	r.lastHash = "deadbeef";
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(r.mode, "attach");
+	assert.equal(r.ownershipEnabled, false);
+	assert.equal(r.selfCreated, false, "ownership never survives a backend switch");
+	assert.deepEqual(r.consoleState, { count: 0, tail: [] });
+	assert.equal(r.lastHash, "");
+	assert.ok(r.consoleLines.some((l) => /switched to attach mode/.test(l)));
+});
+
+test("attach mode: a Cmd+click handoff file navigates the attached target", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.open = async (u) => r.browser.calls.push(`open:${u}`);
+	await r.tick();
+	fs.writeFileSync(
+		path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`),
+		"http://localhost:3000/dash\n",
+	);
+	r.consumeNavigateFile();
+	await flush();
+	assert.ok(
+		r.browser.calls.includes("open:http://localhost:3000/dash"),
+		"click navigates the attached target, not an agent-browser session",
+	);
+});

@@ -12,7 +12,29 @@ require_herdr
 url="${1:-${HERDR_PLUGIN_CLICKED_URL:-}}"
 session="$(session_name)"
 
-if [ -n "$url" ]; then
+# Attach mode is decided from the same static sources the renderer reads, not
+# from a runtime marker: on the first click after configuring an endpoint no
+# pane has ever run, and taking the agent-browser path there would spawn
+# exactly the invisible session attach mode promises never to create.
+cdp_endpoint=""
+if [ -n "${HERDR_BROWSER_CDP_URL:-}" ]; then
+	cdp_endpoint="$HERDR_BROWSER_CDP_URL"
+elif [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" ]; then
+	cdp_endpoint="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" | tr -d '[:space:][:cntrl:]')"
+fi
+
+if [ -n "$url" ] && [ -n "$cdp_endpoint" ]; then
+	if ! validate_url "$url"; then
+		echo "herdr-browser: refusing URL (must start with http:// or https://, no credentials): $url" >&2
+		exit 2
+	fi
+	# Attach mode: hand the URL to the pane, which navigates the attached
+	# target. The renderer watches this file, so pickup does not wait for a
+	# backed-off poll tick.
+	handoff="$(state_dir)/navigate-$(ws_id)"
+	umask 077
+	printf '%s\n' "$url" > "$handoff"
+elif [ -n "$url" ]; then
 	if ! validate_url "$url"; then
 		echo "herdr-browser: refusing URL (must start with http:// or https://, no credentials): $url" >&2
 		exit 2

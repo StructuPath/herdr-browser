@@ -237,3 +237,231 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 		},
 	};
 }
+
+// --- Renderer-facing backend adapter ---
+
+// The attach-mode counterpart of makeBrowser. It deliberately has NO
+// setViewport (the automation client owns emulation — competitors that
+// override it fight their own clients), NO network (the polling failure
+// feed is agent-browser-specific; attach mode feeds the console from CDP
+// events), and NO snapshot/streamEnable/streamStatus (frames are pushed).
+// The Renderer's existing typeof guards turn those absences into disabled
+// features instead of crashes. It never calls Target.createTarget,
+// Target.closeTarget, or Emulation.* — the pane observes, it does not own.
+export function makeCdpBrowser(endpointInput, opts = {}) {
+	const quality = opts.quality ?? 60;
+	const maxDim = opts.maxDim ?? 1280;
+	let session = null;
+	let endpoint = null;
+	let pageSessionId = null;
+	let pinnedTargetId = null;
+	let gen = 0; // screencast generation: stale acks and frames are discarded
+	let lastMeta = null; // latest frame metadata (deviceWidth/Height for input scaling)
+	let handler = null; // onMessage subscriber (the Renderer)
+	let attachTimeMs = 0;
+	const emit = (m) => {
+		try {
+			handler?.(m);
+		} catch {
+			/* the Renderer guards its own paint path */
+		}
+	};
+
+	const pageTargets = async () => {
+		const { targetInfos } = await session.send("Target.getTargets");
+		return targetInfos.filter((t) => t.type === "page");
+	};
+
+	const startScreencast = async () => {
+		const g = ++gen;
+		await session.send(
+			"Page.startScreencast",
+			{ format: "jpeg", quality, maxWidth: maxDim, maxHeight: maxDim, everyNthFrame: 1 },
+			pageSessionId,
+		);
+		return g;
+	};
+
+	const pinTarget = async (targetId) => {
+		const { sessionId } = await session.send("Target.attachToTarget", {
+			targetId,
+			flatten: true,
+		});
+		pinnedTargetId = targetId;
+		pageSessionId = sessionId;
+		await session.send("Page.enable", {}, sessionId);
+		await startScreencast();
+	};
+
+	const onCdpEvent = (m) => {
+		if (m.method === "Page.screencastFrame" && m.sessionId === pageSessionId) {
+			lastMeta = m.params.metadata ?? null;
+			emit({
+				type: "frame",
+				data: m.params.data,
+				metadata: lastMeta,
+				// Two distinct ids: params.sessionId is the INTEGER the ack must
+				// echo; m.sessionId is the flat-session routing string. Conflate
+				// them and Chrome ignores the ack — the stream freezes at quota.
+				ackId: m.params.sessionId,
+				gen,
+			});
+			return;
+		}
+		if (m.method === "Target.targetInfoChanged") {
+			const t = m.params.targetInfo;
+			if (t.targetId === pinnedTargetId)
+				emit({ type: "url", url: t.url, title: t.title });
+			return;
+		}
+		if (m.method === "Target.targetDestroyed") {
+			if (m.params.targetId !== pinnedTargetId) return;
+			pinnedTargetId = null;
+			pageSessionId = null;
+			// Re-pin only on destruction of OUR target — never follow creation.
+			pageTargets()
+				.then(async (pages) => {
+					if (!pages.length) return emit({ type: "target_gone" });
+					await pinTarget(pages[0].targetId);
+					emit({ type: "url", url: pages[0].url, title: pages[0].title });
+				})
+				.catch(() => emit({ type: "target_gone" }));
+			return;
+		}
+		if (m.method === "Inspector.targetCrashed" && m.sessionId === pageSessionId) {
+			emit({ type: "page_error", text: "page crashed — waiting for reload" });
+		}
+	};
+
+	return {
+		// Identity of what we're attached to; the Renderer compares guid across
+		// reattaches so a reused port can't silently swap browsers underneath.
+		async connect() {
+			endpoint = await discoverEndpoint(endpointInput, opts);
+			session = makeCdpSession(endpoint.wsUrl, opts);
+			await session.opened;
+			session.onEvent(onCdpEvent);
+			session.onClose(() => emit({ type: "endpoint_gone" }));
+			await session.send("Target.setDiscoverTargets", { discover: true });
+			const pages = await pageTargets();
+			if (!pages.length) throw new Error("endpoint has no page targets");
+			attachTimeMs = Date.now();
+			await pinTarget(pages[0].targetId);
+			return {
+				host: endpoint.host,
+				port: endpoint.port,
+				browser: endpoint.browser,
+				guid: endpoint.guid,
+				rediscoverable: endpoint.rediscoverable,
+				url: pages[0].url,
+				title: pages[0].title,
+			};
+		},
+		onMessage(fn) {
+			handler = fn;
+		},
+		attachTime: () => attachTimeMs,
+		frameMetadata: () => lastMeta,
+		// Ack path for the Renderer's paint-settle hook. Generation-guarded so
+		// an ack from before a restart/re-pin can never reach a new screencast.
+		async ackFrame(ackId, frameGen) {
+			if (frameGen !== gen || !pageSessionId) return;
+			try {
+				await session.send("Page.screencastFrameAck", { sessionId: ackId }, pageSessionId);
+			} catch {
+				/* stream may be mid-restart; the watchdog covers a stall */
+			}
+		},
+		async restartScreencast() {
+			try {
+				await session.send("Page.stopScreencast", {}, pageSessionId);
+			} catch {
+				/* already stopped */
+			}
+			await startScreencast();
+		},
+		async cycleTarget() {
+			const pages = await pageTargets();
+			if (pages.length < 2) return false;
+			const i = pages.findIndex((t) => t.targetId === pinnedTargetId);
+			const next = pages[(i + 1) % pages.length];
+			try {
+				await session.send("Page.stopScreencast", {}, pageSessionId);
+			} catch {
+				/* old session may be gone */
+			}
+			await pinTarget(next.targetId);
+			emit({ type: "url", url: next.url, title: next.title });
+			return true;
+		},
+		async open(u) {
+			await session.send("Page.navigate", { url: u }, pageSessionId);
+		},
+		async back() {
+			const h = await session.send("Page.getNavigationHistory", {}, pageSessionId);
+			if (h.currentIndex <= 0) return;
+			await session.send(
+				"Page.navigateToHistoryEntry",
+				{ entryId: h.entries[h.currentIndex - 1].id },
+				pageSessionId,
+			);
+		},
+		async forward() {
+			const h = await session.send("Page.getNavigationHistory", {}, pageSessionId);
+			if (h.currentIndex >= h.entries.length - 1) return;
+			await session.send(
+				"Page.navigateToHistoryEntry",
+				{ entryId: h.entries[h.currentIndex + 1].id },
+				pageSessionId,
+			);
+		},
+		async reload() {
+			await session.send("Page.reload", {}, pageSessionId);
+		},
+		// x/y arrive in page CSS pixels — the Renderer scales pane cells ->
+		// frame pixels -> CSS via the per-frame metadata before calling.
+		async click(x, y) {
+			const base = { x, y, button: "left", clickCount: 1 };
+			await session.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base }, pageSessionId);
+			await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base }, pageSessionId);
+		},
+		async scroll(dir, px) {
+			const m = lastMeta;
+			const cx = m ? Math.floor((m.deviceWidth ?? 800) / 2) : 400;
+			const cy = m ? Math.floor((m.deviceHeight ?? 600) / 2) : 300;
+			await session.send(
+				"Input.dispatchMouseEvent",
+				{ type: "mouseWheel", x: cx, y: cy, deltaX: 0, deltaY: dir === "down" ? px : -px },
+				pageSessionId,
+			);
+		},
+		async type(text) {
+			await session.send("Input.insertText", { text }, pageSessionId);
+		},
+		async screenshot(file) {
+			const { data } = await session.send(
+				"Page.captureScreenshot",
+				{ format: "png" },
+				pageSessionId,
+				15_000,
+			);
+			const fs = await import("node:fs");
+			fs.writeFileSync(file, Buffer.from(data, "base64"));
+		},
+		async sessionExists() {
+			if (!session || session.dead || !pinnedTargetId) return false;
+			return session.ping();
+		},
+		close() {
+			const s = session;
+			if (!s || s.dead) return;
+			// Attach-mode cleanup: stop OUR screencast, close OUR socket.
+			// Never a Target.closeTarget, never an agent-browser subprocess.
+			const done = pageSessionId
+				? s.send("Page.stopScreencast", {}, pageSessionId, 1_000).catch(() => {})
+				: Promise.resolve();
+			done.finally(() => s.close());
+		},
+		_session: () => session, // U4 console wiring + tests reach the raw session
+	};
+}

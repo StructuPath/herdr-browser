@@ -186,3 +186,206 @@ test("malformed frames are dropped without throwing", async () => {
 	ws.deliver({ id: ws.sent.at(-1).id, result: {} });
 	await p; // session still functional
 });
+
+// --- makeCdpBrowser adapter (scripted fake CDP endpoint, no network) ---
+
+import { makeCdpBrowser } from "../bin/cdp.mjs";
+
+const makeFakeCdp = ({ pages, results } = {}) => {
+	const state = {
+		sent: [],
+		pages: pages ?? [
+			{ targetId: "T1", type: "page", url: "https://x/", title: "X" },
+		],
+		results: results ?? {},
+		ws: null,
+	};
+	const ws = {
+		onopen: null,
+		onclose: null,
+		onerror: null,
+		onmessage: null,
+		send(s) {
+			const msg = JSON.parse(s);
+			state.sent.push(msg);
+			const custom = state.results[msg.method];
+			const result =
+				typeof custom === "function"
+					? custom(msg)
+					: custom !== undefined
+						? custom
+						: msg.method === "Target.getTargets"
+							? { targetInfos: state.pages }
+							: msg.method === "Target.attachToTarget"
+								? { sessionId: `sess-${msg.params.targetId}` }
+								: {};
+			if (result !== null)
+				queueMicrotask(() =>
+					ws.onmessage?.({ data: JSON.stringify({ id: msg.id, result }) }),
+				);
+		},
+		close() {
+			this.onclose?.();
+		},
+	};
+	state.ws = ws;
+	state.deliver = (obj) => ws.onmessage?.({ data: JSON.stringify(obj) });
+	state.calls = (method) => state.sent.filter((m) => m.method === method);
+	return state;
+};
+
+const attachBrowser = async (fake) => {
+	const b = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", {
+		wsFactory: () => {
+			queueMicrotask(() => fake.ws.onopen?.());
+			return fake.ws;
+		},
+	});
+	const got = [];
+	b.onMessage((m) => got.push(m));
+	const id = await b.connect();
+	return { b, got, id };
+};
+
+test("adapter surface: forbidden methods are absent, required ones present", async () => {
+	const fake = makeFakeCdp();
+	const { b } = await attachBrowser(fake);
+	for (const missing of ["setViewport", "network", "snapshot", "streamEnable", "streamStatus"])
+		assert.equal(b[missing], undefined, `${missing} must not exist — duck-type guards depend on it`);
+	for (const required of ["open", "back", "forward", "reload", "click", "scroll", "type", "sessionExists", "screenshot", "cycleTarget"])
+		assert.equal(typeof b[required], "function", `${required} missing — a key handler calls it unguarded`);
+});
+
+test("adapter pins the first page target and starts a jpeg screencast", async () => {
+	const fake = makeFakeCdp({
+		pages: [
+			{ targetId: "T1", type: "page", url: "https://one/", title: "One" },
+			{ targetId: "T2", type: "page", url: "https://two/", title: "Two" },
+		],
+	});
+	const { id } = await attachBrowser(fake);
+	assert.equal(id.url, "https://one/");
+	const att = fake.calls("Target.attachToTarget");
+	assert.equal(att.length, 1);
+	assert.deepEqual(att[0].params, { targetId: "T1", flatten: true });
+	const sc = fake.calls("Page.startScreencast")[0];
+	assert.equal(sc.params.format, "jpeg");
+	assert.equal(sc.sessionId, "sess-T1");
+});
+
+test("adapter never creates or closes targets across its whole lifecycle", async () => {
+	const fake = makeFakeCdp({
+		pages: [
+			{ targetId: "T1", type: "page", url: "https://one/", title: "One" },
+			{ targetId: "T2", type: "page", url: "https://two/", title: "Two" },
+		],
+	});
+	const { b } = await attachBrowser(fake);
+	await b.open("https://elsewhere/");
+	await b.reload();
+	await b.cycleTarget();
+	fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T2" } });
+	await new Promise((r) => setTimeout(r, 10));
+	b.close();
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(fake.calls("Target.createTarget").length, 0);
+	assert.equal(fake.calls("Target.closeTarget").length, 0);
+	assert.ok(!fake.sent.some((m) => m.method.startsWith("Emulation.")), "no emulation ever");
+});
+
+test("adapter frame events carry the integer ack id; stale-generation acks are dropped", async () => {
+	const fake = makeFakeCdp();
+	const { b, got } = await attachBrowser(fake);
+	fake.deliver({
+		method: "Page.screencastFrame",
+		sessionId: "sess-T1",
+		params: { data: "AAAA", sessionId: 7, metadata: { deviceWidth: 1600, deviceHeight: 900 } },
+	});
+	const frame = got.find((m) => m.type === "frame");
+	assert.equal(frame.ackId, 7, "integer ack id from params, not the routing string");
+	await b.ackFrame(frame.ackId, frame.gen);
+	const acks = fake.calls("Page.screencastFrameAck");
+	assert.equal(acks.length, 1);
+	assert.deepEqual(acks[0].params, { sessionId: 7 });
+	assert.equal(acks[0].sessionId, "sess-T1", "routed over the flat-session string");
+	await b.restartScreencast();
+	await b.ackFrame(frame.ackId, frame.gen); // old generation
+	assert.equal(fake.calls("Page.screencastFrameAck").length, 1, "stale ack dropped");
+});
+
+test("adapter emits url for the pinned target only; re-pins on destruction only", async () => {
+	const fake = makeFakeCdp({
+		pages: [
+			{ targetId: "T1", type: "page", url: "https://one/", title: "One" },
+			{ targetId: "T2", type: "page", url: "https://two/", title: "Two" },
+		],
+	});
+	const { got } = await attachBrowser(fake);
+	fake.deliver({
+		method: "Target.targetInfoChanged",
+		params: { targetInfo: { targetId: "T2", url: "https://noise/", title: "n" } },
+	});
+	fake.deliver({
+		method: "Target.targetInfoChanged",
+		params: { targetInfo: { targetId: "T1", url: "https://one/next", title: "One+" } },
+	});
+	assert.deepEqual(
+		got.filter((m) => m.type === "url").map((m) => m.url),
+		["https://one/next"],
+		"unpinned targets never move the header",
+	);
+	fake.deliver({
+		method: "Target.targetCreated",
+		params: { targetInfo: { targetId: "T9", type: "page", url: "https://pop/" } },
+	});
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(fake.calls("Target.attachToTarget").length, 1, "creation never re-pins");
+	fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T1" } });
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(fake.calls("Target.attachToTarget").length, 2, "destruction re-pins");
+});
+
+test("adapter destroyed pin with no survivors emits target_gone", async () => {
+	const fake = makeFakeCdp();
+	const { got } = await attachBrowser(fake);
+	fake.pages.length = 0;
+	fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T1" } });
+	await new Promise((r) => setTimeout(r, 10));
+	assert.ok(got.some((m) => m.type === "target_gone"));
+});
+
+test("adapter navigation: back is a no-op at history start, forward/reload work", async () => {
+	const history = {
+		currentIndex: 1,
+		entries: [{ id: 10 }, { id: 11 }, { id: 12 }],
+	};
+	const fake = makeFakeCdp({ results: { "Page.getNavigationHistory": () => history } });
+	const { b } = await attachBrowser(fake);
+	await b.back();
+	assert.deepEqual(fake.calls("Page.navigateToHistoryEntry")[0].params, { entryId: 10 });
+	await b.forward();
+	assert.deepEqual(fake.calls("Page.navigateToHistoryEntry")[1].params, { entryId: 12 });
+	history.currentIndex = 0;
+	await b.back();
+	assert.equal(fake.calls("Page.navigateToHistoryEntry").length, 2, "no-op at boundary");
+	await b.reload();
+	assert.equal(fake.calls("Page.reload").length, 1);
+});
+
+test("adapter input: click is press+release, type is insertText, scroll is mouseWheel", async () => {
+	const fake = makeFakeCdp();
+	const { b } = await attachBrowser(fake);
+	await b.click(120, 240);
+	const mouse = fake.calls("Input.dispatchMouseEvent");
+	assert.deepEqual(
+		mouse.map((m) => m.params.type),
+		["mousePressed", "mouseReleased"],
+	);
+	assert.equal(mouse[0].params.x, 120);
+	await b.type("héllo");
+	assert.equal(fake.calls("Input.insertText")[0].params.text, "héllo");
+	await b.scroll("down", 300);
+	const wheel = fake.calls("Input.dispatchMouseEvent").at(-1);
+	assert.equal(wheel.params.type, "mouseWheel");
+	assert.equal(wheel.params.deltaY, 300);
+});

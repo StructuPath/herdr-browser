@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
+import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
 
 const pExecFile = promisify(execFile);
 const ESC = "\x1b";
@@ -557,7 +558,19 @@ export class Renderer {
 			`shot-${safeWsId(env.HERDR_WORKSPACE_ID)}.png`,
 		);
 		this.bin = "agent-browser";
-		this.browser = makeBrowser(this.session, this.bin);
+		// Backend arbitration: an explicitly configured CDP endpoint is the more
+		// deliberate act than an ambient agent-browser session, so it wins — and
+		// it wins deterministically at start, never by racing discovery.
+		this.cdpEndpoint = this.resolveCdpEndpoint(env);
+		this.mode = this.cdpEndpoint ? "attach" : "agent-browser";
+		this.browser =
+			this.mode === "attach"
+				? makeCdpBrowser(this.cdpEndpoint)
+				: makeBrowser(this.session, this.bin);
+		// Attach mode observes a browser someone else owns: ownership is never
+		// claimed, so the quit path can never close a stranger's session.
+		this.ownershipEnabled = this.mode !== "attach";
+		this.backendName = this.mode === "attach" ? "browser endpoint" : "agent-browser";
 		const onPath = (cmd) =>
 			spawnSync("sh", ["-c", `command -v ${cmd}`], { timeout: 5000 }).status ===
 			0;
@@ -610,6 +623,14 @@ export class Renderer {
 		this.networkPollErrors = 0;
 		this.networkTimer = null; // live-mode cadence (see goLive/dropLive)
 		this.networkIdleTicks = 0;
+		// Attach mode (see attachCdp): endpoint identity, frame liveness, and
+		// the per-frame metadata that scales pane clicks into page pixels.
+		this.cdpGuid = null;
+		this.cdpIdentity = null;
+		this.lastFrameMeta = null;
+		this.lastFrameAt = 0;
+		this.staleHandled = false;
+		this.loopbackWarned = false;
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
 		this.lastImageDims = null;
 		this.lastViewportRequest = "";
@@ -724,6 +745,216 @@ export class Renderer {
 		} finally {
 			this.networkPollBusy = false;
 		}
+	}
+
+	// Endpoint sources, most deliberate first. Both are static (readable before
+	// the renderer starts), which is what lets scripts/open.sh reach the same
+	// verdict without a runtime marker file.
+	resolveCdpEndpoint(env) {
+		const raw = env.HERDR_BROWSER_CDP_URL || this.configValue("cdp-url");
+		if (!raw) return null;
+		const value = String(raw).trim();
+		return value || null;
+	}
+
+	// Switch this pane to attach mode at runtime. Everything the old backend
+	// reconciled against is meaningless afterwards, so state resets and the
+	// console carries one discontinuity line.
+	async attachTo(value) {
+		const endpoint = String(value ?? "").trim();
+		if (!/^(wss?|https?):\/\//i.test(endpoint)) {
+			this.banner =
+				"not an endpoint — use http://host:port or ws://… (u navigates, a attaches)";
+			this.header();
+			return;
+		}
+		if (this.mode === "agent-browser" && this.live) this.dropLive();
+		this.stopNetworkTimer();
+		this.cdpEndpoint = endpoint;
+		this.mode = "attach";
+		this.ownershipEnabled = false;
+		this.backendName = "browser endpoint";
+		this.selfCreated = false; // never inherit ownership across a switch
+		this.browser = makeCdpBrowser(endpoint);
+		this.attached = false;
+		this.cdpGuid = null;
+		this.resetBackendState();
+		this.pushConsole([{ text: "— switched to attach mode —", type: "log" }], false);
+		this.streamCooldownUntil = 0;
+		await this.tick();
+	}
+
+	// Attach: connect, wire the event bridge, and take the R9 baseline. All
+	// failures land in a banner — a bad endpoint must never crash the pane.
+	async attachCdp() {
+		if (!cdpSupported()) {
+			this.banner =
+				"attach mode needs Node 22+ (global WebSocket) — pane is idle";
+			this.header();
+			return false;
+		}
+		try {
+			this.browser.onMessage((m) => this.onCdpMessage(m));
+			const id = await this.browser.connect();
+			// A reused port can front a different browser than last time; treat
+			// that as a discontinuity rather than silently continuing the feed.
+			if (this.cdpGuid && id.guid && id.guid !== this.cdpGuid) {
+				this.resetBackendState();
+				this.pushConsole(
+					[{ text: "— reattached to a different browser —", type: "log" }],
+					false,
+				);
+			}
+			this.cdpGuid = id.guid;
+			this.cdpIdentity = id;
+			this.attached = true;
+			this.startNavigateWatch();
+			this.lastUrl = sanitizeText(id.url ?? "");
+			this.lastTitle = sanitizeText(id.title ?? "");
+			this.lastFrameAt = Date.now();
+			// Endpoint URLs carry capability tokens in their path: host:port only.
+			this.banner = id.rediscoverable
+				? ""
+				: `attached to ${redactWsUrl(this.cdpEndpoint)} (raw endpoint — no reconnect)`;
+			if (!this.loopbackWarned && !/^(127\.|\[?::1\]?$|localhost)/.test(String(id.host))) {
+				this.loopbackWarned = true;
+				this.banner = `attached to ${id.host}:${id.port} — remote endpoint, traffic is unencrypted`;
+			}
+			this.header();
+			return true;
+		} catch (err) {
+			this.attached = false;
+			this.banner = `cannot attach to ${redactWsUrl(this.cdpEndpoint)}: ${sanitizeText(err?.message ?? "unknown error")}`;
+			this.header();
+			return false;
+		}
+	}
+
+	// Cmd+click hand-off from open.sh. Watched rather than polled: the attach
+	// tick backs off, and a click that navigates 30 s later reads as broken.
+	// The tick-time read stays as the fallback for platforms where fs.watch
+	// misses events (some network filesystems).
+	startNavigateWatch() {
+		if (this.mode !== "attach" || this.navigateWatcher) return;
+		this.navigateFile = path.join(
+			this.stateDir,
+			`navigate-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`,
+		);
+		const consume = () => {
+			let url;
+			try {
+				url = fs.readFileSync(this.navigateFile, "utf8").split("\n")[0].trim();
+				fs.unlinkSync(this.navigateFile);
+			} catch {
+				return; // nothing pending
+			}
+			if (url) this.userAction(() => this.browser.open(url));
+		};
+		this.consumeNavigateFile = consume;
+		try {
+			this.navigateWatcher = fs.watch(this.stateDir, (_e, name) => {
+				if (name && name === path.basename(this.navigateFile)) consume();
+			});
+			this.navigateWatcher.unref?.();
+		} catch {
+			/* watch unsupported: the tick-time read still picks it up */
+		}
+		consume(); // a click may have landed before the pane started
+	}
+
+	resetBackendState() {
+		this.consoleState = { count: 0, tail: [] };
+		this.networkState = newNetworkState();
+		this.lastHash = "";
+		this.shotFormat = "png";
+	}
+
+	// Bridge: adapter messages arrive already shaped like stream messages, so
+	// frames/url/page_error reuse onStreamMessage. Frames additionally carry
+	// the integer ack id, acked once the paint enqueue settles.
+	onCdpMessage(m) {
+		if (m.type === "frame") {
+			this.lastFrameAt = Date.now();
+			this.lastFrameMeta = m.metadata ?? null;
+			this.onStreamMessage({ type: "frame", data: m.data });
+			// Ack after the paint queue drains. A skipped paint (blocked stdout,
+			// chafa cooldown) still acks — a frozen stream is worse than a
+			// dropped frame, and quality/max-dimension knobs bound the cost.
+			this.enqueue(() => {}).then(() => this.browser.ackFrame?.(m.ackId, m.gen));
+			return;
+		}
+		if (m.type === "url") {
+			this.lastUrl = sanitizeText(m.url ?? "");
+			if (m.title !== undefined) this.lastTitle = sanitizeText(m.title);
+			this.enqueue(() => {
+				this.header();
+			});
+			return;
+		}
+		if (m.type === "page_error" || m.type === "console") {
+			this.onStreamMessage(m);
+			return;
+		}
+		if (m.type === "log_entry") {
+			this.pushLogEntry(m);
+			return;
+		}
+		if (m.type === "target_gone") {
+			this.banner = "the observed page closed — waiting";
+			this.header();
+			return;
+		}
+		if (m.type === "endpoint_gone") {
+			this.attached = false;
+			this.banner = "browser endpoint closed — waiting";
+			this.header();
+		}
+	}
+
+	// Log-domain entries. Network-source entries are the attach-mode
+	// equivalent of the polling failure feed and share its dedupe window, so a
+	// retry loop paints once in either mode; other sources (violation,
+	// security, deprecation) paint at their own level.
+	pushLogEntry(entry) {
+		const text = entry.url
+			? `${entry.text} ${truncate(sanitizeText(entry.url), 200)}`
+			: entry.text;
+		if (entry.source === "network") {
+			const key = `log ${entry.url} ${entry.text}`;
+			const now = Date.now();
+			const last = this.networkState.recent.get(key);
+			this.networkState.recent.set(key, now);
+			if (last !== undefined && now - last <= 60_000) return;
+		}
+		const hadConsole = this.consoleLines.length > 0;
+		this.pushConsole(
+			[{ text, type: entry.level === "warning" ? "warn" : entry.level }],
+			false,
+		);
+		this.queueConsolePaint(hadConsole);
+	}
+
+	// Pane cell -> frame pixel -> page CSS pixel. The frame is scaled by both
+	// maxWidth and the observed browser's DPR, and either can change under us
+	// (a human resizes the window mid-session), so the scale comes from the
+	// latest frame's metadata every time — never cached.
+	cdpPagePoint(framePt, frameDims) {
+		const meta = this.lastFrameMeta;
+		if (!meta || !frameDims?.w) return framePt;
+		const sx = (meta.deviceWidth ?? frameDims.w) / frameDims.w;
+		const sy = (meta.deviceHeight ?? frameDims.h) / frameDims.h;
+		return { x: Math.round(framePt.x * sx), y: Math.round(framePt.y * sy) };
+	}
+
+	// Hidden tabs and DevTools screencast contention both present as a frozen
+	// frame with no error. One restart attempt, last frame stays on screen.
+	checkFrameStaleness(now = Date.now()) {
+		if (this.mode !== "attach" || !this.attached || !this.lastFrameAt) return;
+		if (now - this.lastFrameAt < 10_000 || this.staleHandled) return;
+		this.staleHandled = true;
+		this.banner = "frame stale (tab hidden or contended)";
+		this.header();
+		this.browser.restartScreencast?.().catch(() => {});
 	}
 
 	// Live mode has no snapshot tick and the push stream carries no network
@@ -951,6 +1182,35 @@ export class Renderer {
 	}
 
 	async tick() {
+		// Attach mode is event-driven: the tick only (re)connects, watches
+		// liveness, and notices a stalled screencast. Frames and console
+		// entries arrive over the CDP session, not from polling.
+		if (this.mode === "attach") {
+			if (!this.attached) {
+				if (Date.now() < this.streamCooldownUntil) return;
+				this.streamCooldownUntil = Date.now() + 5_000;
+				await this.attachCdp();
+				return;
+			}
+			if (Date.now() - this.lastLiveCheck > 15_000) {
+				this.lastLiveCheck = Date.now();
+				if (!(await this.browser.sessionExists())) {
+					this.attached = false;
+					// Re-discovery, not a re-dial: the browser may have restarted
+					// and minted a fresh token, and a raw ws endpoint has none.
+					this.banner = this.cdpIdentity?.rediscoverable
+						? "browser endpoint went away — retrying"
+						: `browser endpoint went away — restart the pane to reattach (${redactWsUrl(this.cdpEndpoint)})`;
+					if (!this.cdpIdentity?.rediscoverable)
+						this.streamCooldownUntil = Number.MAX_SAFE_INTEGER;
+					this.header();
+					return;
+				}
+			}
+			this.checkFrameStaleness();
+			this.consumeNavigateFile?.();
+			return;
+		}
 		// Stay truly passive: any get/console/screenshot call would auto-create
 		// the session (and a headless Chrome) on the daemon. Until the session
 		// exists — created by an agent, a link click, or a URL-bearing open —
@@ -1180,6 +1440,12 @@ export class Renderer {
 		switch (ch) {
 			case "u":
 				this.openPrompt("URL: ", (v) => this.navigate(v));
+				break;
+			// Attach gets its own key: "localhost:9222" is already a valid
+			// navigation target, so overloading the URL prompt would force a
+			// heuristic that guesses wrong on exactly the common case.
+			case "a":
+				this.openPrompt("attach to endpoint: ", (v) => this.attachTo(v));
 				break;
 			case "i":
 				this.openPrompt("type: ", (v) => this.browser.type(v));
@@ -1430,7 +1696,7 @@ export class Renderer {
 			} catch {
 				// Poll mode reports daemon failures via the tick failure counter;
 				// live mode's tick never runs that path, so say it directly.
-				this.banner = "command failed — agent-browser not responding";
+				this.banner = `command failed — ${this.backendName} not responding`;
 				this.header();
 			}
 		}).then(() => this.enqueue(() => this.tick()));
@@ -1491,7 +1757,7 @@ export class Renderer {
 			this.networkBaselinePending = false; // nothing to swallow: empty log
 		}
 		await this.browser.open(u);
-		if (!existed) this.selfCreated = true;
+		if (!existed && this.ownershipEnabled) this.selfCreated = true;
 		this.attached = true; // the user is explicitly starting/driving the session
 	}
 
@@ -1514,7 +1780,10 @@ export class Renderer {
 			pngH: dims.h,
 		});
 		if (!pt) return;
-		await this.browser.click(pt.x, pt.y);
+		// Attach-mode frames are scaled by maxWidth and the observed browser's
+		// DPR, so frame pixels are not page pixels — rescale before dispatch.
+		const target = this.mode === "attach" ? this.cdpPagePoint(pt, dims) : pt;
+		await this.browser.click(target.x, target.y);
 	}
 
 	async redrawAll() {
@@ -1535,7 +1804,16 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
-		if (this.selfCreated) {
+		if (this.mode === "attach") {
+			// Stop our screencast and drop the socket. Never a target close,
+			// never an agent-browser subprocess — we did not create any of this.
+			try {
+				this.browser.close?.();
+			} catch {
+				/* endpoint already gone */
+			}
+		}
+		if (this.selfCreated && this.ownershipEnabled) {
 			// The session exists only because the user navigated in this pane;
 			// quitting the pane ends it (and its daemon) instead of leaking it.
 			// Short timeout: a wedged daemon must not freeze the quit path — its

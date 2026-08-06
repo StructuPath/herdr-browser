@@ -17,6 +17,8 @@ Conductor).
 ## Highlights
 
 - **Shared agent sessions** — one isolated browser session per Herdr workspace.
+- **Attach to any CDP browser** — observe a Playwright, Puppeteer, or Browser Use
+  run (or any Chrome started with `--remote-debugging-port`) without owning it.
 - **Live push streaming** — frames, URL/title changes, console messages, and
   page errors arrive over WebSocket, with transparent polling fallback.
 - **Failed network requests** — 4xx/5xx and no-response xhr/fetch/document
@@ -37,7 +39,7 @@ Conductor).
 | Component | Requirement | Notes |
 | --- | --- | --- |
 | Herdr | `>= 0.7.0` | Tested with Herdr 0.7.4 |
-| Node.js | `>= 20` | Node 22+ enables live WebSocket streaming |
+| Node.js | `>= 20` | Node 22+ enables live WebSocket streaming and CDP attach mode |
 | agent-browser | Required | Tested with agent-browser 0.33.x; failed-request reporting needs the `network requests` command |
 | chafa | Optional | ANSI rendering and streamed JPEGs in Kitty mode |
 | carbonyl | Optional | Only required for the separate interactive Browse action |
@@ -137,6 +139,7 @@ Use these controls to drive the shared session directly:
 | Input | Action |
 | --- | --- |
 | `u` | Open the address prompt; `https://` is assumed when omitted |
+| `a` | Attach to a CDP endpoint (`http://host:port` or `ws://…`) |
 | Click the screenshot | Send real Chrome mouse move/down/up events at that page coordinate |
 | `i` | Type into the currently focused page element |
 | `b` / `f` | Navigate backward / forward |
@@ -214,6 +217,57 @@ from before the pane attached are intentionally not replayed, repeated
 identical failures are collapsed within a 60-second window, and on very long
 sessions the feed turns itself off with a one-time note once the daemon's
 request log outgrows the pane's read buffer.
+
+## Attach to any CDP browser
+
+The pane can observe a browser it does not own. Point it at a Chrome DevTools
+Protocol endpoint and it renders that browser's page, streams its console and
+network failures, and forwards your clicks and keystrokes — while your
+automation client keeps driving.
+
+```sh
+# the browser your automation already runs, with a debugging port
+chrome --remote-debugging-port=9222
+
+# tell the pane where to look (either source works)
+export HERDR_BROWSER_CDP_URL=http://127.0.0.1:9222
+printf 'http://127.0.0.1:9222\n' > "$(herdr plugin config-dir structupath.browser)/cdp-url"
+```
+
+Press `a` in the pane to attach at runtime. `u` still means "navigate" — the
+keys are separate because `localhost:9222` is a valid destination as well as a
+valid endpoint.
+
+Launcher recipes: Playwright `chromium.launch({args:['--remote-debugging-port=9222']})`,
+Puppeteer the same `args`, Browser Use its `chrome_remote_debugging_port` option.
+A default launch often uses a pipe transport with no TCP port — the port has to
+be requested explicitly.
+
+### What attach mode guarantees
+
+- **It never owns anything.** No target is created or closed, no viewport or
+  device emulation is set (your automation client owns those — a pane that
+  overrode them would fight the client it is meant to observe), and quitting
+  the pane closes only its own screencast and socket.
+- **It opens no port.** The pane dials out to the endpoint you name. There is
+  no gateway, proxy, or listening socket to secure.
+- **Endpoint tokens stay secret.** A DevTools URL's path is a capability token;
+  the pane displays and logs `host:port` only.
+- **One honest footprint:** the console feed calls `Runtime.enable`, which is
+  observable by the page and is avoided by stealth automation stacks. Set
+  `consoleTier` to `log-only` to skip it — network failures and violations
+  still surface through the Log domain.
+
+### What it shows
+
+Failed requests appear with Chrome's own error text — `net::ERR_CONNECTION_REFUSED`
+rather than a bare status — alongside console output, uncaught exceptions, and
+failures from embedded iframes and workers. One blind spot by design: a request
+that hangs without ever failing produces no CDP event, so attach mode cannot
+report it the way the agent-browser polling feed's timeout heuristic does.
+
+Attach mode needs Node 22 or newer (for the built-in WebSocket client); the pane
+says so plainly on older Node and keeps working in agent-browser mode.
 
 ## Session model
 

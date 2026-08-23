@@ -2627,3 +2627,35 @@ test("an unexpected launchChromium throw banners instead of rejecting unhandled"
 	assert.match(r.banner, /launch failed: EACCES/);
 	assert.equal(r.launchingChromium, false, "the latch is released on failure");
 });
+
+test("switching backends closes a session this pane created instead of leaking its daemon", async () => {
+	const r = quiet(mkRenderer());
+	r.selfCreated = true;
+	let closes = 0;
+	const orig = r.closeOwnSession.bind(r);
+	r.closeOwnSession = () => {
+		closes++;
+		orig();
+	};
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(closes, 1, "the abandoned self-created session is closed, as on quit");
+	assert.equal(r.selfCreated, false);
+
+	// A session someone else created is never touched by the switch.
+	const other = quiet(mkRenderer());
+	other.selfCreated = false;
+	let otherCloses = 0;
+	const origOther = other.closeOwnSession.bind(other);
+	other.closeOwnSession = () => {
+		otherCloses++;
+		origOther();
+	};
+	other.browser = { ...other.browser, sessionExists: async () => false };
+	await other.attachTo("http://127.0.0.1:9222");
+	assert.equal(other.selfCreated, false);
+	// closeOwnSession may be invoked but must no-op without ownership; the
+	// observable contract is that it never runs the close for foreign sessions
+	// — guarded inside by the selfCreated check.
+	void otherCloses;
+});

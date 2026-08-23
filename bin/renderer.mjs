@@ -846,9 +846,12 @@ export class Renderer {
 		this.stopNetworkTimer();
 		this.cdpEndpoint = endpoint;
 		this.backend = "attach";
+		// A session this pane created is closed on abandonment exactly as on
+		// quit; ownership never crosses the switch either way.
+		this.closeOwnSession();
 		this.ownershipEnabled = false;
 		this.backendName = "browser endpoint";
-		this.selfCreated = false; // never inherit ownership across a switch
+		this.selfCreated = false;
 		this.browser = makeCdpBrowser(endpoint);
 		this.attached = false;
 		// Static sources cannot see a runtime switch; the marker lets open.sh
@@ -1752,6 +1755,24 @@ export class Renderer {
 		this.header();
 	}
 
+	// A session that exists only because the user navigated in this pane is
+	// closed (daemon included) when the pane is done with it — on quit and
+	// on switching backends alike — instead of idling as a leaked daemon
+	// until the 30-minute reaper. Sessions others created are never touched.
+	// Short timeout: a wedged daemon must not freeze the caller — its own
+	// idle reaper collects the session anyway.
+	closeOwnSession() {
+		if (!this.selfCreated || !this.ownershipEnabled) return;
+		try {
+			spawnSync(this.bin, ["--session", this.session, "close"], {
+				timeout: 2_000,
+			});
+		} catch {
+			/* already gone */
+		}
+		this.selfCreated = false;
+	}
+
 	// Observe-only is a pane-side latch, deliberately not a backend call:
 	// nothing about the observed browser changes, input simply stops here.
 	toggleObserveOnly() {
@@ -2205,19 +2226,7 @@ export class Renderer {
 				/* endpoint already gone */
 			}
 		}
-		if (this.selfCreated && this.ownershipEnabled) {
-			// The session exists only because the user navigated in this pane;
-			// quitting the pane ends it (and its daemon) instead of leaking it.
-			// Short timeout: a wedged daemon must not freeze the quit path — its
-			// own idle reaper collects the session anyway.
-			try {
-				spawnSync(this.bin, ["--session", this.session, "close"], {
-					timeout: 2_000,
-				});
-			} catch {
-				/* already gone */
-			}
-		}
+		this.closeOwnSession();
 		for (const f of [
 			this.shot,
 			this.shot + ".tmp",

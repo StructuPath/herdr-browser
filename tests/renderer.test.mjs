@@ -72,6 +72,9 @@ const quiet = (r) => {
 const flush = async () => {
 	for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
 };
+// attachCdp (and launchChromium) refuse on Node < 22 before touching the
+// backend, so attach-behavior tests only make sense where attach is possible.
+const canCdp = typeof WebSocket === "function";
 
 test("reconcile: first poll returns everything", () => {
 	const r = reconcileConsole({ count: 0, tail: [] }, e(["a", "b"]));
@@ -1987,7 +1990,7 @@ test("attach mode: CDP endpoint wins over agent-browser and disables owning path
 	assert.equal(plain.ownershipEnabled, true);
 });
 
-test("attach mode: tick connects, then only watches liveness", async () => {
+test("attach mode: tick connects, then only watches liveness", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	await r.tick();
@@ -1998,7 +2001,7 @@ test("attach mode: tick connects, then only watches liveness", async () => {
 	assert.deepEqual(r.browser.calls, ["connect"], "no polling while attached");
 });
 
-test("attach mode: frames paint and ack with the integer id after the paint settles", async () => {
+test("attach mode: frames paint and ack with the integer id after the paint settles", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	let renders = 0;
@@ -2034,7 +2037,7 @@ test("attach mode: clicks scale from frame pixels to page pixels per frame", asy
 	});
 });
 
-test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", async () => {
+test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend({ alive: false });
 	await r.tick();
@@ -2052,7 +2055,7 @@ test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", async
 	assert.equal(raw.streamCooldownUntil, Number.MAX_SAFE_INTEGER, "no retry loop");
 });
 
-test("attach mode: reattach to a different browser resets state with a marker", async () => {
+test("attach mode: reattach to a different browser resets state with a marker", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	await r.tick();
@@ -2069,7 +2072,7 @@ test("attach mode: reattach to a different browser resets state with a marker", 
 	assert.equal(r.lastHash, "", "frame state reset");
 });
 
-test("attach mode: stale frames banner once and trigger one restart", async () => {
+test("attach mode: stale frames banner once and trigger one restart", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	await r.tick();
@@ -2110,7 +2113,7 @@ test("attach mode: Node without global WebSocket banners instead of crashing", a
 	}
 });
 
-test("attach mode: endpoint tokens never reach the banner", async () => {
+test("attach mode: endpoint tokens never reach the banner", { skip: !canCdp }, async () => {
 	const r = attachRenderer({
 		HERDR_BROWSER_CDP_URL: "ws://127.0.0.1:9222/devtools/browser/SECRET-TOKEN",
 	});
@@ -2181,7 +2184,7 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	assert.ok(r.consoleLines.some((l) => /switched to attach mode/.test(l)));
 });
 
-test("attach mode: a Cmd+click handoff file navigates the attached target", async () => {
+test("attach mode: a Cmd+click handoff file navigates the attached target", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	r.browser.open = async (u) => r.browser.calls.push(`open:${u}`);
@@ -2200,7 +2203,7 @@ test("attach mode: a Cmd+click handoff file navigates the attached target", asyn
 
 // --- Wave 5: backend/render-mode split, observe-only, target cycling ---
 
-test("backend split: render-mode pick does not erase a configured attach backend", async () => {
+test("backend split: render-mode pick does not erase a configured attach backend", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	// run() assigns the render mode after the kitty probe; the attach decision
@@ -2242,7 +2245,7 @@ test("navigate: baseline stays pending when the busy guard skips the read", asyn
 	);
 });
 
-test("t cycles the pinned page target in attach mode only", async () => {
+test("t cycles the pinned page target in attach mode only", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	let cycles = 0;
@@ -2264,7 +2267,7 @@ test("t cycles the pinned page target in attach mode only", async () => {
 	assert.equal(plainCycles, 0, "agent-browser backend has no target cycling");
 });
 
-test("t with a single page target reports instead of failing silently", async () => {
+test("t with a single page target reports instead of failing silently", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	r.browser.cycleTarget = async () => false;
@@ -2274,7 +2277,7 @@ test("t with a single page target reports instead of failing silently", async ()
 	assert.equal(r.banner, "no other page targets");
 });
 
-test("observe-only: o toggles, page-affecting keys and clicks are dropped", async () => {
+test("observe-only: o toggles, page-affecting keys and clicks are dropped", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	r.browser.reload = async () => r.browser.calls.push("reload");
@@ -2305,7 +2308,7 @@ test("observe-only: o toggles, page-affecting keys and clicks are dropped", asyn
 	assert.ok(r.browser.calls.includes("reload"), "input works again after re-enable");
 });
 
-test("observe-only: u prompt is blocked; a Cmd+click handoff is consumed, not forwarded", async () => {
+test("observe-only: u prompt is blocked; a Cmd+click handoff is consumed, not forwarded", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	r.browser.open = async (u) => r.browser.calls.push(`open:${u}`);
@@ -2325,7 +2328,7 @@ test("observe-only: u prompt is blocked; a Cmd+click handoff is consumed, not fo
 	);
 });
 
-test("observe-only: t (view-only) and q remain available; header shows the state", async () => {
+test("observe-only: t (view-only) and q remain available; header shows the state", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	let cycles = 0;
@@ -2370,10 +2373,6 @@ exec sleep 30
 	);
 	return bin;
 };
-
-// launchChromium refuses on Node < 22 before doing anything else, so the
-// behavioral tests below only make sense where attach itself is possible.
-const canCdp = typeof WebSocket === "function";
 
 test("launch mode: refuses on Node without a WebSocket client", { skip: canCdp }, async () => {
 	const r = quiet(mkRenderer());

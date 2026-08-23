@@ -18,8 +18,16 @@ session="$(session_name)"
 # never to create. In both pane-owned modes agent-browser itself is not
 # required — the requirement lives on the branch that actually invokes it.
 pane_owns_navigation=0
-if cdp_endpoint_configured >/dev/null || launch_configured; then
+if cdp_endpoint_configured || launch_configured; then
 	pane_owns_navigation=1
+fi
+# Runtime switches (the a/l keys) are invisible to static sources; the pane
+# leaves a marker while attached. Only a live pane's marker counts.
+if [ "$pane_owns_navigation" -eq 0 ] && [ -f "$(backend_marker_file)" ]; then
+	marker_pane="$(cat "$(pane_id_file)" 2>/dev/null || true)"
+	if pane_alive "$marker_pane"; then
+		pane_owns_navigation=1
+	fi
 fi
 
 # A workspace configured observe-only exists to watch a run untouched; a

@@ -688,6 +688,9 @@ export class Renderer {
 		this.launchedChild = null;
 		this.launchedEndpoint = null;
 		this.launchingChromium = false;
+		// A click that arrived while the launch was still coming up parks its
+		// URL here and is delivered on attach (see startNavigateWatch/attachCdp).
+		this.pendingNavigateUrl = null;
 		// A launch failure explains itself for this long before the generic
 		// waiting-for-session banner may paint over it (see tick).
 		this.bannerHoldUntil = 0;
@@ -848,6 +851,17 @@ export class Renderer {
 		this.selfCreated = false; // never inherit ownership across a switch
 		this.browser = makeCdpBrowser(endpoint);
 		this.attached = false;
+		// Static sources cannot see a runtime switch; the marker lets open.sh
+		// route clicks to the handoff file while this pane is alive.
+		try {
+			fs.writeFileSync(
+				path.join(this.stateDir, `backend-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`),
+				"attach\n",
+				{ mode: 0o600 },
+			);
+		} catch {
+			/* marker is best-effort; static workspaces never need it */
+		}
 		this.cdpGuid = null;
 		this.resetBackendState();
 		this.pushConsole(
@@ -1031,6 +1045,13 @@ export class Renderer {
 			this.cdpIdentity = id;
 			this.attached = true;
 			this.startNavigateWatch();
+			// A click while the launch was still coming up parked its URL here;
+			// deliver it now that there is a browser, unless it has gone stale.
+			const pending = this.pendingNavigateUrl;
+			this.pendingNavigateUrl = null;
+			if (pending && Date.now() - pending.at < 120_000) {
+				this.userAction(() => this.browser.open(pending.url));
+			}
 			this.lastUrl = sanitizeText(id.url ?? "");
 			this.lastTitle = sanitizeText(id.title ?? "");
 			this.lastFrameAt = Date.now();
@@ -1057,24 +1078,42 @@ export class Renderer {
 	// The tick-time read stays as the fallback for platforms where fs.watch
 	// misses events (some network filesystems).
 	startNavigateWatch() {
-		if (this.backend !== "attach" || this.navigateWatcher) return;
+		if (
+			(this.backend !== "attach" && !this.launchConfigured) ||
+			this.navigateWatcher
+		)
+			return;
 		this.navigateFile = path.join(
 			this.stateDir,
 			`navigate-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`,
 		);
 		const consume = () => {
 			let url;
+			let age = 0;
 			try {
+				age = Date.now() - fs.statSync(this.navigateFile).mtimeMs;
 				url = fs.readFileSync(this.navigateFile, "utf8").split("\n")[0].trim();
 				fs.unlinkSync(this.navigateFile);
 			} catch {
 				return; // nothing pending
 			}
 			if (!url) return;
+			// A handoff can predate this pane (written before it started, or
+			// while its launch was broken); navigating to an hours-old click
+			// out of nowhere is worse than dropping it.
+			if (age > 300_000) return;
 			// A Cmd+click handoff is page-affecting input like any other; the
 			// URL is consumed (file already unlinked) but not forwarded.
 			if (this.observeOnly) {
 				this.noteObserveBlocked();
+				return;
+			}
+			// Launch workspace with no browser up: the click is an explicit
+			// ask — (re)launch and navigate once attached.
+			if (!this.attached && this.launchConfigured) {
+				this.pendingNavigateUrl = { url, at: Date.now() };
+				this.launchAttempted = true;
+				this.launchChromium();
 				return;
 			}
 			this.userAction(() => this.browser.open(url));
@@ -1461,6 +1500,7 @@ export class Renderer {
 			// on failure the banner stands and the keys are back in charge.
 			if (this.launchConfigured && !this.launchAttempted) {
 				this.launchAttempted = true;
+				this.startNavigateWatch(); // clicks must work even mid-launch
 				this.launchChromium();
 				return;
 			}
@@ -1473,9 +1513,13 @@ export class Renderer {
 				if (Date.now() < this.bannerHoldUntil) return;
 				// A missing binary is not 'session not started yet' — the waiting
 				// advice below can never fix it, so say what's actually wrong.
-				this.banner = this.agentBrowser
-					? `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`
-					: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
+				// In a launch workspace the accurate advice is to retry the
+				// launch — a click also retries it (see startNavigateWatch).
+				this.banner = this.launchConfigured
+					? "Chromium launch failed — press l or Cmd+click a localhost link to retry"
+					: this.agentBrowser
+						? `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`
+						: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
 				this.header();
 				return;
 			}
@@ -2121,6 +2165,14 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
+		// The runtime-backend marker routes clicks only while this pane lives.
+		try {
+			fs.unlinkSync(
+				path.join(this.stateDir, `backend-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`),
+			);
+		} catch {
+			/* never written */
+		}
 		if (this.launchedChild) {
 			// The pane spawned this browser; quitting must not leak it. SIGTERM
 			// lets Chrome flush its profile — its own exit handles the rest.

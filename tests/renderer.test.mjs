@@ -2557,3 +2557,58 @@ test("a crash before the queued attach still latches and never dials the corpse"
 	for (const fn of deferred) await fn();
 	assert.equal(attachCalls, 0, "the queued attach must notice the corpse");
 });
+
+// --- Round-2 review fixes: unattached handoff paths ---
+
+test("a click in a launch workspace with no browser up triggers the launch and navigates on attach", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	let launches = 0;
+	r.launchChromium = async () => launches++;
+	r.startNavigateWatch();
+	fs.writeFileSync(
+		path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`),
+		"http://localhost:3000/app\n",
+	);
+	r.consumeNavigateFile();
+	assert.equal(launches, 1, "the click retries the launch");
+	assert.equal(r.pendingNavigateUrl?.url, "http://localhost:3000/app");
+
+	// On attach, the parked URL is delivered.
+	const opened = [];
+	r.browser = fakeCdpBackend();
+	r.browser.open = async (u) => opened.push(u);
+	r.backend = "attach";
+	await r.attachCdp();
+	await flush();
+	assert.deepEqual(opened, ["http://localhost:3000/app"]);
+	assert.equal(r.pendingNavigateUrl, null);
+});
+
+test("a stale handoff file is dropped, not replayed", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	r.attached = true;
+	const opened = [];
+	r.browser = { ...r.browser, open: async (u) => opened.push(u) };
+	r.startNavigateWatch();
+	const f = path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`);
+	fs.writeFileSync(f, "http://localhost:3000/old\n");
+	const old = new Date(Date.now() - 3_600_000);
+	fs.utimesSync(f, old, old);
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, [], "an hour-old click must not navigate out of nowhere");
+	assert.ok(!fs.existsSync(f), "the stale file is still consumed");
+});
+
+test("runtime attach writes the backend marker; cleanup removes it", async () => {
+	const r = quiet(mkRenderer());
+	const marker = path.join(
+		r.stateDir,
+		`backend-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`,
+	);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(fs.readFileSync(marker, "utf8").trim(), "attach");
+	r.cleanup();
+	assert.ok(!fs.existsSync(marker));
+});

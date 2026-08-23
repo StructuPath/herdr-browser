@@ -98,16 +98,24 @@ session_name() {
 # a runtime marker. Must stay in lockstep with resolveCdpEndpoint() and the
 # launch/observe knobs in bin/renderer.mjs.
 cdp_endpoint_configured() {
+	# Silent predicate. Whitespace-only values are treated as unset, and a
+	# set-but-blank env var does NOT fall through to the config file — both
+	# exactly as resolveCdpEndpoint() decides.
+	local v=""
 	if [ -n "${HERDR_BROWSER_CDP_URL:-}" ]; then
-		printf '%s\n' "$HERDR_BROWSER_CDP_URL"
-		return 0
-	fi
-	if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" ]; then
-		local v
+		v="$(printf '%s' "$HERDR_BROWSER_CDP_URL" | tr -d '[:space:][:cntrl:]')"
+	elif [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" ]; then
 		v="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" | tr -d '[:space:][:cntrl:]')"
-		[ -n "$v" ] && printf '%s\n' "$v" && return 0
 	fi
-	return 1
+	[ -n "$v" ]
+}
+
+# A pane that switched to attach/launch mode at runtime (the a or l key)
+# leaves this marker; static sources cannot see that switch. Trust it only
+# alongside a live pane — a crashed pane's stale marker must not swallow
+# clicks into a handoff file nobody consumes.
+backend_marker_file() {
+	printf '%s/backend-%s\n' "$(state_dir)" "$(ws_id)"
 }
 
 # Boolean knob files/envs: same accepted spellings as truthyConfig() in the

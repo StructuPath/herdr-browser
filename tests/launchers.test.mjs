@@ -651,3 +651,42 @@ test("open in an observe-only workspace refuses navigation but still opens the p
 	assert.ok(!fs.existsSync(path.join(stateDir, "navigate-w9")));
 	assert.match(log(), /plugin pane open/);
 });
+
+test("a live runtime-attach pane's marker routes clicks to the handoff file", () => {
+	fs.writeFileSync(path.join(stateDir, "pane-id-w9"), "w9:p7\n");
+	fs.writeFileSync(path.join(stateDir, "backend-w9"), "attach\n");
+	const r = runScript(
+		"open.sh",
+		["http://localhost:5000/x"],
+		freshEnv({ STUB_PANE_ALIVE: "0" }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.doesNotMatch(log(), /agent-browser --session .* open/);
+	assert.equal(
+		fs.readFileSync(path.join(stateDir, "navigate-w9"), "utf8").trim(),
+		"http://localhost:5000/x",
+	);
+	fs.rmSync(path.join(stateDir, "navigate-w9"), { force: true });
+	fs.rmSync(path.join(stateDir, "backend-w9"), { force: true });
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+});
+
+test("a dead pane's stale backend marker is ignored", () => {
+	fs.writeFileSync(path.join(stateDir, "backend-w9"), "attach\n");
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+	const r = runScript("open.sh", ["http://localhost:5001/y"]);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /agent-browser --session herdr-ws-w9 open/);
+	fs.rmSync(path.join(stateDir, "backend-w9"), { force: true });
+});
+
+test("whitespace-only HERDR_BROWSER_CDP_URL is not attach mode (renderer parity)", () => {
+	const r = runScript(
+		"open.sh",
+		["http://localhost:5002/z"],
+		freshEnv({ HERDR_BROWSER_CDP_URL: "   " }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /agent-browser --session herdr-ws-w9 open/);
+	assert.ok(!fs.existsSync(path.join(stateDir, "navigate-w9")));
+});

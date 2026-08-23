@@ -18,7 +18,7 @@ esac
 # configured for CDP attach mode or launch mode has no such session —
 # starting one here would record a fresh, unrelated headless browser, not
 # the browser the pane shows.
-if cdp_endpoint_configured >/dev/null || launch_configured; then
+if cdp_endpoint_configured || launch_configured; then
 	echo "herdr-browser: recording captures agent-browser sessions, but this workspace is configured for attach/launch mode. Record from the automation client that owns the browser, or remove the cdp-url/launch configuration to record an agent-browser session." >&2
 	exit 1
 fi

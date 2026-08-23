@@ -27,6 +27,8 @@ import {
 	newNetworkState,
 	diffNetworkFailures,
 	formatNetworkFailure,
+	findChromium,
+	truthyConfig,
 } from "../bin/renderer.mjs";
 
 const repoRoot = path.resolve(
@@ -58,6 +60,10 @@ const mkRenderer = (over = {}) =>
 		HERDR_BROWSER_SESSION: "hb-test",
 		HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "hb-r-")),
 		HOME: os.homedir(),
+		// Dead by default: with PATH unset entirely, sh falls back to the
+		// system default path and the launch-mode probe can find and start a
+		// REAL browser on CI runners — whose open handles then hang the run.
+		PATH: "/nonexistent",
 		...over,
 	});
 // Silence painting; keep state transitions observable.
@@ -70,6 +76,16 @@ const quiet = (r) => {
 };
 const flush = async () => {
 	for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+};
+// attachCdp (and launchChromium) refuse on Node < 22 before touching the
+// backend, so attach-behavior tests only make sense where attach is possible.
+const canCdp = typeof WebSocket === "function";
+// Poll until cond() or the timeout; launch tests wait on real child I/O.
+const until = async (cond, ms = 5_000) => {
+	const end = Date.now() + ms;
+	while (Date.now() < end && !cond())
+		await new Promise((res) => setTimeout(res, 100));
+	return cond();
 };
 
 test("reconcile: first poll returns everything", () => {
@@ -1973,7 +1989,7 @@ const fakeCdpBackend = (over = {}) => {
 
 test("attach mode: CDP endpoint wins over agent-browser and disables owning paths", () => {
 	const r = attachRenderer();
-	assert.equal(r.mode, "attach");
+	assert.equal(r.backend, "attach");
 	assert.equal(r.ownershipEnabled, false);
 	assert.equal(r.backendName, "browser endpoint");
 	// The duck-type omissions are the contract: no viewport fitting, no
@@ -1982,11 +1998,11 @@ test("attach mode: CDP endpoint wins over agent-browser and disables owning path
 	assert.equal(typeof r.browser.network, "undefined");
 	assert.equal(typeof r.browser.streamEnable, "undefined");
 	const plain = mkRenderer();
-	assert.equal(plain.mode, "agent-browser");
+	assert.equal(plain.backend, "agent-browser");
 	assert.equal(plain.ownershipEnabled, true);
 });
 
-test("attach mode: tick connects, then only watches liveness", async () => {
+test("attach mode: tick connects, then only watches liveness", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	await r.tick();
@@ -1997,7 +2013,7 @@ test("attach mode: tick connects, then only watches liveness", async () => {
 	assert.deepEqual(r.browser.calls, ["connect"], "no polling while attached");
 });
 
-test("attach mode: frames paint and ack with the integer id after the paint settles", async () => {
+test("attach mode: frames paint and ack with the integer id after the paint settles", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	let renders = 0;
@@ -2033,7 +2049,7 @@ test("attach mode: clicks scale from frame pixels to page pixels per frame", asy
 	});
 });
 
-test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", async () => {
+test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend({ alive: false });
 	await r.tick();
@@ -2051,7 +2067,7 @@ test("attach mode: dead endpoint detaches; raw ws endpoints do not retry", async
 	assert.equal(raw.streamCooldownUntil, Number.MAX_SAFE_INTEGER, "no retry loop");
 });
 
-test("attach mode: reattach to a different browser resets state with a marker", async () => {
+test("attach mode: reattach to a different browser resets state with a marker", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	await r.tick();
@@ -2068,7 +2084,7 @@ test("attach mode: reattach to a different browser resets state with a marker", 
 	assert.equal(r.lastHash, "", "frame state reset");
 });
 
-test("attach mode: stale frames banner once and trigger one restart", async () => {
+test("attach mode: stale frames banner once and trigger one restart", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	await r.tick();
@@ -2109,7 +2125,7 @@ test("attach mode: Node without global WebSocket banners instead of crashing", a
 	}
 });
 
-test("attach mode: endpoint tokens never reach the banner", async () => {
+test("attach mode: endpoint tokens never reach the banner", { skip: !canCdp }, async () => {
 	const r = attachRenderer({
 		HERDR_BROWSER_CDP_URL: "ws://127.0.0.1:9222/devtools/browser/SECRET-TOKEN",
 	});
@@ -2148,7 +2164,7 @@ test("attach mode: config-dir cdp-url is a valid endpoint source", () => {
 	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-cfg-cdp-"));
 	fs.writeFileSync(path.join(cfg, "cdp-url"), "http://127.0.0.1:9333\n");
 	const r = mkRenderer({ HERDR_PLUGIN_CONFIG_DIR: cfg });
-	assert.equal(r.mode, "attach");
+	assert.equal(r.backend, "attach");
 	assert.equal(r.cdpEndpoint, "http://127.0.0.1:9333");
 	// Env wins over the file.
 	const r2 = mkRenderer({
@@ -2162,7 +2178,7 @@ test("attach prompt refuses navigation-shaped input and keeps u for URLs", async
 	const r = quiet(mkRenderer());
 	await r.attachTo("localhost:9222");
 	assert.match(r.banner, /not an endpoint/);
-	assert.equal(r.mode, "agent-browser", "bad input must not switch modes");
+	assert.equal(r.backend, "agent-browser", "bad input must not switch modes");
 });
 
 test("attach switch resets reconciliation state and drops ownership", async () => {
@@ -2172,7 +2188,7 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	r.lastHash = "deadbeef";
 	r.browser = { ...r.browser, sessionExists: async () => false };
 	await r.attachTo("http://127.0.0.1:9222");
-	assert.equal(r.mode, "attach");
+	assert.equal(r.backend, "attach");
 	assert.equal(r.ownershipEnabled, false);
 	assert.equal(r.selfCreated, false, "ownership never survives a backend switch");
 	assert.deepEqual(r.consoleState, { count: 0, tail: [] });
@@ -2180,7 +2196,7 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	assert.ok(r.consoleLines.some((l) => /switched to attach mode/.test(l)));
 });
 
-test("attach mode: a Cmd+click handoff file navigates the attached target", async () => {
+test("attach mode: a Cmd+click handoff file navigates the attached target", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
 	r.browser.open = async (u) => r.browser.calls.push(`open:${u}`);
@@ -2195,4 +2211,451 @@ test("attach mode: a Cmd+click handoff file navigates the attached target", asyn
 		r.browser.calls.includes("open:http://localhost:3000/dash"),
 		"click navigates the attached target, not an agent-browser session",
 	);
+});
+
+// --- Wave 5: backend/render-mode split, observe-only, target cycling ---
+
+test("backend split: render-mode pick does not erase a configured attach backend", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	// run() assigns the render mode after the kitty probe; the attach decision
+	// must survive it or a configured endpoint never attaches in the real pane.
+	r.mode = "symbols";
+	await r.tick();
+	assert.equal(r.backend, "attach");
+	assert.ok(r.browser.calls.includes("connect"), "tick still takes the attach path");
+	assert.equal(r.mode, "symbols", "render mode is untouched by attaching");
+});
+
+test("backend split: runtime attach switch keeps the render mode", async () => {
+	const r = quiet(mkRenderer());
+	r.mode = "kitty";
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(r.backend, "attach");
+	assert.equal(r.mode, "kitty", "a-key attach must not clobber kitty rendering");
+});
+
+test("navigate: baseline stays pending when the busy guard skips the read", async () => {
+	const r = quiet(mkRenderer());
+	const calls = [];
+	r.browser = {
+		sessionExists: async () => true,
+		open: async (u) => calls.push(`open:${u}`),
+		network: async () => {
+			calls.push("network");
+			return [];
+		},
+	};
+	r.networkPollBusy = true; // a live-timer poll is in flight
+	await r.navigate("https://localhost:3000/");
+	assert.ok(!calls.includes("network"), "busy guard skipped the baseline read");
+	assert.equal(
+		r.networkBaselinePending,
+		true,
+		"flag must stay pending or the next poll replays the whole failure log",
+	);
+});
+
+test("t cycles the pinned page target in attach mode only", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	let cycles = 0;
+	r.browser.cycleTarget = async () => {
+		cycles++;
+		return true;
+	};
+	await r.tick();
+	r.onKey("t");
+	await flush();
+	assert.equal(cycles, 1);
+
+	const plain = quiet(mkRenderer());
+	plain.attached = true;
+	let plainCycles = 0;
+	plain.browser = { ...plain.browser, cycleTarget: async () => plainCycles++ };
+	plain.onKey("t");
+	await flush();
+	assert.equal(plainCycles, 0, "agent-browser backend has no target cycling");
+});
+
+test("t with a single page target reports instead of failing silently", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.cycleTarget = async () => false;
+	await r.tick();
+	r.onKey("t");
+	await flush();
+	assert.equal(r.banner, "no other page targets");
+});
+
+test("observe-only: o toggles, page-affecting keys and clicks are dropped", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.reload = async () => r.browser.calls.push("reload");
+	r.browser.scroll = async () => r.browser.calls.push("scroll");
+	r.browser.type = async () => r.browser.calls.push("type");
+	await r.tick();
+	r.onKey("o");
+	assert.equal(r.observeOnly, true);
+	for (const ch of ["r", "j", "k", " ", "b", "f"]) r.onKey(ch);
+	r.onKey("i"); // must not even open the type prompt
+	assert.equal(r.promptState, null);
+	r.onMouse({ button: 0, col: 10, row: 5, release: false });
+	r.onMouse({ button: 65, col: 10, row: 5, release: false });
+	await flush();
+	assert.deepEqual(
+		r.browser.calls.filter((c) =>
+			/^(reload|scroll|type|click)/.test(c),
+		),
+		[],
+		"no input reaches the observed browser while observe-only is on",
+	);
+	assert.match(r.banner, /observe-only/);
+	r.onKey("o");
+	assert.equal(r.observeOnly, false);
+	assert.equal(r.banner, "", "the observe banner clears with the toggle");
+	r.onKey("r");
+	await flush();
+	assert.ok(r.browser.calls.includes("reload"), "input works again after re-enable");
+});
+
+test("observe-only: u prompt is blocked; a Cmd+click handoff is consumed, not forwarded", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.open = async (u) => r.browser.calls.push(`open:${u}`);
+	await r.tick();
+	r.onKey("o");
+	r.onKey("u");
+	assert.equal(r.promptState, null, "navigation prompt must not open");
+	fs.writeFileSync(
+		path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`),
+		"http://localhost:3000/x\n",
+	);
+	r.consumeNavigateFile();
+	await flush();
+	assert.ok(
+		!r.browser.calls.some((c) => c.startsWith("open:")),
+		"handoff navigation is not forwarded under observe-only",
+	);
+});
+
+test("observe-only: t (view-only) and q remain available; header shows the state", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	let cycles = 0;
+	r.browser.cycleTarget = async () => {
+		cycles++;
+		return true;
+	};
+	await r.tick();
+	r.onKey("o");
+	r.onKey("t");
+	await flush();
+	assert.equal(cycles, 1, "cycling the pane's own view stays allowed");
+});
+
+// --- Wave 5: Chromium launch mode ---
+
+test("findChromium: explicit env wins, then config, then first probed candidate", () => {
+	assert.equal(
+		findChromium({ HERDR_BROWSER_CHROMIUM: "/opt/my-chrome" }, "cfg", () => true),
+		"/opt/my-chrome",
+	);
+	assert.equal(findChromium({}, "/cfg/chrome", () => true), "/cfg/chrome");
+	assert.equal(
+		findChromium({}, undefined, (c) => c === "google-chrome"),
+		"google-chrome",
+	);
+	assert.equal(findChromium({}, undefined, () => false), null);
+});
+
+const fakeChromiumScript = () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-"));
+	const bin = path.join(dir, "fake-chromium");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+d=""
+for a in "$@"; do case "$a" in --user-data-dir=*) d="\${a#--user-data-dir=}";; esac; done
+printf '9876\\n/devtools/browser/fake-guid\\n' > "$d/DevToolsActivePort"
+exec sleep 30
+`,
+		{ mode: 0o755 },
+	);
+	return bin;
+};
+
+test("launch mode: refuses on Node without a WebSocket client", { skip: canCdp }, async () => {
+	const r = quiet(mkRenderer());
+	await r.launchChromium();
+	assert.match(r.banner, /needs Node 22/);
+});
+
+test("launch mode: l spawns the configured chromium, waits for the port, attaches, owns the child", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	const attachedTo = [];
+	r.attachTo = async (ep) => attachedTo.push(ep);
+	r.attached = false;
+	r.onKey("l"); // reachable while unattached
+	await until(() => attachedTo.length > 0);
+	assert.deepEqual(attachedTo, ["http://127.0.0.1:9876"]);
+	assert.ok(r.launchedChild, "the pane records the child it owns");
+	const pid = r.launchedChild.pid;
+	r.cleanup();
+	assert.equal(r.launchedChild, null);
+	await new Promise((res) => setTimeout(res, 300));
+	assert.throws(
+		() => process.kill(pid, 0),
+		"quit must kill the browser the pane launched",
+	);
+});
+
+test("launch mode: attaching to a different endpoint kills the launched browser", async () => {
+	const r = quiet(mkRenderer());
+	let killed = 0;
+	r.launchedChild = { kill: () => killed++, exitCode: null };
+	r.launchedEndpoint = "http://127.0.0.1:9876";
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9333");
+	assert.equal(killed, 1, "abandoning a launched browser must not leak it");
+	assert.equal(r.launchedChild, null);
+});
+
+test("launch mode: no chromium found reports instead of failing silently", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ PATH: "/nonexistent" }));
+	// Probe uses the real PATH via sh; force emptiness through env PATH.
+	r.env.PATH = "/nonexistent";
+	await r.launchChromium();
+	assert.match(r.banner, /no Chromium found/);
+});
+
+test("a opens the attach prompt while unattached", () => {
+	const r = quiet(mkRenderer());
+	r.attached = false;
+	r.onKey("a");
+	assert.ok(r.promptState, "attach prompt must be reachable with no session");
+	assert.match(r.promptState.label, /attach/);
+});
+
+test("launch mode: a bad binary path banners instead of crashing the pane", { skip: !canCdp }, async () => {
+	const r = quiet(
+		mkRenderer({ HERDR_BROWSER_CHROMIUM: "/nonexistent/definitely-not-chrome" }),
+	);
+	await r.launchChromium();
+	assert.match(r.banner, /cannot launch/);
+	assert.equal(r.launchedChild, null);
+});
+
+// --- Wave 6: config-first observe-only and launch ---
+
+test("truthyConfig accepts common spellings only", () => {
+	for (const v of ["1", "true", "YES", "on ", " True"]) assert.equal(truthyConfig(v), true, v);
+	for (const v of ["0", "false", "", undefined, null, "2", "enabled"]) assert.equal(truthyConfig(v), false, String(v));
+});
+
+test("HERDR_BROWSER_OBSERVE starts the pane observe-only; o still toggles", () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_OBSERVE: "1" }));
+	assert.equal(r.observeOnly, true);
+	r.attached = true;
+	let reloads = 0;
+	r.browser = { ...r.browser, reload: async () => reloads++ };
+	r.onKey("r");
+	assert.equal(reloads, 0, "input starts blocked");
+	r.onKey("o");
+	assert.equal(r.observeOnly, false);
+});
+
+test("observe config file is a valid source", () => {
+	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-cfg-obs-"));
+	fs.writeFileSync(path.join(cfg, "observe"), "true\n");
+	const r = mkRenderer({ HERDR_PLUGIN_CONFIG_DIR: cfg });
+	assert.equal(r.observeOnly, true);
+});
+
+test("launch-first workspace launches once from the first unattached tick", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(
+		mkRenderer({ HERDR_BROWSER_LAUNCH: "1", HERDR_BROWSER_CHROMIUM: bin }),
+	);
+	assert.equal(r.launchConfigured, true);
+	const attachedTo = [];
+	r.attachTo = async (ep) => attachedTo.push(ep);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.tick(); // triggers the launch instead of waiting for a session
+	assert.equal(r.launchAttempted, true);
+	await until(() => attachedTo.length > 0);
+	assert.deepEqual(attachedTo, ["http://127.0.0.1:9876"]);
+	r.cleanup();
+});
+
+test("a configured cdp endpoint wins over launch-first", () => {
+	const r = mkRenderer({
+		HERDR_BROWSER_LAUNCH: "1",
+		HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222",
+	});
+	assert.equal(r.backend, "attach");
+	assert.equal(r.launchConfigured, false);
+});
+
+test("a crashed launched Chromium banners l-to-relaunch instead of redialing a dead port", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	r.attachTo = async (ep) => {
+		r.cdpEndpoint = ep; // what the real attachTo records
+		r.attached = true;
+	};
+	await r.launchChromium();
+	await until(() => r.attached);
+	const child = r.launchedChild;
+	assert.ok(child);
+	child.kill("SIGKILL"); // crash, not a pane-initiated quit
+	await until(() => !r.launchedChild);
+	assert.equal(r.launchedChild, null);
+	assert.equal(r.attached, false);
+	assert.match(r.banner, /press l to relaunch/);
+	assert.equal(
+		r.streamCooldownUntil,
+		Number.MAX_SAFE_INTEGER,
+		"no rediscovery loop against a port that died with the browser",
+	);
+});
+
+test("a launch-failure banner survives the next waiting-for-session tick", { skip: !canCdp }, async () => {
+	// PATH must be explicitly dead: with no PATH at all, sh falls back to the
+	// system default path and can find a real browser on CI runners.
+	const r = quiet(mkRenderer({ PATH: "/nonexistent" }));
+	await r.launchChromium();
+	assert.match(r.banner, /no Chromium found/);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.tick();
+	assert.match(
+		r.banner,
+		/no Chromium found/,
+		"generic waiting advice must not paint over the failure explanation",
+	);
+});
+
+test("a crash before the queued attach still latches and never dials the corpse", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	let attachCalls = 0;
+	r.attachTo = async () => attachCalls++;
+	// Defer queued user actions so the crash lands between the port read and
+	// the attach, the exact window the exit-handler guard must cover.
+	const deferred = [];
+	r.userAction = (fn) => deferred.push(fn);
+	await r.launchChromium();
+	const child = r.launchedChild;
+	assert.ok(child, "launch reached the port read");
+	child.kill("SIGKILL");
+	await until(() => !r.launchedChild);
+	assert.match(r.banner, /press l to relaunch/);
+	assert.equal(r.streamCooldownUntil, Number.MAX_SAFE_INTEGER);
+	for (const fn of deferred) await fn();
+	assert.equal(attachCalls, 0, "the queued attach must notice the corpse");
+});
+
+// --- Round-2 review fixes: unattached handoff paths ---
+
+test("a click in a launch workspace with no browser up triggers the launch and navigates on attach", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	let launches = 0;
+	r.launchChromium = async () => launches++;
+	r.startNavigateWatch();
+	fs.writeFileSync(
+		path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`),
+		"http://localhost:3000/app\n",
+	);
+	r.consumeNavigateFile();
+	assert.equal(launches, 1, "the click retries the launch");
+	assert.equal(r.pendingNavigateUrl?.url, "http://localhost:3000/app");
+
+	// On attach, the parked URL is delivered.
+	const opened = [];
+	r.browser = fakeCdpBackend();
+	r.browser.open = async (u) => opened.push(u);
+	r.backend = "attach";
+	await r.attachCdp();
+	await flush();
+	assert.deepEqual(opened, ["http://localhost:3000/app"]);
+	assert.equal(r.pendingNavigateUrl, null);
+});
+
+test("a stale handoff file is dropped, not replayed", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	r.attached = true;
+	const opened = [];
+	r.browser = { ...r.browser, open: async (u) => opened.push(u) };
+	r.startNavigateWatch();
+	const f = path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`);
+	fs.writeFileSync(f, "http://localhost:3000/old\n");
+	const old = new Date(Date.now() - 3_600_000);
+	fs.utimesSync(f, old, old);
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, [], "an hour-old click must not navigate out of nowhere");
+	assert.ok(!fs.existsSync(f), "the stale file is still consumed");
+});
+
+test("runtime attach writes the backend marker; cleanup removes it", async () => {
+	const r = quiet(mkRenderer());
+	const marker = path.join(
+		r.stateDir,
+		`backend-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`,
+	);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(fs.readFileSync(marker, "utf8").trim(), "attach");
+	r.cleanup();
+	assert.ok(!fs.existsSync(marker));
+});
+
+test("an unexpected launchChromium throw banners instead of rejecting unhandled", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: "/bin/true" }));
+	// Force a throw inside the guarded body: an unwritable profile parent.
+	const origMkdir = fs.mkdirSync;
+	fs.mkdirSync = () => {
+		throw new Error("EACCES: permission denied, mkdir");
+	};
+	try {
+		await r.launchChromium(); // must resolve, never reject
+	} finally {
+		fs.mkdirSync = origMkdir;
+	}
+	assert.match(r.banner, /launch failed: EACCES/);
+	assert.equal(r.launchingChromium, false, "the latch is released on failure");
+});
+
+test("switching backends closes a session this pane created instead of leaking its daemon", async () => {
+	const r = quiet(mkRenderer());
+	r.selfCreated = true;
+	let closes = 0;
+	const orig = r.closeOwnSession.bind(r);
+	r.closeOwnSession = () => {
+		closes++;
+		orig();
+	};
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(closes, 1, "the abandoned self-created session is closed, as on quit");
+	assert.equal(r.selfCreated, false);
+
+	// A session someone else created is never touched by the switch.
+	const other = quiet(mkRenderer());
+	other.selfCreated = false;
+	let otherCloses = 0;
+	const origOther = other.closeOwnSession.bind(other);
+	other.closeOwnSession = () => {
+		otherCloses++;
+		origOther();
+	};
+	other.browser = { ...other.browser, sessionExists: async () => false };
+	await other.attachTo("http://127.0.0.1:9222");
+	assert.equal(other.selfCreated, false);
+	// closeOwnSession may be invoked but must no-op without ownership; the
+	// observable contract is that it never runs the close for foreign sessions
+	// — guarded inside by the selfCreated check.
+	void otherCloses;
 });

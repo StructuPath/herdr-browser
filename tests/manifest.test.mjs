@@ -57,8 +57,8 @@ test("release version and existing action IDs remain stable", () => {
 		path.join(root, "herdr-plugin.toml"),
 		"utf8",
 	);
-	assert.equal(packageJson.version, "0.6.0");
-	assert.match(manifest, /^version = "0\.6\.0"$/m);
+	assert.equal(packageJson.version, "0.7.0");
+	assert.match(manifest, /^version = "0\.7\.0"$/m);
 	assert.deepEqual(
 		[...manifest.matchAll(/^id = "([^"]+)"$/gm)]
 			.slice(1, 6)

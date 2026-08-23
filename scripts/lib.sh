@@ -93,6 +93,55 @@ session_name() {
 	printf 'herdr-cwd-%s\n' "$(printf '%s\n' "$PWD" | cksum | cut -d' ' -f1)"
 }
 
+# Static backend arbitration, shared with the renderer's constructor: these
+# read the same sources so launchers and pane reach the same verdict without
+# a runtime marker. Must stay in lockstep with resolveCdpEndpoint() and the
+# launch/observe knobs in bin/renderer.mjs.
+cdp_endpoint_configured() {
+	# Silent predicate. Whitespace-only values are treated as unset, and a
+	# set-but-blank env var does NOT fall through to the config file — both
+	# exactly as resolveCdpEndpoint() decides.
+	local v=""
+	if [ -n "${HERDR_BROWSER_CDP_URL:-}" ]; then
+		v="$(printf '%s' "$HERDR_BROWSER_CDP_URL" | tr -d '[:space:][:cntrl:]')"
+	elif [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" ]; then
+		v="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" | tr -d '[:space:][:cntrl:]')"
+	fi
+	[ -n "$v" ]
+}
+
+# A pane that switched to attach/launch mode at runtime (the a or l key)
+# leaves this marker; static sources cannot see that switch. Trust it only
+# alongside a live pane — a crashed pane's stale marker must not swallow
+# clicks into a handoff file nobody consumes.
+backend_marker_file() {
+	printf '%s/backend-%s\n' "$(state_dir)" "$(ws_id)"
+}
+
+# Boolean knob files/envs: same accepted spellings as truthyConfig() in the
+# renderer. A set-but-non-truthy env wins over the config file (|| semantics).
+truthy_config() {
+	case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+	1 | true | yes | on) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+knob_configured() { # $1: env value (may be empty), $2: config file name
+	if [ -n "$1" ]; then
+		truthy_config "$1"
+		return $?
+	fi
+	if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/$2" ]; then
+		truthy_config "$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/$2")"
+		return $?
+	fi
+	return 1
+}
+
+launch_configured() { knob_configured "${HERDR_BROWSER_LAUNCH:-}" launch; }
+observe_configured() { knob_configured "${HERDR_BROWSER_OBSERVE:-}" observe; }
+
 require_agent_browser() {
 	if ! command -v agent-browser >/dev/null 2>&1; then
 		echo "herdr-browser: agent-browser CLI not found." >&2

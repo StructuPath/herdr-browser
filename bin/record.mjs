@@ -7,7 +7,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PLUGIN_ID = "structupath.browser";
-const PLUGIN_VERSION = "0.6.0";
+// Single-sourced from package.json so a release bump cannot miss it. The
+// Start/Stop manifest check still compares versions strictly: a recording
+// that crosses an upgrade fails closed rather than completing ambiguously.
+const PLUGIN_VERSION = JSON.parse(
+	fs.readFileSync(
+		path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"),
+		"utf8",
+	),
+).version;
 const SCHEMA_VERSION = 1;
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKSPACE_ID_RE = /^[A-Za-z0-9_-]+$/;

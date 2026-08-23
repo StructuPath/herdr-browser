@@ -332,6 +332,11 @@ echo "my-agent-session" \
 
 ## Recording
 
+Recording captures the workspace's **agent-browser session**. In CDP attach
+mode there is no such session, so the record actions refuse with an
+explanation instead of silently recording a fresh, unrelated headless
+browser — record from the automation client that owns the browser instead.
+
 Start and stop recording through the existing recording actions. Each new
 capture is a run-scoped observation bundle:
 

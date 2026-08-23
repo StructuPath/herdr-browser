@@ -889,7 +889,10 @@ export class Renderer {
 				"--no-first-run",
 				"--no-default-browser-check",
 				"--disable-background-networking",
-				...(headed ? [] : ["--headless=new"]),
+				// Plain --headless: new headless on 112+, old headless before it
+				// (both support DevTools and screencast); =new was removed in
+				// newer Chromes and would eventually break launches.
+				...(headed ? [] : ["--headless"]),
 				// Chrome refuses to start as root without this; root (containers,
 				// CI) already has no user boundary for the sandbox to defend.
 				...(process.getuid?.() === 0 ? ["--no-sandbox"] : []),
@@ -898,6 +901,10 @@ export class Renderer {
 			this.banner = "launching Chromium…";
 			this.header();
 			let child;
+			// spawn reports a missing or non-executable binary as an async
+			// 'error' event, not a throw; without a listener that event is an
+			// uncaughtException that takes the whole pane down.
+			const spawnFailed = { err: null };
 			try {
 				child = spawn(bin, args, { stdio: "ignore" });
 			} catch (err) {
@@ -905,14 +912,19 @@ export class Renderer {
 				this.header();
 				return;
 			}
-			const port = await this.waitForDevToolsPort(portFile, child);
+			child.once("error", (err) => {
+				spawnFailed.err = err;
+			});
+			const port = await this.waitForDevToolsPort(portFile, child, spawnFailed);
 			if (!port) {
 				try {
 					child.kill();
 				} catch {
 					/* already dead */
 				}
-				this.banner = `${bin} did not expose a DevTools port — is it Chromium-based?`;
+				this.banner = spawnFailed.err
+					? `cannot launch ${bin}: ${sanitizeText(spawnFailed.err.message ?? "spawn failed")}`
+					: `${bin} did not expose a DevTools port — is it Chromium-based?`;
 				this.header();
 				return;
 			}
@@ -930,10 +942,11 @@ export class Renderer {
 	// DevToolsActivePort appears in the profile root once the port is bound:
 	// line 1 is the port, line 2 the browser target path (a capability token
 	// we deliberately do not read — discovery re-derives it).
-	async waitForDevToolsPort(portFile, child, timeoutMs = 15_000) {
+	async waitForDevToolsPort(portFile, child, spawnFailed = null, timeoutMs = 15_000) {
 		const until = Date.now() + timeoutMs;
 		while (Date.now() < until) {
 			if (child.exitCode !== null) return null; // died during startup
+			if (spawnFailed?.err) return null; // binary missing/not executable
 			try {
 				const port = Number(
 					fs.readFileSync(portFile, "utf8").split("\n")[0].trim(),

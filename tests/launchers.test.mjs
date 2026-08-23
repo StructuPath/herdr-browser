@@ -580,3 +580,20 @@ test("a live holder is never stolen from, even after the wait budget", {
 	);
 	assert.equal(fs.existsSync(lock), false, "lock released after holder exit");
 });
+
+test("record refuses in attach mode instead of recording an unrelated browser", () => {
+	const env = freshEnv({ HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222" });
+	const r = runScript("record.sh", ["start"], env);
+	assert.notEqual(r.status, 0);
+	assert.match(r.stderr, /attach mode/);
+	// The config-file source must reach the same verdict as the env var.
+	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-rec-cfg-"));
+	fs.writeFileSync(path.join(cfg, "cdp-url"), "http://127.0.0.1:9222\n");
+	const r2 = runScript(
+		"record.sh",
+		["start"],
+		freshEnv({ HERDR_PLUGIN_CONFIG_DIR: cfg }),
+	);
+	assert.notEqual(r2.status, 0);
+	assert.match(r2.stderr, /attach mode/);
+});

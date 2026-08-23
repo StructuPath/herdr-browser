@@ -2431,3 +2431,12 @@ test("a opens the attach prompt while unattached", () => {
 	assert.ok(r.promptState, "attach prompt must be reachable with no session");
 	assert.match(r.promptState.label, /attach/);
 });
+
+test("launch mode: a bad binary path banners instead of crashing the pane", { skip: !canCdp }, async () => {
+	const r = quiet(
+		mkRenderer({ HERDR_BROWSER_CHROMIUM: "/nonexistent/definitely-not-chrome" }),
+	);
+	await r.launchChromium();
+	assert.match(r.banner, /cannot launch/);
+	assert.equal(r.launchedChild, null);
+});

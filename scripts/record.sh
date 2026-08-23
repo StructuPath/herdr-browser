@@ -14,6 +14,18 @@ start | stop) ;;
 	;;
 esac
 
+# Recording captures the workspace's agent-browser session. A workspace
+# configured for CDP attach mode has no such session — starting one here
+# would record a fresh, unrelated headless browser, not the observed one.
+cdp_endpoint="${HERDR_BROWSER_CDP_URL:-}"
+if [ -z "$cdp_endpoint" ] && [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" ]; then
+	cdp_endpoint="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" | tr -d '[:space:][:cntrl:]')"
+fi
+if [ -n "$cdp_endpoint" ]; then
+	echo "herdr-browser: recording captures agent-browser sessions, but this workspace is configured for CDP attach mode (cdp-url). Record from the automation client that owns the browser, or remove the cdp-url configuration to record an agent-browser session." >&2
+	exit 1
+fi
+
 require_agent_browser
 if ! command -v node >/dev/null 2>&1; then
 	echo "herdr-browser: node is required." >&2

@@ -80,6 +80,13 @@ const flush = async () => {
 // attachCdp (and launchChromium) refuse on Node < 22 before touching the
 // backend, so attach-behavior tests only make sense where attach is possible.
 const canCdp = typeof WebSocket === "function";
+// Poll until cond() or the timeout; launch tests wait on real child I/O.
+const until = async (cond, ms = 5_000) => {
+	const end = Date.now() + ms;
+	while (Date.now() < end && !cond())
+		await new Promise((res) => setTimeout(res, 100));
+	return cond();
+};
 
 test("reconcile: first poll returns everything", () => {
 	const r = reconcileConsole({ count: 0, tail: [] }, e(["a", "b"]));
@@ -2392,9 +2399,7 @@ test("launch mode: l spawns the configured chromium, waits for the port, attache
 	r.attachTo = async (ep) => attachedTo.push(ep);
 	r.attached = false;
 	r.onKey("l"); // reachable while unattached
-	// The port wait polls every 200ms; give the fake time to write the file.
-	for (let i = 0; i < 50 && !attachedTo.length; i++)
-		await new Promise((res) => setTimeout(res, 100));
+	await until(() => attachedTo.length > 0);
 	assert.deepEqual(attachedTo, ["http://127.0.0.1:9876"]);
 	assert.ok(r.launchedChild, "the pane records the child it owns");
 	const pid = r.launchedChild.pid;
@@ -2409,7 +2414,6 @@ test("launch mode: l spawns the configured chromium, waits for the port, attache
 
 test("launch mode: attaching to a different endpoint kills the launched browser", async () => {
 	const r = quiet(mkRenderer());
-	const child = spawnSync("sh", ["-c", "echo"], {}); // placeholder shape
 	let killed = 0;
 	r.launchedChild = { kill: () => killed++, exitCode: null };
 	r.launchedEndpoint = "http://127.0.0.1:9876";
@@ -2417,7 +2421,6 @@ test("launch mode: attaching to a different endpoint kills the launched browser"
 	await r.attachTo("http://127.0.0.1:9333");
 	assert.equal(killed, 1, "abandoning a launched browser must not leak it");
 	assert.equal(r.launchedChild, null);
-	void child;
 });
 
 test("launch mode: no chromium found reports instead of failing silently", { skip: !canCdp }, async () => {
@@ -2482,8 +2485,7 @@ test("launch-first workspace launches once from the first unattached tick", { sk
 	r.browser = { ...r.browser, sessionExists: async () => false };
 	await r.tick(); // triggers the launch instead of waiting for a session
 	assert.equal(r.launchAttempted, true);
-	for (let i = 0; i < 50 && !attachedTo.length; i++)
-		await new Promise((res) => setTimeout(res, 100));
+	await until(() => attachedTo.length > 0);
 	assert.deepEqual(attachedTo, ["http://127.0.0.1:9876"]);
 	r.cleanup();
 });
@@ -2505,13 +2507,11 @@ test("a crashed launched Chromium banners l-to-relaunch instead of redialing a d
 		r.attached = true;
 	};
 	await r.launchChromium();
-	for (let i = 0; i < 50 && !r.attached; i++)
-		await new Promise((res) => setTimeout(res, 100));
+	await until(() => r.attached);
 	const child = r.launchedChild;
 	assert.ok(child);
 	child.kill("SIGKILL"); // crash, not a pane-initiated quit
-	for (let i = 0; i < 50 && r.launchedChild; i++)
-		await new Promise((res) => setTimeout(res, 100));
+	await until(() => !r.launchedChild);
 	assert.equal(r.launchedChild, null);
 	assert.equal(r.attached, false);
 	assert.match(r.banner, /press l to relaunch/);
@@ -2550,8 +2550,7 @@ test("a crash before the queued attach still latches and never dials the corpse"
 	const child = r.launchedChild;
 	assert.ok(child, "launch reached the port read");
 	child.kill("SIGKILL");
-	for (let i = 0; i < 50 && r.launchedChild; i++)
-		await new Promise((res) => setTimeout(res, 100));
+	await until(() => !r.launchedChild);
 	assert.match(r.banner, /press l to relaunch/);
 	assert.equal(r.streamCooldownUntil, Number.MAX_SAFE_INTEGER);
 	for (const fn of deferred) await fn();
@@ -2611,4 +2610,20 @@ test("runtime attach writes the backend marker; cleanup removes it", async () =>
 	assert.equal(fs.readFileSync(marker, "utf8").trim(), "attach");
 	r.cleanup();
 	assert.ok(!fs.existsSync(marker));
+});
+
+test("an unexpected launchChromium throw banners instead of rejecting unhandled", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: "/bin/true" }));
+	// Force a throw inside the guarded body: an unwritable profile parent.
+	const origMkdir = fs.mkdirSync;
+	fs.mkdirSync = () => {
+		throw new Error("EACCES: permission denied, mkdir");
+	};
+	try {
+		await r.launchChromium(); // must resolve, never reject
+	} finally {
+		fs.mkdirSync = origMkdir;
+	}
+	assert.match(r.banner, /launch failed: EACCES/);
+	assert.equal(r.launchingChromium, false, "the latch is released on failure");
 });

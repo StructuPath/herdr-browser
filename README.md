@@ -45,7 +45,7 @@ Conductor).
 | Component | Requirement | Notes |
 | --- | --- | --- |
 | Herdr | `>= 0.7.0` | Tested with Herdr 0.7.4 |
-| Node.js | `>= 20` | Node 22+ enables live WebSocket streaming and CDP attach mode |
+| Node.js | `>= 20` | Node 22+ enables live WebSocket streaming, CDP attach mode, and launch mode |
 | agent-browser | Optional | Required for shared agent sessions; tested with agent-browser 0.33.x; failed-request reporting needs the `network requests` command |
 | Chromium/Chrome | Optional | Any Chromium-based browser enables launch mode (`l`) and attach mode |
 | chafa | Optional | ANSI rendering and streamed JPEGs in Kitty mode |
@@ -293,7 +293,9 @@ says so plainly on older Node and keeps working in agent-browser mode.
 
 Press `l` and the pane launches a local Chromium with a loopback DevTools
 port and attaches to it — no agent-browser, no configuration. This is the
-zero-setup path: open the pane, press `l`, press `u`, browse.
+zero-setup path: open the pane, press `l`, press `u`, browse. Like attach
+mode, launching needs Node 22 or newer (the built-in WebSocket client); the
+pane says so instead of starting a browser it could never attach to.
 
 The launcher looks for `HERDR_BROWSER_CHROMIUM` (or the `chromium` config
 file), then probes `google-chrome`, `google-chrome-stable`, `chromium`,
@@ -347,9 +349,9 @@ echo "my-agent-session" \
 
 ## Recording
 
-Recording captures the workspace's **agent-browser session**. In CDP attach
-mode there is no such session, so the record actions refuse with an
-explanation instead of silently recording a fresh, unrelated headless
+Recording captures the workspace's **agent-browser session**. Attach and
+launch workspaces have no such session, so the record actions refuse with
+an explanation instead of silently recording a fresh, unrelated headless
 browser — record from the automation client that owns the browser instead.
 
 Start and stop recording through the existing recording actions. Each new

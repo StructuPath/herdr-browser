@@ -913,7 +913,11 @@ export class Renderer {
 				this.stateDir,
 				`chromium-profile-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`,
 			);
+			// mkdir's mode applies only on creation (and umask can relax it);
+			// the profile holds the launched browser's cookies and session
+			// state, so tighten explicitly like the constructor does stateDir.
 			fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
+			fs.chmodSync(profile, 0o700);
 			const portFile = path.join(profile, "DevToolsActivePort");
 			try {
 				fs.unlinkSync(portFile); // a stale port must never win the wait below
@@ -993,6 +997,13 @@ export class Renderer {
 				if (child.exitCode !== null || child.signalCode !== null) return;
 				return this.attachTo(ep, { note: "— launched Chromium —" });
 			});
+		} catch (err) {
+			// Callers fire-and-forget this promise; an uncaught throw here
+			// (say, an unwritable profile dir) would surface as an unhandled
+			// rejection and take the whole pane down instead of explaining.
+			this.holdBanner(
+				`launch failed: ${sanitizeText(err?.message ?? "unknown error")}`,
+			);
 		} finally {
 			this.launchingChromium = false;
 		}
@@ -1331,11 +1342,13 @@ export class Renderer {
 				`${ESC}[${bottomRow};1H${truncate(text, cols)}${ESC}[K`,
 			);
 		} else {
+			// Every advertised key is handled in both backends (a and l work
+			// everywhere); t only moves targets on an attach backend.
 			const help = this.observeOnly
 				? " observe-only: input is not forwarded  o:enable-input  q:quit"
 				: this.backend === "attach"
-					? " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  t:target  o:observe  q:quit"
-					: " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  l:launch  o:observe  q:quit";
+					? " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  t:target  o:observe  q:quit"
+					: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
 			);

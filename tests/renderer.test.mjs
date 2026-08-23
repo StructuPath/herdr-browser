@@ -1973,7 +1973,7 @@ const fakeCdpBackend = (over = {}) => {
 
 test("attach mode: CDP endpoint wins over agent-browser and disables owning paths", () => {
 	const r = attachRenderer();
-	assert.equal(r.mode, "attach");
+	assert.equal(r.backend, "attach");
 	assert.equal(r.ownershipEnabled, false);
 	assert.equal(r.backendName, "browser endpoint");
 	// The duck-type omissions are the contract: no viewport fitting, no
@@ -1982,7 +1982,7 @@ test("attach mode: CDP endpoint wins over agent-browser and disables owning path
 	assert.equal(typeof r.browser.network, "undefined");
 	assert.equal(typeof r.browser.streamEnable, "undefined");
 	const plain = mkRenderer();
-	assert.equal(plain.mode, "agent-browser");
+	assert.equal(plain.backend, "agent-browser");
 	assert.equal(plain.ownershipEnabled, true);
 });
 
@@ -2148,7 +2148,7 @@ test("attach mode: config-dir cdp-url is a valid endpoint source", () => {
 	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-cfg-cdp-"));
 	fs.writeFileSync(path.join(cfg, "cdp-url"), "http://127.0.0.1:9333\n");
 	const r = mkRenderer({ HERDR_PLUGIN_CONFIG_DIR: cfg });
-	assert.equal(r.mode, "attach");
+	assert.equal(r.backend, "attach");
 	assert.equal(r.cdpEndpoint, "http://127.0.0.1:9333");
 	// Env wins over the file.
 	const r2 = mkRenderer({
@@ -2162,7 +2162,7 @@ test("attach prompt refuses navigation-shaped input and keeps u for URLs", async
 	const r = quiet(mkRenderer());
 	await r.attachTo("localhost:9222");
 	assert.match(r.banner, /not an endpoint/);
-	assert.equal(r.mode, "agent-browser", "bad input must not switch modes");
+	assert.equal(r.backend, "agent-browser", "bad input must not switch modes");
 });
 
 test("attach switch resets reconciliation state and drops ownership", async () => {
@@ -2172,7 +2172,7 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	r.lastHash = "deadbeef";
 	r.browser = { ...r.browser, sessionExists: async () => false };
 	await r.attachTo("http://127.0.0.1:9222");
-	assert.equal(r.mode, "attach");
+	assert.equal(r.backend, "attach");
 	assert.equal(r.ownershipEnabled, false);
 	assert.equal(r.selfCreated, false, "ownership never survives a backend switch");
 	assert.deepEqual(r.consoleState, { count: 0, tail: [] });
@@ -2195,4 +2195,146 @@ test("attach mode: a Cmd+click handoff file navigates the attached target", asyn
 		r.browser.calls.includes("open:http://localhost:3000/dash"),
 		"click navigates the attached target, not an agent-browser session",
 	);
+});
+
+// --- Wave 5: backend/render-mode split, observe-only, target cycling ---
+
+test("backend split: render-mode pick does not erase a configured attach backend", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	// run() assigns the render mode after the kitty probe; the attach decision
+	// must survive it or a configured endpoint never attaches in the real pane.
+	r.mode = "symbols";
+	await r.tick();
+	assert.equal(r.backend, "attach");
+	assert.ok(r.browser.calls.includes("connect"), "tick still takes the attach path");
+	assert.equal(r.mode, "symbols", "render mode is untouched by attaching");
+});
+
+test("backend split: runtime attach switch keeps the render mode", async () => {
+	const r = quiet(mkRenderer());
+	r.mode = "kitty";
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	assert.equal(r.backend, "attach");
+	assert.equal(r.mode, "kitty", "a-key attach must not clobber kitty rendering");
+});
+
+test("navigate: baseline stays pending when the busy guard skips the read", async () => {
+	const r = quiet(mkRenderer());
+	const calls = [];
+	r.browser = {
+		sessionExists: async () => true,
+		open: async (u) => calls.push(`open:${u}`),
+		network: async () => {
+			calls.push("network");
+			return [];
+		},
+	};
+	r.networkPollBusy = true; // a live-timer poll is in flight
+	await r.navigate("https://localhost:3000/");
+	assert.ok(!calls.includes("network"), "busy guard skipped the baseline read");
+	assert.equal(
+		r.networkBaselinePending,
+		true,
+		"flag must stay pending or the next poll replays the whole failure log",
+	);
+});
+
+test("t cycles the pinned page target in attach mode only", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	let cycles = 0;
+	r.browser.cycleTarget = async () => {
+		cycles++;
+		return true;
+	};
+	await r.tick();
+	r.onKey("t");
+	await flush();
+	assert.equal(cycles, 1);
+
+	const plain = quiet(mkRenderer());
+	plain.attached = true;
+	let plainCycles = 0;
+	plain.browser = { ...plain.browser, cycleTarget: async () => plainCycles++ };
+	plain.onKey("t");
+	await flush();
+	assert.equal(plainCycles, 0, "agent-browser backend has no target cycling");
+});
+
+test("t with a single page target reports instead of failing silently", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.cycleTarget = async () => false;
+	await r.tick();
+	r.onKey("t");
+	await flush();
+	assert.equal(r.banner, "no other page targets");
+});
+
+test("observe-only: o toggles, page-affecting keys and clicks are dropped", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.reload = async () => r.browser.calls.push("reload");
+	r.browser.scroll = async () => r.browser.calls.push("scroll");
+	r.browser.type = async () => r.browser.calls.push("type");
+	await r.tick();
+	r.onKey("o");
+	assert.equal(r.observeOnly, true);
+	for (const ch of ["r", "j", "k", " ", "b", "f"]) r.onKey(ch);
+	r.onKey("i"); // must not even open the type prompt
+	assert.equal(r.promptState, null);
+	r.onMouse({ button: 0, col: 10, row: 5, release: false });
+	r.onMouse({ button: 65, col: 10, row: 5, release: false });
+	await flush();
+	assert.deepEqual(
+		r.browser.calls.filter((c) =>
+			/^(reload|scroll|type|click)/.test(c),
+		),
+		[],
+		"no input reaches the observed browser while observe-only is on",
+	);
+	assert.match(r.banner, /observe-only/);
+	r.onKey("o");
+	assert.equal(r.observeOnly, false);
+	assert.equal(r.banner, "", "the observe banner clears with the toggle");
+	r.onKey("r");
+	await flush();
+	assert.ok(r.browser.calls.includes("reload"), "input works again after re-enable");
+});
+
+test("observe-only: u prompt is blocked; a Cmd+click handoff is consumed, not forwarded", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	r.browser.open = async (u) => r.browser.calls.push(`open:${u}`);
+	await r.tick();
+	r.onKey("o");
+	r.onKey("u");
+	assert.equal(r.promptState, null, "navigation prompt must not open");
+	fs.writeFileSync(
+		path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`),
+		"http://localhost:3000/x\n",
+	);
+	r.consumeNavigateFile();
+	await flush();
+	assert.ok(
+		!r.browser.calls.some((c) => c.startsWith("open:")),
+		"handoff navigation is not forwarded under observe-only",
+	);
+});
+
+test("observe-only: t (view-only) and q remain available; header shows the state", async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	let cycles = 0;
+	r.browser.cycleTarget = async () => {
+		cycles++;
+		return true;
+	};
+	await r.tick();
+	r.onKey("o");
+	r.onKey("t");
+	await flush();
+	assert.equal(cycles, 1, "cycling the pane's own view stays allowed");
 });

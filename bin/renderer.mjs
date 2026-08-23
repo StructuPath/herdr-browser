@@ -562,15 +562,20 @@ export class Renderer {
 		// deliberate act than an ambient agent-browser session, so it wins — and
 		// it wins deterministically at start, never by racing discovery.
 		this.cdpEndpoint = this.resolveCdpEndpoint(env);
-		this.mode = this.cdpEndpoint ? "attach" : "agent-browser";
+		// Backend (attach vs agent-browser) is not the render mode: run() assigns
+		// this.mode from pickRenderMode (kitty/symbols/text) after the terminal
+		// probe. Sharing one field made that assignment erase the attach decision,
+		// so a configured endpoint never actually attached once run() started.
+		this.backend = this.cdpEndpoint ? "attach" : "agent-browser";
+		this.mode = null; // render mode; run() picks it after the kitty probe
 		this.browser =
-			this.mode === "attach"
+			this.backend === "attach"
 				? makeCdpBrowser(this.cdpEndpoint)
 				: makeBrowser(this.session, this.bin);
 		// Attach mode observes a browser someone else owns: ownership is never
 		// claimed, so the quit path can never close a stranger's session.
-		this.ownershipEnabled = this.mode !== "attach";
-		this.backendName = this.mode === "attach" ? "browser endpoint" : "agent-browser";
+		this.ownershipEnabled = this.backend !== "attach";
+		this.backendName = this.backend === "attach" ? "browser endpoint" : "agent-browser";
 		const onPath = (cmd) =>
 			spawnSync("sh", ["-c", `command -v ${cmd}`], { timeout: 5000 }).status ===
 			0;
@@ -593,6 +598,10 @@ export class Renderer {
 		this.banner = "";
 		this.attached = false;
 		this.selfCreated = false;
+		// Observe-only: pane input (clicks, wheel, navigation, typing) is
+		// dropped instead of forwarded, so watching a live automation run
+		// cannot blur the field it is typing into or dismiss what it awaits.
+		this.observeOnly = false;
 		this.promptState = null;
 		this.paintQueue = Promise.resolve();
 		this.paintErrors = 0;
@@ -768,10 +777,10 @@ export class Renderer {
 			this.header();
 			return;
 		}
-		if (this.mode === "agent-browser" && this.live) this.dropLive();
+		if (this.backend === "agent-browser" && this.live) this.dropLive();
 		this.stopNetworkTimer();
 		this.cdpEndpoint = endpoint;
-		this.mode = "attach";
+		this.backend = "attach";
 		this.ownershipEnabled = false;
 		this.backendName = "browser endpoint";
 		this.selfCreated = false; // never inherit ownership across a switch
@@ -835,7 +844,7 @@ export class Renderer {
 	// The tick-time read stays as the fallback for platforms where fs.watch
 	// misses events (some network filesystems).
 	startNavigateWatch() {
-		if (this.mode !== "attach" || this.navigateWatcher) return;
+		if (this.backend !== "attach" || this.navigateWatcher) return;
 		this.navigateFile = path.join(
 			this.stateDir,
 			`navigate-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`,
@@ -848,7 +857,14 @@ export class Renderer {
 			} catch {
 				return; // nothing pending
 			}
-			if (url) this.userAction(() => this.browser.open(url));
+			if (!url) return;
+			// A Cmd+click handoff is page-affecting input like any other; the
+			// URL is consumed (file already unlinked) but not forwarded.
+			if (this.observeOnly) {
+				this.noteObserveBlocked();
+				return;
+			}
+			this.userAction(() => this.browser.open(url));
 		};
 		this.consumeNavigateFile = consume;
 		try {
@@ -949,7 +965,7 @@ export class Renderer {
 	// Hidden tabs and DevTools screencast contention both present as a frozen
 	// frame with no error. One restart attempt, last frame stays on screen.
 	checkFrameStaleness(now = Date.now()) {
-		if (this.mode !== "attach" || !this.attached || !this.lastFrameAt) return;
+		if (this.backend !== "attach" || !this.attached || !this.lastFrameAt) return;
 		if (now - this.lastFrameAt < 10_000 || this.staleHandled) return;
 		this.staleHandled = true;
 		this.banner = "frame stale (tab hidden or contended)";
@@ -1025,8 +1041,16 @@ export class Renderer {
 			this.lastHeaderSig = null; // force a repaint once we fit again
 			return;
 		}
+		// Attach mode shows the endpoint (host:port only — the path is a
+		// capability token); agent-browser mode shows the session name that
+		// the quick-start instructions tell the user to copy from here.
+		const source =
+			this.backend === "attach"
+				? `attach:${redactWsUrl(this.cdpEndpoint)}`
+				: `session:${this.session}`;
+		const observe = this.observeOnly ? "  observe-only" : "";
 		const line1 = truncate(
-			` herdr-browser  session:${this.session}  mode:${this.mode}`,
+			` herdr-browser  ${source}  mode:${this.mode ?? "-"}${observe}`,
 			cols,
 		);
 		const blankHint =
@@ -1055,8 +1079,11 @@ export class Renderer {
 				`${ESC}[${bottomRow};1H${truncate(text, cols)}${ESC}[K`,
 			);
 		} else {
-			const help =
-				" u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  q:quit";
+			const help = this.observeOnly
+				? " observe-only: input is not forwarded  o:enable-input  q:quit"
+				: this.backend === "attach"
+					? " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  t:target  o:observe  q:quit"
+					: " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
 			);
@@ -1185,7 +1212,7 @@ export class Renderer {
 		// Attach mode is event-driven: the tick only (re)connects, watches
 		// liveness, and notices a stalled screencast. Frames and console
 		// entries arrive over the CDP session, not from polling.
-		if (this.mode === "attach") {
+		if (this.backend === "attach") {
 			if (!this.attached) {
 				if (Date.now() < this.streamCooldownUntil) return;
 				this.streamCooldownUntil = Date.now() + 5_000;
@@ -1416,6 +1443,10 @@ export class Renderer {
 
 	onMouse(mouse) {
 		if (!mouse || mouse.release) return;
+		if (this.observeOnly && this.attached) {
+			this.noteObserveBlocked();
+			return;
+		}
 		// Wheel reports (64=up, 65=down) scroll the page; presses only.
 		if (mouse.button === 64 || mouse.button === 65) {
 			if (this.attached) {
@@ -1429,11 +1460,40 @@ export class Renderer {
 		this.userAction(() => this.clickAt(mouse.col, mouse.row));
 	}
 
+	// Observe-only is a pane-side latch, deliberately not a backend call:
+	// nothing about the observed browser changes, input simply stops here.
+	toggleObserveOnly() {
+		this.observeOnly = !this.observeOnly;
+		if (!this.observeOnly && this.banner.startsWith("observe-only"))
+			this.banner = "";
+		this.lastHeaderSig = null; // the observe marker lives in line 1
+		this.header();
+		this.renderBottom();
+	}
+
+	noteObserveBlocked() {
+		if (this.banner.startsWith("observe-only")) return;
+		this.banner = "observe-only — input is not forwarded (o re-enables)";
+		this.header();
+	}
+
 	onKey(ch) {
 		// A prompt owns the keyboard; clicks while typing must not drive the
 		// page behind the prompt.
 		if (this.promptState) {
 			this.promptInput(ch);
+			return;
+		}
+		// The toggle itself must stay reachable while observe-only is on.
+		if (ch === "o") {
+			this.toggleObserveOnly();
+			return;
+		}
+		if (
+			this.observeOnly &&
+			["u", "i", "b", "f", "r", "j", "k", " "].includes(ch)
+		) {
+			this.noteObserveBlocked();
 			return;
 		}
 		if (!this.attached && !["u", "q", "\x03"].includes(ch)) return;
@@ -1446,6 +1506,22 @@ export class Renderer {
 			// heuristic that guesses wrong on exactly the common case.
 			case "a":
 				this.openPrompt("attach to endpoint: ", (v) => this.attachTo(v));
+				break;
+			// Cycle the pinned page target (attach mode, R6). View-only motion:
+			// it moves the pane's screencast, never focus or page state, so it
+			// stays allowed under observe-only.
+			case "t":
+				if (this.backend !== "attach") break;
+				this.userAction(async () => {
+					const moved = await this.browser.cycleTarget?.();
+					if (!moved) {
+						this.banner = "no other page targets";
+						this.header();
+					} else if (this.banner === "no other page targets") {
+						this.banner = "";
+						this.header();
+					}
+				});
 				break;
 			case "i":
 				this.openPrompt("type: ", (v) => this.browser.type(v));
@@ -1750,7 +1826,6 @@ export class Renderer {
 			// poll is in flight, the busy guard skips this read, and clearing
 			// the flag here would let the next poll replay the whole log.
 			this.networkBaselinePending = true;
-			this.networkBaselinePending = false;
 			this.attached = true; // pollNetwork requires it; the session exists
 			await this.pollNetwork(true);
 		} else {
@@ -1782,7 +1857,7 @@ export class Renderer {
 		if (!pt) return;
 		// Attach-mode frames are scaled by maxWidth and the observed browser's
 		// DPR, so frame pixels are not page pixels — rescale before dispatch.
-		const target = this.mode === "attach" ? this.cdpPagePoint(pt, dims) : pt;
+		const target = this.backend === "attach" ? this.cdpPagePoint(pt, dims) : pt;
 		await this.browser.click(target.x, target.y);
 	}
 
@@ -1804,7 +1879,7 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
-		if (this.mode === "attach") {
+		if (this.backend === "attach") {
 			// Stop our screencast and drop the socket. Never a target close,
 			// never an agent-browser subprocess — we did not create any of this.
 			try {

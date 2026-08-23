@@ -631,15 +631,18 @@ export class Renderer {
 		// dropped instead of forwarded, so watching a live automation run
 		// cannot blur the field it is typing into or dismiss what it awaits.
 		// Configurable at start for watch-the-agent workflows; o still toggles.
+		// || not ??: a set-but-empty env var falls through to the config file,
+		// matching resolveCdpEndpoint — the knob families must agree on what
+		// an empty environment value means.
 		this.observeOnly = truthyConfig(
-			env.HERDR_BROWSER_OBSERVE ?? this.configValue("observe"),
+			env.HERDR_BROWSER_OBSERVE || this.configValue("observe"),
 		);
 		// Launch-first workspaces: the first unattached tick launches a local
 		// Chromium instead of waiting for an agent-browser session. One
 		// attempt — a failed launch banners and leaves the keys in charge.
 		this.launchConfigured =
 			!this.cdpEndpoint &&
-			truthyConfig(env.HERDR_BROWSER_LAUNCH ?? this.configValue("launch"));
+			truthyConfig(env.HERDR_BROWSER_LAUNCH || this.configValue("launch"));
 		this.launchAttempted = false;
 		this.promptState = null;
 		this.paintQueue = Promise.resolve();
@@ -685,6 +688,9 @@ export class Renderer {
 		this.launchedChild = null;
 		this.launchedEndpoint = null;
 		this.launchingChromium = false;
+		// A launch failure explains itself for this long before the generic
+		// waiting-for-session banner may paint over it (see tick).
+		this.bannerHoldUntil = 0;
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
 		this.lastImageDims = null;
 		this.lastViewportRequest = "";
@@ -870,9 +876,7 @@ export class Renderer {
 		// WebSocket client, and a browser we can never attach to would just
 		// idle until quit.
 		if (!cdpSupported()) {
-			this.banner =
-				"launch mode needs Node 22+ (global WebSocket) — pane is idle";
-			this.header();
+			this.holdBanner("launch mode needs Node 22+ (global WebSocket) — pane is idle");
 			return;
 		}
 		this.launchingChromium = true;
@@ -886,9 +890,9 @@ export class Renderer {
 				}).status === 0,
 			);
 			if (!bin) {
-				this.banner =
-					"no Chromium found — set HERDR_BROWSER_CHROMIUM to a browser binary";
-				this.header();
+				this.holdBanner(
+					"no Chromium found — set HERDR_BROWSER_CHROMIUM to a browser binary",
+				);
 				return;
 			}
 			const profile = path.join(
@@ -928,8 +932,9 @@ export class Renderer {
 			try {
 				child = spawn(bin, args, { stdio: "ignore" });
 			} catch (err) {
-				this.banner = `cannot launch ${bin}: ${sanitizeText(err?.message ?? "spawn failed")}`;
-				this.header();
+				this.holdBanner(
+					`cannot launch ${bin}: ${sanitizeText(err?.message ?? "spawn failed")}`,
+				);
 				return;
 			}
 			child.once("error", (err) => {
@@ -942,33 +947,38 @@ export class Renderer {
 				} catch {
 					/* already dead */
 				}
-				this.banner = spawnFailed.err
-					? `cannot launch ${bin}: ${sanitizeText(spawnFailed.err.message ?? "spawn failed")}`
-					: `${bin} did not expose a DevTools port — is it Chromium-based?`;
-				this.header();
+				this.holdBanner(
+					spawnFailed.err
+						? `cannot launch ${bin}: ${sanitizeText(spawnFailed.err.message ?? "spawn failed")}`
+						: `${bin} did not expose a DevTools port — is it Chromium-based?`,
+				);
 				return;
 			}
 			this.launchedChild = child;
 			this.launchedEndpoint = `http://127.0.0.1:${port}`;
+			const ep = this.launchedEndpoint;
 			child.once("exit", () => {
 				if (this.launchedChild !== child) return;
 				this.launchedChild = null;
 				// A dead launched browser cannot be re-discovered — its port died
 				// with it. Retrying would dial a corpse every cooldown; say what
-				// actually helps instead. (Quit-path kills land here too, but the
-				// pane is tearing down then and nobody sees the banner.)
-				if (this.cdpEndpoint === this.launchedEndpoint) {
+				// actually helps instead. The launchedEndpoint comparison also
+				// catches a crash before the queued attach ran (cdpEndpoint not
+				// yet switched). Quit-path kills never get here: cleanup and
+				// attach-elsewhere clear launchedChild before the event fires.
+				if (this.cdpEndpoint === ep || this.launchedEndpoint === ep) {
 					this.attached = false;
 					this.streamCooldownUntil = Number.MAX_SAFE_INTEGER;
-					this.banner = "launched Chromium exited — press l to relaunch";
-					this.header();
+					this.holdBanner("launched Chromium exited — press l to relaunch");
 				}
 			});
-			this.userAction(() =>
-				this.attachTo(this.launchedEndpoint, {
-					note: "— launched Chromium —",
-				}),
-			);
+			this.userAction(() => {
+				// Died between the port read and this queued attach: dialing the
+				// corpse would re-arm the retry loop the exit handler just
+				// latched. Signal deaths leave exitCode null — check both.
+				if (child.exitCode !== null || child.signalCode !== null) return;
+				return this.attachTo(ep, { note: "— launched Chromium —" });
+			});
 		} finally {
 			this.launchingChromium = false;
 		}
@@ -980,7 +990,8 @@ export class Renderer {
 	async waitForDevToolsPort(portFile, child, spawnFailed = null, timeoutMs = 15_000) {
 		const until = Date.now() + timeoutMs;
 		while (Date.now() < until) {
-			if (child.exitCode !== null) return null; // died during startup
+			// Signal deaths leave exitCode null and set signalCode — check both.
+			if (child.exitCode !== null || child.signalCode !== null) return null;
 			if (spawnFailed?.err) return null; // binary missing/not executable
 			try {
 				const port = Number(
@@ -1457,6 +1468,9 @@ export class Renderer {
 			// waiting-for-session advice below would overwrite it mid-wait.
 			if (this.launchingChromium) return;
 			if (!(await this.browser.sessionExists())) {
+				// A held banner names a real failure (launch mode); repainting
+				// generic waiting advice over it would erase the explanation.
+				if (Date.now() < this.bannerHoldUntil) return;
 				// A missing binary is not 'session not started yet' — the waiting
 				// advice below can never fix it, so say what's actually wrong.
 				this.banner = this.agentBrowser
@@ -1671,6 +1685,14 @@ export class Renderer {
 		}
 		if (mouse.button !== 0 || !this.attached) return;
 		this.userAction(() => this.clickAt(mouse.col, mouse.row));
+	}
+
+	// A banner that names a real failure must outlive the next poll tick, or
+	// the generic waiting-for-session advice paints over it within a second.
+	holdBanner(text, ms = 30_000) {
+		this.banner = text;
+		this.bannerHoldUntil = Date.now() + ms;
+		this.header();
 	}
 
 	// Observe-only is a pane-side latch, deliberately not a backend call:

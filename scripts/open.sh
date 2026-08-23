@@ -6,35 +6,43 @@ set -uo pipefail
 cd "${HERDR_PLUGIN_ROOT:-$(dirname "$0")/..}" || exit 1
 . scripts/lib.sh
 
-require_agent_browser
 require_herdr
 
 url="${1:-${HERDR_PLUGIN_CLICKED_URL:-}}"
 session="$(session_name)"
 
-# Attach mode is decided from the same static sources the renderer reads, not
-# from a runtime marker: on the first click after configuring an endpoint no
-# pane has ever run, and taking the agent-browser path there would spawn
-# exactly the invisible session attach mode promises never to create.
-cdp_endpoint=""
-if [ -n "${HERDR_BROWSER_CDP_URL:-}" ]; then
-	cdp_endpoint="$HERDR_BROWSER_CDP_URL"
-elif [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ] && [ -f "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" ]; then
-	cdp_endpoint="$(head -n1 "${HERDR_PLUGIN_CONFIG_DIR}/cdp-url" | tr -d '[:space:][:cntrl:]')"
+# Backend arbitration from the same static sources the renderer reads, not a
+# runtime marker: on the first click after configuring an endpoint (or a
+# launch-first workspace) no pane has ever run, and taking the agent-browser
+# path there would spawn exactly the invisible session those modes promise
+# never to create. In both pane-owned modes agent-browser itself is not
+# required — the requirement lives on the branch that actually invokes it.
+pane_owns_navigation=0
+if cdp_endpoint_configured >/dev/null || launch_configured; then
+	pane_owns_navigation=1
 fi
 
-if [ -n "$url" ] && [ -n "$cdp_endpoint" ]; then
+# A workspace configured observe-only exists to watch a run untouched; a
+# link click must not navigate the observed session. (The runtime o toggle
+# is pane state — the pane drops its own handoffs itself.)
+if [ -n "$url" ] && observe_configured; then
+	echo "herdr-browser: observe-only workspace — not navigating (unset HERDR_BROWSER_OBSERVE / the observe config to navigate)" >&2
+	url=""
+fi
+
+if [ -n "$url" ] && [ "$pane_owns_navigation" -eq 1 ]; then
 	if ! validate_url "$url"; then
 		echo "herdr-browser: refusing URL (must start with http:// or https://, no credentials): $url" >&2
 		exit 2
 	fi
-	# Attach mode: hand the URL to the pane, which navigates the attached
+	# Hand the URL to the pane, which navigates its attached or launched
 	# target. The renderer watches this file, so pickup does not wait for a
 	# backed-off poll tick.
 	handoff="$(state_dir)/navigate-$(ws_id)"
 	umask 077
 	printf '%s\n' "$url" > "$handoff"
 elif [ -n "$url" ]; then
+	require_agent_browser
 	if ! validate_url "$url"; then
 		echo "herdr-browser: refusing URL (must start with http:// or https://, no credentials): $url" >&2
 		exit 2

@@ -2517,3 +2517,37 @@ test("a crashed launched Chromium banners l-to-relaunch instead of redialing a d
 		"no rediscovery loop against a port that died with the browser",
 	);
 });
+
+test("a launch-failure banner survives the next waiting-for-session tick", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer());
+	await r.launchChromium(); // no PATH candidates in the test env -> no Chromium
+	assert.match(r.banner, /no Chromium found/);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.tick();
+	assert.match(
+		r.banner,
+		/no Chromium found/,
+		"generic waiting advice must not paint over the failure explanation",
+	);
+});
+
+test("a crash before the queued attach still latches and never dials the corpse", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	let attachCalls = 0;
+	r.attachTo = async () => attachCalls++;
+	// Defer queued user actions so the crash lands between the port read and
+	// the attach, the exact window the exit-handler guard must cover.
+	const deferred = [];
+	r.userAction = (fn) => deferred.push(fn);
+	await r.launchChromium();
+	const child = r.launchedChild;
+	assert.ok(child, "launch reached the port read");
+	child.kill("SIGKILL");
+	for (let i = 0; i < 50 && r.launchedChild; i++)
+		await new Promise((res) => setTimeout(res, 100));
+	assert.match(r.banner, /press l to relaunch/);
+	assert.equal(r.streamCooldownUntil, Number.MAX_SAFE_INTEGER);
+	for (const fn of deferred) await fn();
+	assert.equal(attachCalls, 0, "the queued attach must notice the corpse");
+});

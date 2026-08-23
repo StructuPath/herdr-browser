@@ -585,7 +585,7 @@ test("record refuses in attach mode instead of recording an unrelated browser", 
 	const env = freshEnv({ HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222" });
 	const r = runScript("record.sh", ["start"], env);
 	assert.notEqual(r.status, 0);
-	assert.match(r.stderr, /attach mode/);
+	assert.match(r.stderr, /attach\/launch mode/);
 	// The config-file source must reach the same verdict as the env var.
 	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-rec-cfg-"));
 	fs.writeFileSync(path.join(cfg, "cdp-url"), "http://127.0.0.1:9222\n");
@@ -595,5 +595,59 @@ test("record refuses in attach mode instead of recording an unrelated browser", 
 		freshEnv({ HERDR_PLUGIN_CONFIG_DIR: cfg }),
 	);
 	assert.notEqual(r2.status, 0);
-	assert.match(r2.stderr, /attach mode/);
+	assert.match(r2.stderr, /attach\/launch mode/);
+	// Launch-first workspaces have no agent-browser session either.
+	const r3 = runScript(
+		"record.sh",
+		["start"],
+		freshEnv({ HERDR_BROWSER_LAUNCH: "1" }),
+	);
+	assert.notEqual(r3.status, 0);
+	assert.match(r3.stderr, /attach\/launch mode/);
+});
+
+test("open in a launch-first workspace hands the URL to the pane, never agent-browser", () => {
+	const r = runScript(
+		"open.sh",
+		["http://localhost:3000/app"],
+		freshEnv({ HERDR_BROWSER_LAUNCH: "1" }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.doesNotMatch(log(), /agent-browser --session/);
+	assert.equal(
+		fs.readFileSync(path.join(stateDir, "navigate-w9"), "utf8").trim(),
+		"http://localhost:3000/app",
+	);
+	fs.rmSync(path.join(stateDir, "navigate-w9"), { force: true });
+});
+
+test("open in attach/launch mode works without agent-browser installed", () => {
+	// Strip the agent-browser stub from PATH; herdr and core tools remain.
+	const noAb = fs.mkdtempSync(path.join(os.tmpdir(), "hb-noab-"));
+	for (const t of ["herdr"]) {
+		fs.copyFileSync(path.join(stubDir, t), path.join(noAb, t));
+		fs.chmodSync(path.join(noAb, t), 0o755);
+	}
+	const env = freshEnv({
+		HERDR_BROWSER_LAUNCH: "1",
+		PATH: `${noAb}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+		HERDR_BIN_PATH: path.join(noAb, "herdr"),
+	});
+	const r = runScript("open.sh", ["http://localhost:3000"], env);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /plugin pane open/);
+	fs.rmSync(path.join(stateDir, "navigate-w9"), { force: true });
+});
+
+test("open in an observe-only workspace refuses navigation but still opens the pane", () => {
+	const r = runScript(
+		"open.sh",
+		["http://localhost:3000"],
+		freshEnv({ HERDR_BROWSER_OBSERVE: "1" }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stderr, /observe-only workspace/);
+	assert.doesNotMatch(log(), /agent-browser --session .* open/);
+	assert.ok(!fs.existsSync(path.join(stateDir, "navigate-w9")));
+	assert.match(log(), /plugin pane open/);
 });

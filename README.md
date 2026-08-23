@@ -247,13 +247,16 @@ valid endpoint. While attached, the pane header shows the endpoint's
 `host:port` instead of a session name, `t` cycles between the browser's page
 targets when your automation has more than one tab open, and `o` toggles
 **observe-only**: every pane click, wheel event, keystroke, and navigation —
-including Cmd/Ctrl+click link handoffs — is dropped at the pane instead of
-forwarded, so watching a live run cannot blur the field your automation is
-typing into or dismiss the element it is waiting on. Observe-only is a
-pane-side latch; nothing about the observed browser changes when you toggle
-it, and it works in agent-browser mode too. Set `HERDR_BROWSER_OBSERVE=1`
-(or the `observe` config file) to start the pane that way for
-watch-the-agent workflows.
+including Cmd/Ctrl+click link handoffs in attach mode — is dropped at the
+pane instead of forwarded, so watching a live run cannot blur the field your
+automation is typing into or dismiss the element it is waiting on.
+Observe-only is a pane-side latch; nothing about the observed browser
+changes when you toggle it, and pane input is guarded in agent-browser mode
+too. One caveat for the runtime toggle: in agent-browser mode a Cmd+click
+navigates the session daemon directly, outside the pane. Set
+`HERDR_BROWSER_OBSERVE=1` (or the `observe` config file) for
+watch-the-agent workspaces — the pane starts observe-only *and* the open
+action itself refuses link navigation, closing that gap in both modes.
 
 Launcher recipes: Playwright `chromium.launch({args:['--remote-debugging-port=9222']})`,
 Puppeteer the same `args`, Browser Use its `chrome_remote_debugging_port` option.
@@ -293,8 +296,10 @@ port and attaches to it — no agent-browser, no configuration. This is the
 zero-setup path: open the pane, press `l`, press `u`, browse.
 
 The launcher looks for `HERDR_BROWSER_CHROMIUM` (or the `chromium` config
-file), then probes `chromium`, `chromium-browser`, `google-chrome`,
-`google-chrome-stable`, `chrome`, and the macOS Chrome/Chromium app bundles.
+file), then probes `google-chrome`, `google-chrome-stable`, `chromium`,
+`chromium-browser`, `chrome`, and the macOS Chrome/Chromium app bundles —
+`google-chrome` first because Ubuntu's `chromium` is often a snap wrapper
+whose confinement cannot use a profile outside `$HOME`.
 The browser starts headless with a fresh ephemeral DevTools port
 (`--remote-debugging-port=0`, read back from `DevToolsActivePort`) and a
 per-workspace profile under the plugin state directory, so cookies and

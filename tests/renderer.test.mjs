@@ -28,6 +28,7 @@ import {
 	diffNetworkFailures,
 	formatNetworkFailure,
 	findChromium,
+	truthyConfig,
 } from "../bin/renderer.mjs";
 
 const repoRoot = path.resolve(
@@ -2438,4 +2439,56 @@ test("launch mode: a bad binary path banners instead of crashing the pane", { sk
 	await r.launchChromium();
 	assert.match(r.banner, /cannot launch/);
 	assert.equal(r.launchedChild, null);
+});
+
+// --- Wave 6: config-first observe-only and launch ---
+
+test("truthyConfig accepts common spellings only", () => {
+	for (const v of ["1", "true", "YES", "on ", " True"]) assert.equal(truthyConfig(v), true, v);
+	for (const v of ["0", "false", "", undefined, null, "2", "enabled"]) assert.equal(truthyConfig(v), false, String(v));
+});
+
+test("HERDR_BROWSER_OBSERVE starts the pane observe-only; o still toggles", () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_OBSERVE: "1" }));
+	assert.equal(r.observeOnly, true);
+	r.attached = true;
+	let reloads = 0;
+	r.browser = { ...r.browser, reload: async () => reloads++ };
+	r.onKey("r");
+	assert.equal(reloads, 0, "input starts blocked");
+	r.onKey("o");
+	assert.equal(r.observeOnly, false);
+});
+
+test("observe config file is a valid source", () => {
+	const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "hb-cfg-obs-"));
+	fs.writeFileSync(path.join(cfg, "observe"), "true\n");
+	const r = mkRenderer({ HERDR_PLUGIN_CONFIG_DIR: cfg });
+	assert.equal(r.observeOnly, true);
+});
+
+test("launch-first workspace launches once from the first unattached tick", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(
+		mkRenderer({ HERDR_BROWSER_LAUNCH: "1", HERDR_BROWSER_CHROMIUM: bin }),
+	);
+	assert.equal(r.launchConfigured, true);
+	const attachedTo = [];
+	r.attachTo = async (ep) => attachedTo.push(ep);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.tick(); // triggers the launch instead of waiting for a session
+	assert.equal(r.launchAttempted, true);
+	for (let i = 0; i < 50 && !attachedTo.length; i++)
+		await new Promise((res) => setTimeout(res, 100));
+	assert.deepEqual(attachedTo, ["http://127.0.0.1:9876"]);
+	r.cleanup();
+});
+
+test("a configured cdp endpoint wins over launch-first", () => {
+	const r = mkRenderer({
+		HERDR_BROWSER_LAUNCH: "1",
+		HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222",
+	});
+	assert.equal(r.backend, "attach");
+	assert.equal(r.launchConfigured, false);
 });

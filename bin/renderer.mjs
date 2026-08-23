@@ -97,6 +97,11 @@ export function consoleTail(entries, n = 8) {
 	return entries.slice(-n).map((e) => e.text);
 }
 
+// Boolean knobs accept the common spellings; anything else is off.
+export function truthyConfig(value) {
+	return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
+}
+
 // Locate a launchable Chromium for launch mode (the l key). An explicit
 // choice (env, then config file) is trusted as-is — it may name a binary
 // that is not on PATH; probing covers the common names plus the macOS app
@@ -104,11 +109,15 @@ export function consoleTail(entries, n = 8) {
 export function findChromium(env, configDirValue, probe) {
 	const explicit = env.HERDR_BROWSER_CHROMIUM || configDirValue;
 	if (explicit) return explicit;
+	// google-chrome first: where it exists it is nearly always a real
+	// binary, while "chromium" on Ubuntu is often a snap wrapper whose
+	// confinement cannot read a profile directory outside $HOME — it then
+	// never writes DevToolsActivePort and the launch times out.
 	const candidates = [
-		"chromium",
-		"chromium-browser",
 		"google-chrome",
 		"google-chrome-stable",
+		"chromium",
+		"chromium-browser",
 		"chrome",
 		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		"/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -621,7 +630,17 @@ export class Renderer {
 		// Observe-only: pane input (clicks, wheel, navigation, typing) is
 		// dropped instead of forwarded, so watching a live automation run
 		// cannot blur the field it is typing into or dismiss what it awaits.
-		this.observeOnly = false;
+		// Configurable at start for watch-the-agent workflows; o still toggles.
+		this.observeOnly = truthyConfig(
+			env.HERDR_BROWSER_OBSERVE ?? this.configValue("observe"),
+		);
+		// Launch-first workspaces: the first unattached tick launches a local
+		// Chromium instead of waiting for an agent-browser session. One
+		// attempt — a failed launch banners and leaves the keys in charge.
+		this.launchConfigured =
+			!this.cdpEndpoint &&
+			truthyConfig(env.HERDR_BROWSER_LAUNCH ?? this.configValue("launch"));
+		this.launchAttempted = false;
 		this.promptState = null;
 		this.paintQueue = Promise.resolve();
 		this.paintErrors = 0;
@@ -880,9 +899,7 @@ export class Renderer {
 			} catch {
 				/* none */
 			}
-			const headed = /^(1|true|yes)$/i.test(
-				String(this.env.HERDR_BROWSER_LAUNCH_HEADED ?? ""),
-			);
+			const headed = truthyConfig(this.env.HERDR_BROWSER_LAUNCH_HEADED);
 			const args = [
 				"--remote-debugging-port=0",
 				`--user-data-dir=${profile}`,
@@ -1410,6 +1427,17 @@ export class Renderer {
 		// exists — created by an agent, a link click, or a URL-bearing open —
 		// only run the non-creating existence check and wait.
 		if (!this.attached) {
+			// A launch-first workspace starts its own browser instead of
+			// waiting. Once, from the tick so run()'s terminal setup is done;
+			// on failure the banner stands and the keys are back in charge.
+			if (this.launchConfigured && !this.launchAttempted) {
+				this.launchAttempted = true;
+				this.launchChromium();
+				return;
+			}
+			// An in-flight launch (config or the l key) owns the banner; the
+			// waiting-for-session advice below would overwrite it mid-wait.
+			if (this.launchingChromium) return;
 			if (!(await this.browser.sessionExists())) {
 				// A missing binary is not 'session not started yet' — the waiting
 				// advice below can never fix it, so say what's actually wrong.

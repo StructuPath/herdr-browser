@@ -1,5 +1,7 @@
 # herdr-browser
 
+[![CI](https://github.com/StructuPath/herdr-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/StructuPath/herdr-browser/actions/workflows/ci.yml)
+
 A drivable browser pane for [Herdr](https://herdr.dev), built around
 [agent-browser](https://github.com/vercel-labs/agent-browser).
 
@@ -249,7 +251,9 @@ including Cmd/Ctrl+click link handoffs — is dropped at the pane instead of
 forwarded, so watching a live run cannot blur the field your automation is
 typing into or dismiss the element it is waiting on. Observe-only is a
 pane-side latch; nothing about the observed browser changes when you toggle
-it, and it works in agent-browser mode too.
+it, and it works in agent-browser mode too. Set `HERDR_BROWSER_OBSERVE=1`
+(or the `observe` config file) to start the pane that way for
+watch-the-agent workflows.
 
 Launcher recipes: Playwright `chromium.launch({args:['--remote-debugging-port=9222']})`,
 Puppeteer the same `args`, Browser Use its `chrome_remote_debugging_port` option.
@@ -302,6 +306,12 @@ Unlike plain attach mode, the pane owns what it launches: quitting the pane
 than leaking a headless Chrome. Every attach-mode guarantee about the
 *endpoint* still holds: the DevTools port binds to loopback, and the
 capability token is never displayed.
+
+For a workspace that should always work this way, set
+`HERDR_BROWSER_LAUNCH=1` (or write `1` to the `launch` config file): the
+pane launches its Chromium on open, no keypress needed. A configured
+`cdp-url` endpoint still wins, and the launch is attempted once — if it
+fails, the banner says why and the keys take over.
 
 ## Session model
 
@@ -381,6 +391,8 @@ Plugin config files contain one value on their first line:
 | `render` | `kitty`, `symbols`, `text` | Automatic probe | Force a rendering mode |
 | `cdp-url` | `http://host:port` or `ws://…` | None | Attach to this CDP endpoint at startup |
 | `chromium` | Path to a browser binary | Probed | Browser used by launch mode (`l`) |
+| `launch` | `1`/`true`/`yes`/`on` | Off | Launch a Chromium on open instead of waiting for a session |
+| `observe` | `1`/`true`/`yes`/`on` | Off | Start observe-only; `o` still toggles |
 
 Equivalent environment controls:
 
@@ -392,6 +404,8 @@ Equivalent environment controls:
 | `HERDR_BROWSER_CDP_URL` | None | Attach to this CDP endpoint at startup |
 | `HERDR_BROWSER_CHROMIUM` | Probed | Browser binary used by launch mode |
 | `HERDR_BROWSER_LAUNCH_HEADED` | Unset | `1` launches a visible window instead of headless |
+| `HERDR_BROWSER_LAUNCH` | Unset | `1` launches a Chromium on open instead of waiting for a session |
+| `HERDR_BROWSER_OBSERVE` | Unset | `1` starts the pane observe-only |
 | `HERDR_BROWSER_INTERVAL_MS` | `1000` | Polling interval; clamped to safe bounds |
 | `AGENT_BROWSER_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for plugin-created browser daemons |
 

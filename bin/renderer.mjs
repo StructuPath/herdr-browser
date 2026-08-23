@@ -814,7 +814,7 @@ export class Renderer {
 	// Switch this pane to attach mode at runtime. Everything the old backend
 	// reconciled against is meaningless afterwards, so state resets and the
 	// console carries one discontinuity line.
-	async attachTo(value) {
+	async attachTo(value, { note } = {}) {
 		const endpoint = String(value ?? "").trim();
 		if (!/^(wss?|https?):\/\//i.test(endpoint)) {
 			this.banner =
@@ -844,7 +844,10 @@ export class Renderer {
 		this.attached = false;
 		this.cdpGuid = null;
 		this.resetBackendState();
-		this.pushConsole([{ text: "— switched to attach mode —", type: "log" }], false);
+		this.pushConsole(
+			[{ text: note ?? "— switched to attach mode —", type: "log" }],
+			false,
+		);
 		this.streamCooldownUntil = 0;
 		await this.tick();
 	}
@@ -950,7 +953,11 @@ export class Renderer {
 			child.once("exit", () => {
 				if (this.launchedChild === child) this.launchedChild = null;
 			});
-			this.userAction(() => this.attachTo(this.launchedEndpoint));
+			this.userAction(() =>
+				this.attachTo(this.launchedEndpoint, {
+					note: "— launched Chromium —",
+				}),
+			);
 		} finally {
 			this.launchingChromium = false;
 		}

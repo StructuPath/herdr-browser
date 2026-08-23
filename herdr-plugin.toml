@@ -2,7 +2,7 @@ id = "structupath.browser"
 name = "Browser"
 version = "0.7.0"
 min_herdr_version = "0.7.0"
-description = "Driveable browser pane: live screenshots, console output, and localhost link handling via agent-browser"
+description = "Driveable browser pane: live screenshots, console output, localhost links; drives agent-browser sessions, attaches to any CDP browser, or launches its own Chromium"
 platforms = ["macos", "linux"]
 
 [[actions]]

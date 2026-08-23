@@ -422,6 +422,9 @@ Environment variables take precedence over config files.
 - WebM recordings are intentionally retained under the plugin state directory.
 - Browser sessions are a trusted local boundary: any local process that knows a
   session name can drive it, including authenticated pages.
+- The `chromium`/`cdp-url` configuration files and their environment
+  equivalents are trusted local configuration: whoever can write them chooses
+  which binary launch mode executes and which endpoint the pane dials.
 
 If an agent browses sensitive or authenticated content, that content is visible
 in the pane and briefly present in its cached frame. Treat screen sharing and

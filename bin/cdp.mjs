@@ -316,7 +316,17 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		} catch {
 			/* older engines: page-level feed only */
 		}
-		await startScreencast();
+		try {
+			await startScreencast();
+		} catch (err) {
+			// Firefox's CDP subset has no Page.startScreencast: name the reason
+			// instead of surfacing a raw protocol error nobody can act on.
+			if (/wasn't found|not found|not supported|unknown method/i.test(err?.message ?? ""))
+				throw new Error(
+					"browser has no CDP screencast (Firefox?) — attach needs a Chromium-based browser",
+				);
+			throw err;
+		}
 	};
 
 	const onCdpEvent = (m) => {

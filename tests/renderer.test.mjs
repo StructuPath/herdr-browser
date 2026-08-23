@@ -2371,7 +2371,17 @@ exec sleep 30
 	return bin;
 };
 
-test("launch mode: l spawns the configured chromium, waits for the port, attaches, owns the child", async () => {
+// launchChromium refuses on Node < 22 before doing anything else, so the
+// behavioral tests below only make sense where attach itself is possible.
+const canCdp = typeof WebSocket === "function";
+
+test("launch mode: refuses on Node without a WebSocket client", { skip: canCdp }, async () => {
+	const r = quiet(mkRenderer());
+	await r.launchChromium();
+	assert.match(r.banner, /needs Node 22/);
+});
+
+test("launch mode: l spawns the configured chromium, waits for the port, attaches, owns the child", { skip: !canCdp }, async () => {
 	const bin = fakeChromiumScript();
 	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
 	const attachedTo = [];
@@ -2406,7 +2416,7 @@ test("launch mode: attaching to a different endpoint kills the launched browser"
 	void child;
 });
 
-test("launch mode: no chromium found reports instead of failing silently", async () => {
+test("launch mode: no chromium found reports instead of failing silently", { skip: !canCdp }, async () => {
 	const r = quiet(mkRenderer({ PATH: "/nonexistent" }));
 	// Probe uses the real PATH via sh; force emptiness through env PATH.
 	r.env.PATH = "/nonexistent";

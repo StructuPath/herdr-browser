@@ -844,6 +844,15 @@ export class Renderer {
 			if (this.launchedEndpoint) this.userAction(() => this.attachTo(this.launchedEndpoint));
 			return;
 		}
+		// Refuse before spawning: attaching to the result needs the Node 22
+		// WebSocket client, and a browser we can never attach to would just
+		// idle until quit.
+		if (!cdpSupported()) {
+			this.banner =
+				"launch mode needs Node 22+ (global WebSocket) — pane is idle";
+			this.header();
+			return;
+		}
 		this.launchingChromium = true;
 		try {
 			// Probe with the renderer's own env so the pane and the launched

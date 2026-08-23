@@ -140,6 +140,8 @@ Use these controls to drive the shared session directly:
 | --- | --- |
 | `u` | Open the address prompt; `https://` is assumed when omitted |
 | `a` | Attach to a CDP endpoint (`http://host:port` or `ws://…`) |
+| `t` | Attach mode: cycle the pane between the browser's page targets (tabs) |
+| `o` | Toggle observe-only: pane input is dropped instead of forwarded |
 | Click the screenshot | Send real Chrome mouse move/down/up events at that page coordinate |
 | `i` | Type into the currently focused page element |
 | `b` / `f` | Navigate backward / forward |
@@ -212,10 +214,7 @@ seconds without a status). Only xhr, fetch, and document requests are watched �
 images, stylesheets, and held-open streams (SSE, WebSocket) stay out. Failures
 from before the pane attached are intentionally not replayed, a repeating
 identical failure paints once and stays collapsed until it has been quiet for
-60 seconds, and on very long
-from before the pane attached are intentionally not replayed, repeated
-identical failures are collapsed within a 60-second window, and on very long
-sessions the feed turns itself off with a one-time note once the daemon's
+60 seconds, and on very long sessions the feed turns itself off with a one-time note once the daemon's
 request log outgrows the pane's read buffer.
 
 ## Attach to any CDP browser
@@ -236,7 +235,15 @@ printf 'http://127.0.0.1:9222\n' > "$(herdr plugin config-dir structupath.browse
 
 Press `a` in the pane to attach at runtime. `u` still means "navigate" — the
 keys are separate because `localhost:9222` is a valid destination as well as a
-valid endpoint.
+valid endpoint. While attached, the pane header shows the endpoint's
+`host:port` instead of a session name, `t` cycles between the browser's page
+targets when your automation has more than one tab open, and `o` toggles
+**observe-only**: every pane click, wheel event, keystroke, and navigation —
+including Cmd/Ctrl+click link handoffs — is dropped at the pane instead of
+forwarded, so watching a live run cannot blur the field your automation is
+typing into or dismiss the element it is waiting on. Observe-only is a
+pane-side latch; nothing about the observed browser changes when you toggle
+it, and it works in agent-browser mode too.
 
 Launcher recipes: Playwright `chromium.launch({args:['--remote-debugging-port=9222']})`,
 Puppeteer the same `args`, Browser Use its `chrome_remote_debugging_port` option.

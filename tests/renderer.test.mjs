@@ -27,6 +27,7 @@ import {
 	newNetworkState,
 	diffNetworkFailures,
 	formatNetworkFailure,
+	findChromium,
 } from "../bin/renderer.mjs";
 
 const repoRoot = path.resolve(
@@ -2337,4 +2338,86 @@ test("observe-only: t (view-only) and q remain available; header shows the state
 	r.onKey("t");
 	await flush();
 	assert.equal(cycles, 1, "cycling the pane's own view stays allowed");
+});
+
+// --- Wave 5: Chromium launch mode ---
+
+test("findChromium: explicit env wins, then config, then first probed candidate", () => {
+	assert.equal(
+		findChromium({ HERDR_BROWSER_CHROMIUM: "/opt/my-chrome" }, "cfg", () => true),
+		"/opt/my-chrome",
+	);
+	assert.equal(findChromium({}, "/cfg/chrome", () => true), "/cfg/chrome");
+	assert.equal(
+		findChromium({}, undefined, (c) => c === "google-chrome"),
+		"google-chrome",
+	);
+	assert.equal(findChromium({}, undefined, () => false), null);
+});
+
+const fakeChromiumScript = () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-"));
+	const bin = path.join(dir, "fake-chromium");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+d=""
+for a in "$@"; do case "$a" in --user-data-dir=*) d="\${a#--user-data-dir=}";; esac; done
+printf '9876\\n/devtools/browser/fake-guid\\n' > "$d/DevToolsActivePort"
+exec sleep 30
+`,
+		{ mode: 0o755 },
+	);
+	return bin;
+};
+
+test("launch mode: l spawns the configured chromium, waits for the port, attaches, owns the child", async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	const attachedTo = [];
+	r.attachTo = async (ep) => attachedTo.push(ep);
+	r.attached = false;
+	r.onKey("l"); // reachable while unattached
+	// The port wait polls every 200ms; give the fake time to write the file.
+	for (let i = 0; i < 50 && !attachedTo.length; i++)
+		await new Promise((res) => setTimeout(res, 100));
+	assert.deepEqual(attachedTo, ["http://127.0.0.1:9876"]);
+	assert.ok(r.launchedChild, "the pane records the child it owns");
+	const pid = r.launchedChild.pid;
+	r.cleanup();
+	assert.equal(r.launchedChild, null);
+	await new Promise((res) => setTimeout(res, 300));
+	assert.throws(
+		() => process.kill(pid, 0),
+		"quit must kill the browser the pane launched",
+	);
+});
+
+test("launch mode: attaching to a different endpoint kills the launched browser", async () => {
+	const r = quiet(mkRenderer());
+	const child = spawnSync("sh", ["-c", "echo"], {}); // placeholder shape
+	let killed = 0;
+	r.launchedChild = { kill: () => killed++, exitCode: null };
+	r.launchedEndpoint = "http://127.0.0.1:9876";
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9333");
+	assert.equal(killed, 1, "abandoning a launched browser must not leak it");
+	assert.equal(r.launchedChild, null);
+	void child;
+});
+
+test("launch mode: no chromium found reports instead of failing silently", async () => {
+	const r = quiet(mkRenderer({ PATH: "/nonexistent" }));
+	// Probe uses the real PATH via sh; force emptiness through env PATH.
+	r.env.PATH = "/nonexistent";
+	await r.launchChromium();
+	assert.match(r.banner, /no Chromium found/);
+});
+
+test("a opens the attach prompt while unattached", () => {
+	const r = quiet(mkRenderer());
+	r.attached = false;
+	r.onKey("a");
+	assert.ok(r.promptState, "attach prompt must be reachable with no session");
+	assert.match(r.promptState.label, /attach/);
 });

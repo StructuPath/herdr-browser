@@ -2,7 +2,7 @@
 // herdr-browser pane renderer: an attached view of an agent-browser session.
 // It stays passive until explicit pane input, never clears the console buffer,
 // and closes only sessions that its own successful navigation created.
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -95,6 +95,26 @@ export function reconcileConsole(prev, entries, ringSize = 1000) {
 
 export function consoleTail(entries, n = 8) {
 	return entries.slice(-n).map((e) => e.text);
+}
+
+// Locate a launchable Chromium for launch mode (the l key). An explicit
+// choice (env, then config file) is trusted as-is — it may name a binary
+// that is not on PATH; probing covers the common names plus the macOS app
+// bundles that never appear on PATH.
+export function findChromium(env, configDirValue, probe) {
+	const explicit = env.HERDR_BROWSER_CHROMIUM || configDirValue;
+	if (explicit) return explicit;
+	const candidates = [
+		"chromium",
+		"chromium-browser",
+		"google-chrome",
+		"google-chrome-stable",
+		"chrome",
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+	];
+	for (const c of candidates) if (probe(c)) return c;
+	return null;
 }
 
 // Render-mode precedence: explicit config > kitty probe > symbols > text.
@@ -640,6 +660,12 @@ export class Renderer {
 		this.lastFrameAt = 0;
 		this.staleHandled = false;
 		this.loopbackWarned = false;
+		// Launch mode (see launchChromium): the one browser the pane owns the
+		// lifecycle of, because it spawned it. Quit must kill it — a leaked
+		// headless Chrome has no other owner to collect it.
+		this.launchedChild = null;
+		this.launchedEndpoint = null;
+		this.launchingChromium = false;
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
 		this.lastImageDims = null;
 		this.lastViewportRequest = "";
@@ -778,6 +804,17 @@ export class Renderer {
 			return;
 		}
 		if (this.backend === "agent-browser" && this.live) this.dropLive();
+		// Pointing the pane away from a browser it launched abandons it; kill
+		// it now rather than leak a headless Chrome with no remaining owner.
+		if (this.launchedChild && endpoint !== this.launchedEndpoint) {
+			try {
+				this.launchedChild.kill();
+			} catch {
+				/* already gone */
+			}
+			this.launchedChild = null;
+			this.launchedEndpoint = null;
+		}
 		this.stopNetworkTimer();
 		this.cdpEndpoint = endpoint;
 		this.backend = "attach";
@@ -791,6 +828,114 @@ export class Renderer {
 		this.pushConsole([{ text: "— switched to attach mode —", type: "log" }], false);
 		this.streamCooldownUntil = 0;
 		await this.tick();
+	}
+
+	// Launch mode: start a local Chromium with a loopback DevTools port and
+	// attach to it through the normal attach path. Unlike plain attach, the
+	// pane owns this browser's lifecycle — it spawned it — so quit (or
+	// attaching elsewhere) kills it instead of leaking a headless Chrome.
+	// Port 0 + DevToolsActivePort avoids picking a port and racing for it:
+	// Chrome binds an ephemeral port and writes it to the profile root.
+	async launchChromium() {
+		if (this.launchingChromium) return;
+		if (this.launchedChild && this.launchedChild.exitCode === null) {
+			// Still running (the pane may have attached elsewhere meanwhile in
+			// a way that kept it): just point back at it.
+			if (this.launchedEndpoint) this.userAction(() => this.attachTo(this.launchedEndpoint));
+			return;
+		}
+		this.launchingChromium = true;
+		try {
+			// Probe with the renderer's own env so the pane and the launched
+			// child resolve binaries from the same PATH.
+			const bin = findChromium(this.env, this.configValue("chromium"), (c) =>
+				spawnSync("sh", ["-c", 'command -v -- "$1"', "sh", c], {
+					timeout: 5000,
+					env: this.env,
+				}).status === 0,
+			);
+			if (!bin) {
+				this.banner =
+					"no Chromium found — set HERDR_BROWSER_CHROMIUM to a browser binary";
+				this.header();
+				return;
+			}
+			const profile = path.join(
+				this.stateDir,
+				`chromium-profile-${safeWsId(this.env.HERDR_WORKSPACE_ID)}`,
+			);
+			fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
+			const portFile = path.join(profile, "DevToolsActivePort");
+			try {
+				fs.unlinkSync(portFile); // a stale port must never win the wait below
+			} catch {
+				/* none */
+			}
+			const headed = /^(1|true|yes)$/i.test(
+				String(this.env.HERDR_BROWSER_LAUNCH_HEADED ?? ""),
+			);
+			const args = [
+				"--remote-debugging-port=0",
+				`--user-data-dir=${profile}`,
+				"--no-first-run",
+				"--no-default-browser-check",
+				"--disable-background-networking",
+				...(headed ? [] : ["--headless=new"]),
+				// Chrome refuses to start as root without this; root (containers,
+				// CI) already has no user boundary for the sandbox to defend.
+				...(process.getuid?.() === 0 ? ["--no-sandbox"] : []),
+				"about:blank",
+			];
+			this.banner = "launching Chromium…";
+			this.header();
+			let child;
+			try {
+				child = spawn(bin, args, { stdio: "ignore" });
+			} catch (err) {
+				this.banner = `cannot launch ${bin}: ${sanitizeText(err?.message ?? "spawn failed")}`;
+				this.header();
+				return;
+			}
+			const port = await this.waitForDevToolsPort(portFile, child);
+			if (!port) {
+				try {
+					child.kill();
+				} catch {
+					/* already dead */
+				}
+				this.banner = `${bin} did not expose a DevTools port — is it Chromium-based?`;
+				this.header();
+				return;
+			}
+			this.launchedChild = child;
+			this.launchedEndpoint = `http://127.0.0.1:${port}`;
+			child.once("exit", () => {
+				if (this.launchedChild === child) this.launchedChild = null;
+			});
+			this.userAction(() => this.attachTo(this.launchedEndpoint));
+		} finally {
+			this.launchingChromium = false;
+		}
+	}
+
+	// DevToolsActivePort appears in the profile root once the port is bound:
+	// line 1 is the port, line 2 the browser target path (a capability token
+	// we deliberately do not read — discovery re-derives it).
+	async waitForDevToolsPort(portFile, child, timeoutMs = 15_000) {
+		const until = Date.now() + timeoutMs;
+		while (Date.now() < until) {
+			if (child.exitCode !== null) return null; // died during startup
+			try {
+				const port = Number(
+					fs.readFileSync(portFile, "utf8").split("\n")[0].trim(),
+				);
+				if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
+			} catch {
+				/* not written yet */
+			}
+			await new Promise((r) => setTimeout(r, 200));
+		}
+		return null;
 	}
 
 	// Attach: connect, wire the event bridge, and take the R9 baseline. All
@@ -1083,7 +1228,7 @@ export class Renderer {
 				? " observe-only: input is not forwarded  o:enable-input  q:quit"
 				: this.backend === "attach"
 					? " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  t:target  o:observe  q:quit"
-					: " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  o:observe  q:quit";
+					: " u:url  click:page  i:type  b/f:back-fwd  r:reload  j/k:scroll  l:launch  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
 			);
@@ -1248,7 +1393,7 @@ export class Renderer {
 				// advice below can never fix it, so say what's actually wrong.
 				this.banner = this.agentBrowser
 					? `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`
-					: "agent-browser is not installed — npm install -g agent-browser && agent-browser install";
+					: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
 				this.header();
 				return;
 			}
@@ -1496,7 +1641,9 @@ export class Renderer {
 			this.noteObserveBlocked();
 			return;
 		}
-		if (!this.attached && !["u", "q", "\x03"].includes(ch)) return;
+		// a and l must stay reachable while unattached — no session yet and a
+		// dead endpoint are exactly when attaching or launching is the answer.
+		if (!this.attached && !["u", "a", "l", "q", "\x03"].includes(ch)) return;
 		switch (ch) {
 			case "u":
 				this.openPrompt("URL: ", (v) => this.navigate(v));
@@ -1506,6 +1653,11 @@ export class Renderer {
 			// heuristic that guesses wrong on exactly the common case.
 			case "a":
 				this.openPrompt("attach to endpoint: ", (v) => this.attachTo(v));
+				break;
+			// Deliberately unqueued: the DevTools-port wait can take seconds and
+			// must not stall the paint queue; only the final attach is enqueued.
+			case "l":
+				this.launchChromium();
 				break;
 			// Cycle the pinned page target (attach mode, R6). View-only motion:
 			// it moves the pane's screencast, never focus or page state, so it
@@ -1879,6 +2031,16 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
+		if (this.launchedChild) {
+			// The pane spawned this browser; quitting must not leak it. SIGTERM
+			// lets Chrome flush its profile — its own exit handles the rest.
+			try {
+				this.launchedChild.kill();
+			} catch {
+				/* already gone */
+			}
+			this.launchedChild = null;
+		}
 		if (this.backend === "attach") {
 			// Stop our screencast and drop the socket. Never a target close,
 			// never an agent-browser subprocess — we did not create any of this.

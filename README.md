@@ -19,6 +19,10 @@ Conductor).
 - **Shared agent sessions** — one isolated browser session per Herdr workspace.
 - **Attach to any CDP browser** — observe a Playwright, Puppeteer, or Browser Use
   run (or any Chrome started with `--remote-debugging-port`) without owning it.
+- **Zero-setup launch** — press `l` and the pane launches a local Chromium of
+  its own and attaches to it; no agent-browser install required.
+- **Observe-only mode** — press `o` and pane input stops being forwarded, so
+  watching a live automation run can never perturb it.
 - **Live push streaming** — frames, URL/title changes, console messages, and
   page errors arrive over WebSocket, with transparent polling fallback.
 - **Failed network requests** — 4xx/5xx and no-response xhr/fetch/document
@@ -40,7 +44,8 @@ Conductor).
 | --- | --- | --- |
 | Herdr | `>= 0.7.0` | Tested with Herdr 0.7.4 |
 | Node.js | `>= 20` | Node 22+ enables live WebSocket streaming and CDP attach mode |
-| agent-browser | Required | Tested with agent-browser 0.33.x; failed-request reporting needs the `network requests` command |
+| agent-browser | Optional | Required for shared agent sessions; tested with agent-browser 0.33.x; failed-request reporting needs the `network requests` command |
+| Chromium/Chrome | Optional | Any Chromium-based browser enables launch mode (`l`) and attach mode |
 | chafa | Optional | ANSI rendering and streamed JPEGs in Kitty mode |
 | carbonyl | Optional | Only required for the separate interactive Browse action |
 
@@ -140,6 +145,7 @@ Use these controls to drive the shared session directly:
 | --- | --- |
 | `u` | Open the address prompt; `https://` is assumed when omitted |
 | `a` | Attach to a CDP endpoint (`http://host:port` or `ws://…`) |
+| `l` | Launch a local Chromium the pane owns and attach to it |
 | `t` | Attach mode: cycle the pane between the browser's page targets (tabs) |
 | `o` | Toggle observe-only: pane input is dropped instead of forwarded |
 | Click the screenshot | Send real Chrome mouse move/down/up events at that page coordinate |
@@ -276,6 +282,27 @@ report it the way the agent-browser polling feed's timeout heuristic does.
 Attach mode needs Node 22 or newer (for the built-in WebSocket client); the pane
 says so plainly on older Node and keeps working in agent-browser mode.
 
+## Launch a browser from the pane
+
+Press `l` and the pane launches a local Chromium with a loopback DevTools
+port and attaches to it — no agent-browser, no configuration. This is the
+zero-setup path: open the pane, press `l`, press `u`, browse.
+
+The launcher looks for `HERDR_BROWSER_CHROMIUM` (or the `chromium` config
+file), then probes `chromium`, `chromium-browser`, `google-chrome`,
+`google-chrome-stable`, `chrome`, and the macOS Chrome/Chromium app bundles.
+The browser starts headless with a fresh ephemeral DevTools port
+(`--remote-debugging-port=0`, read back from `DevToolsActivePort`) and a
+per-workspace profile under the plugin state directory, so cookies and
+localStorage survive relaunches. Set `HERDR_BROWSER_LAUNCH_HEADED=1` to get
+a visible browser window instead.
+
+Unlike plain attach mode, the pane owns what it launches: quitting the pane
+— or attaching to a different endpoint — kills the launched browser rather
+than leaking a headless Chrome. Every attach-mode guarantee about the
+*endpoint* still holds: the DevTools port binds to loopback, and the
+capability token is never displayed.
+
 ## Session model
 
 By default, each Herdr workspace uses:
@@ -347,6 +374,8 @@ Plugin config files contain one value on their first line:
 | `session` | Session name | `herdr-ws-<workspace-id>` | Watch a different agent-browser session |
 | `run-id` | Valid run ID | Generated | Correlate a recording bundle with an external run |
 | `render` | `kitty`, `symbols`, `text` | Automatic probe | Force a rendering mode |
+| `cdp-url` | `http://host:port` or `ws://…` | None | Attach to this CDP endpoint at startup |
+| `chromium` | Path to a browser binary | Probed | Browser used by launch mode (`l`) |
 
 Equivalent environment controls:
 
@@ -355,6 +384,9 @@ Equivalent environment controls:
 | `HERDR_BROWSER_SESSION` | Workspace session | Override the watched session |
 | `HERDR_BROWSER_RUN_ID` | Config or generated ID | Select the recording run ID |
 | `HERDR_BROWSER_RENDER` | Automatic probe | Override the rendering mode |
+| `HERDR_BROWSER_CDP_URL` | None | Attach to this CDP endpoint at startup |
+| `HERDR_BROWSER_CHROMIUM` | Probed | Browser binary used by launch mode |
+| `HERDR_BROWSER_LAUNCH_HEADED` | Unset | `1` launches a visible window instead of headless |
 | `HERDR_BROWSER_INTERVAL_MS` | `1000` | Polling interval; clamped to safe bounds |
 | `AGENT_BROWSER_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for plugin-created browser daemons |
 

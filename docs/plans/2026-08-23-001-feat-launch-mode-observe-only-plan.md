@@ -64,6 +64,13 @@ zero pre-existing engines.
 
 ## Also fixed en route
 
+- Config-first knobs landed with the wave: `HERDR_BROWSER_OBSERVE`/`observe`
+  starts the pane observe-only, `HERDR_BROWSER_LAUNCH`/`launch` launches on
+  the first unattached tick (a configured `cdp-url` still wins). CI evidence
+  reordered the probe list — Ubuntu's `chromium` is often a snap wrapper
+  that cannot read a profile outside `$HOME`, so `google-chrome` is tried
+  first. A crashed launched browser banners "press l to relaunch" instead
+  of redialing its dead port.
 - The 294cade merge kept both sides of the 34d1559 fix in `navigate()`
   (baseline flag cleared immediately) and both drafts of the README's
   failure-feed paragraph; both restored to the fixed versions.

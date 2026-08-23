@@ -2492,3 +2492,28 @@ test("a configured cdp endpoint wins over launch-first", () => {
 	assert.equal(r.backend, "attach");
 	assert.equal(r.launchConfigured, false);
 });
+
+test("a crashed launched Chromium banners l-to-relaunch instead of redialing a dead port", { skip: !canCdp }, async () => {
+	const bin = fakeChromiumScript();
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	r.attachTo = async (ep) => {
+		r.cdpEndpoint = ep; // what the real attachTo records
+		r.attached = true;
+	};
+	await r.launchChromium();
+	for (let i = 0; i < 50 && !r.attached; i++)
+		await new Promise((res) => setTimeout(res, 100));
+	const child = r.launchedChild;
+	assert.ok(child);
+	child.kill("SIGKILL"); // crash, not a pane-initiated quit
+	for (let i = 0; i < 50 && r.launchedChild; i++)
+		await new Promise((res) => setTimeout(res, 100));
+	assert.equal(r.launchedChild, null);
+	assert.equal(r.attached, false);
+	assert.match(r.banner, /press l to relaunch/);
+	assert.equal(
+		r.streamCooldownUntil,
+		Number.MAX_SAFE_INTEGER,
+		"no rediscovery loop against a port that died with the browser",
+	);
+});

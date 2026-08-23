@@ -951,7 +951,18 @@ export class Renderer {
 			this.launchedChild = child;
 			this.launchedEndpoint = `http://127.0.0.1:${port}`;
 			child.once("exit", () => {
-				if (this.launchedChild === child) this.launchedChild = null;
+				if (this.launchedChild !== child) return;
+				this.launchedChild = null;
+				// A dead launched browser cannot be re-discovered — its port died
+				// with it. Retrying would dial a corpse every cooldown; say what
+				// actually helps instead. (Quit-path kills land here too, but the
+				// pane is tearing down then and nobody sees the banner.)
+				if (this.cdpEndpoint === this.launchedEndpoint) {
+					this.attached = false;
+					this.streamCooldownUntil = Number.MAX_SAFE_INTEGER;
+					this.banner = "launched Chromium exited — press l to relaunch";
+					this.header();
+				}
 			});
 			this.userAction(() =>
 				this.attachTo(this.launchedEndpoint, {

@@ -60,6 +60,10 @@ const mkRenderer = (over = {}) =>
 		HERDR_BROWSER_SESSION: "hb-test",
 		HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "hb-r-")),
 		HOME: os.homedir(),
+		// Dead by default: with PATH unset entirely, sh falls back to the
+		// system default path and the launch-mode probe can find and start a
+		// REAL browser on CI runners — whose open handles then hang the run.
+		PATH: "/nonexistent",
 		...over,
 	});
 // Silence painting; keep state transitions observable.
@@ -2519,8 +2523,10 @@ test("a crashed launched Chromium banners l-to-relaunch instead of redialing a d
 });
 
 test("a launch-failure banner survives the next waiting-for-session tick", { skip: !canCdp }, async () => {
-	const r = quiet(mkRenderer());
-	await r.launchChromium(); // no PATH candidates in the test env -> no Chromium
+	// PATH must be explicitly dead: with no PATH at all, sh falls back to the
+	// system default path and can find a real browser on CI runners.
+	const r = quiet(mkRenderer({ PATH: "/nonexistent" }));
+	await r.launchChromium();
 	assert.match(r.banner, /no Chromium found/);
 	r.browser = { ...r.browser, sessionExists: async () => false };
 	await r.tick();

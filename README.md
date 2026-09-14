@@ -49,7 +49,7 @@ guides to this plugin and its three siblings (Guard, Swarm, Conductor).
 | --- | --- | --- |
 | Herdr | `>= 0.7.0` | Tested with Herdr 0.7.4 |
 | Node.js | `>= 20` | Node 22+ enables live WebSocket streaming, CDP attach mode, and launch mode |
-| agent-browser | Optional | Required for shared agent sessions; tested with agent-browser 0.33.x; failed-request reporting needs the `network requests` command |
+| agent-browser | Optional | Required for shared agent sessions, recording, and saved QA scenarios; QA requires 0.33.0+; tested with 0.33.x |
 | Chromium/Chrome | Optional | Any Chromium-based browser enables launch mode (`l`) and attach mode |
 | chafa | Optional | ANSI rendering and streamed JPEGs in Kitty mode |
 | carbonyl | Optional | Only required for the separate interactive Browse action |
@@ -466,8 +466,9 @@ needed.
 
 ## Development
 
-Use Node 22+ for full browser support (Node 20 supports polling only), Python
-3.11+ for manifest validation, and ShellCheck for launcher validation. The
+Use Node 22+ for the pane's full streaming, CDP attach, and launch support.
+Node 20 supports pane polling and the standalone saved QA runner. Use Python
+3.11+ for manifest validation and ShellCheck for launcher validation. The
 plugin runs its source directly; there is no bundled browser or compilation
 step.
 

@@ -28,7 +28,20 @@ test("e2e: saved QA runs desktop/mobile assertions and records real browser fail
 <p id="size"></p><script>
 document.querySelector('#size').textContent=innerWidth < 600 ? 'mobile' : 'desktop';
 document.querySelector('#submit').onclick=()=>document.querySelector('#result').textContent='Hello '+document.querySelector('#name').value;
-${req.url === "/broken" ? "console.error('fixture console error'); setTimeout(()=>{throw new Error('fixture page error')},0); fetch('/failure').then(()=>document.querySelector('#result').textContent='failure observed');" : ""}
+${req.url === "/broken" ? `
+let failureSignals = 0;
+const markFailure = () => {
+  if (++failureSignals !== 2) return;
+  const done = document.createElement('p');
+  done.id = 'failure-observed';
+  done.textContent = 'failure observed';
+  document.body.append(done);
+};
+window.addEventListener('error', markFailure, { once: true });
+console.error('fixture console error');
+setTimeout(() => { throw new Error('fixture page error'); }, 0);
+fetch('/failure').then(markFailure);
+` : ""}
 </script>`);
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -52,7 +65,7 @@ ${req.url === "/broken" ? "console.error('fixture console error'); setTimeout(()
 		assert.equal(image.readUInt32BE(20), run.viewport.height);
 	}
 	scenario.viewports = [scenario.viewports[0]];
-	scenario.steps = [{ type: "navigate", path: "/broken" }, { type: "waitFor", selector: "#result" }, { type: "assertText", selector: "h1", contains: "Deliberately absent" }];
+	scenario.steps = [{ type: "navigate", path: "/broken" }, { type: "waitFor", selector: "#failure-observed" }, { type: "assertText", selector: "h1", contains: "Deliberately absent" }];
 	fs.writeFileSync(config, JSON.stringify(scenario));
 	const failed = await runQa({ config, repo, output: path.join(root, "failed") });
 	assert.equal(failed.status, "failed");

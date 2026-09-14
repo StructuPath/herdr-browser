@@ -427,14 +427,8 @@ export function makeBrowser(session, bin = "agent-browser") {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
 	// maxBuffer would throw on every tick and freeze the pane for good.
 	const maxBuffer = 16 * 1024 * 1024;
-	// If a call is the one that spawns the session daemon, the daemon
-	// self-reaps after idle instead of living forever. No-op for daemons an
-	// agent already owns (read at daemon spawn only).
-	const abEnv = () => ({
-		...process.env,
-		AGENT_BROWSER_IDLE_TIMEOUT_MS:
-			process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS || "1800000",
-	});
+	// Inherit the caller's configuration unchanged. Injecting an idle timeout
+	// makes agent-browser restart an existing daemon and lose its browser.
 	const parse = (stdout, what) => {
 		let parsed;
 		try {
@@ -452,7 +446,7 @@ export function makeBrowser(session, bin = "agent-browser") {
 		const { stdout } = await pExecFile(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
-			{ timeout, maxBuffer, env: abEnv() },
+			{ timeout, maxBuffer },
 		);
 		const arr = parse(stdout, "batch output");
 		for (const r of arr) {
@@ -470,7 +464,6 @@ export function makeBrowser(session, bin = "agent-browser") {
 			{
 				timeout: 10_000,
 				maxBuffer,
-				env: abEnv(),
 			},
 		);
 		const parsed = parse(stdout, "output");
@@ -1937,11 +1930,27 @@ export class Renderer {
 		const port = Number(status?.port);
 		if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
 		let ws;
+		const initialFrameSeq = this.frameSeq;
 		try {
 			ws = new WebSocket(`ws://127.0.0.1:${port}`);
 		} catch {
 			return false; // malformed URL or constructor failure: just poll
 		}
+		// Chrome can send its only frame for a quiet page with the handshake.
+		// Install the listener before awaiting open so those messages survive.
+		ws.onmessage = (ev) => {
+			let m;
+			try {
+				m = JSON.parse(ev.data);
+			} catch {
+				return;
+			}
+			try {
+				this.onStreamMessage(m);
+			} catch {
+				this.paintErrors++;
+			}
+		};
 		const ok = await new Promise((resolve) => {
 			const timer = setTimeout(() => {
 				try {
@@ -1962,21 +1971,13 @@ export class Renderer {
 		});
 		if (!ok) return false;
 		this.live = { ws };
-		ws.onmessage = (ev) => {
-			let m;
-			try {
-				m = JSON.parse(ev.data);
-			} catch {
-				return;
+		const live = this.live;
+		live.firstFrameTimer = setTimeout(() => {
+			if (this.live === live && this.frameSeq === initialFrameSeq) {
+				this.dropLive("live stream sent no image — polling");
 			}
-			// A malformed message must never become an uncaughtException —
-			// those bypass cleanup() and leave the terminal wedged.
-			try {
-				this.onStreamMessage(m);
-			} catch {
-				this.paintErrors++;
-			}
-		};
+		}, 5_000);
+		live.firstFrameTimer.unref?.();
 		const drop = () => this.dropLive("live stream dropped — polling");
 		ws.onclose = drop;
 		ws.onerror = drop;
@@ -1992,6 +1993,10 @@ export class Renderer {
 		this.stopNetworkTimer();
 		const wasLive = !!this.live;
 		if (this.live) {
+			clearTimeout(this.live.firstFrameTimer);
+			this.live.ws.onmessage = null;
+			this.live.ws.onclose = null;
+			this.live.ws.onerror = null;
 			try {
 				this.live.ws.close();
 			} catch {
@@ -2193,6 +2198,7 @@ export class Renderer {
 	cleanup() {
 		if (this.mode === "kitty") process.stdout.write(KITTY_DELETE_ALL);
 		this.stopNetworkTimer();
+		clearTimeout(this.live?.firstFrameTimer);
 		try {
 			this.live?.ws.close();
 		} catch {

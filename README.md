@@ -206,6 +206,10 @@ The pane falls back automatically when WebSocket support is unavailable, the
 stream disconnects, or the selected renderer cannot display streamed JPEGs.
 No feature flag is required.
 
+If a stream connects but sends no usable image within five seconds, the pane
+returns to screenshot polling and retries streaming after its cooldown. A
+connected WebSocket alone does not establish that image delivery is working.
+
 ### Pane fitting
 
 On attach and pane resize, herdr-browser preserves the session's current
@@ -337,7 +341,8 @@ name appears in the viewer header.
   closed with it so the browser daemon is not leaked.
 - The **Close** action always ends the workspace session and closes its browser
   panes.
-- Plugin-created browser daemons default to a 30-minute idle timeout.
+- Daemon idle timeouts follow agent-browser's configuration. The viewer does
+  not inject a different timeout, which can restart an existing daemon.
 
 To watch a differently named agent-browser session, write its name to the
 plugin configuration directory:
@@ -414,7 +419,7 @@ Equivalent environment controls:
 | `HERDR_BROWSER_LAUNCH` | Unset | `1` launches a Chromium on open instead of waiting for a session |
 | `HERDR_BROWSER_OBSERVE` | Unset | `1` starts the pane observe-only |
 | `HERDR_BROWSER_INTERVAL_MS` | `1000` | Polling interval; clamped to safe bounds |
-| `AGENT_BROWSER_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for plugin-created browser daemons |
+| `AGENT_BROWSER_IDLE_TIMEOUT_MS` | Engine default | Inherited unchanged; use the same value for the agent and pane to avoid daemon configuration changes |
 
 Environment variables take precedence over config files.
 
@@ -458,17 +463,37 @@ needed.
 
 ## Development
 
+Use Node 22+ for full browser support (Node 20 supports polling only), Python
+3.11+ for manifest validation, and ShellCheck for launcher validation. The
+plugin runs its source directly; there is no bundled browser or compilation
+step.
+
 ```sh
 git clone https://github.com/StructuPath/herdr-browser
 cd herdr-browser
-npm test
-shellcheck scripts/*.sh
+npm run doctor
+npm run build
+npm run validate
+npm run test:integration
 herdr plugin link .
 ```
 
-`npm test` includes unit, launcher, security, rendering, input, recording, and
-live-stream coverage. The real agent-browser integration test skips when its
-engine is unavailable.
+`npm run doctor` checks local prerequisites without starting a browser,
+contacting an endpoint, or changing configuration. Optional tools are warnings;
+missing prerequisites for the selected backend cause a nonzero exit. It does
+not verify Herdr's version, engine downloads, or endpoint reachability.
+
+`npm run build` checks every JavaScript and shell source file plus the plugin
+manifest. `npm run validate` adds ShellCheck and the complete test suite.
+`npm test` includes launcher, security, rendering, input, recording, and live
+browser coverage; optional browser tests skip when their prerequisites are
+unavailable. `npm run test:integration` requires both an installed Chrome or
+Chromium and agent-browser with its engine installed, on Node 22+. It fails
+instead of silently skipping either real-browser path. Tests use a local HTTP
+fixture and isolated browser sessions.
+
+For backend choices and the remaining readiness work, see the
+[readiness assessment](docs/readiness.md).
 
 ## License
 

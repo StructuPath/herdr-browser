@@ -31,7 +31,11 @@ const until = async (cond, ms) => {
 	return cond();
 };
 
-test("launch mode drives a real Chromium end to end", { skip }, async () => {
+test("launch mode drives a real Chromium end to end", {
+	skip: process.env.HERDR_BROWSER_REQUIRE_INTEGRATION === "1" ? false : skip,
+	timeout: 60_000,
+}, async () => {
+	assert.equal(skip, false, `integration prerequisites missing: ${skip}`);
 	const r = new Renderer({
 		HERDR_BROWSER_SESSION: "hb-launch-int",
 		HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "hb-int-")),

@@ -1,12 +1,14 @@
 {
   "name": "herdr-browser",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "node scripts/build.mjs",
     "doctor": "node bin/doctor.mjs",
+    "qa": "node bin/qa.mjs",
+    "test:qa": "HERDR_BROWSER_REQUIRE_QA=1 node --test tests/qa.test.mjs tests/qa.integration.test.mjs",
     "test": "node --test tests/*.test.mjs",
     "test:integration": "HERDR_BROWSER_REQUIRE_INTEGRATION=1 node --test --test-name-pattern='end to end|e2e:' tests/launch.integration.test.mjs tests/renderer.test.mjs",
     "validate": "npm run build && shellcheck scripts/*.sh && npm test"

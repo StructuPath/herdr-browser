@@ -12,9 +12,9 @@ scroll, navigate, and record the flow without leaving Herdr.
 
 ![herdr-browser demo: driving a page from a herdr pane](assets/herdr-browser-demo.gif)
 
-**Docs:** the [StructuPath Herdr Plugins wiki](https://github.com/StructuPath/herdr-browser/wiki)
-is the practical guide to this plugin and its three siblings (Guard, Swarm,
-Conductor).
+**Docs:** the [Browser guide](https://herdr.structupath.ai/docs/browser/)
+and [Herdr Suite overview](https://herdr.structupath.ai/docs/) are the canonical
+guides to this plugin and its three siblings (Guard, Swarm, Conductor).
 
 ## Highlights
 

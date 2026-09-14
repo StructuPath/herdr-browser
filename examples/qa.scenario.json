@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "name": "Local app smoke",
+  "baseUrl": "http://localhost:3000",
+  "viewports": [
+    { "name": "desktop", "width": 1440, "height": 900 },
+    { "name": "mobile", "width": 390, "height": 844 }
+  ],
+  "steps": [
+    { "type": "navigate", "path": "/" },
+    { "type": "waitFor", "selector": "h1" },
+    { "type": "assertVisible", "selector": "h1" },
+    { "type": "assertText", "selector": "h1", "contains": "Your app heading" },
+    { "type": "screenshot", "name": "home" }
+  ]
+}

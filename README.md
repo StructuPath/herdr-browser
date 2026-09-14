@@ -18,6 +18,9 @@ guides to this plugin and its three siblings (Guard, Swarm, Conductor).
 
 ## Highlights
 
+- **Repeatable QA scenarios** — run saved desktop/mobile checks in fresh browser
+  sessions and collect commit-bound screenshots, assertions, and error evidence.
+  See the [QA guide](docs/qa.md) (Browser 0.8.0).
 - **Shared agent sessions** — one isolated browser session per Herdr workspace.
 - **Attach to any CDP browser** — observe a Playwright, Puppeteer, or Browser Use
   run (or any Chrome started with `--remote-debugging-port`) without owning it.

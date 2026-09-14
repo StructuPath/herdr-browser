@@ -86,6 +86,22 @@ test("open with URL navigates workspace session and opens pane", () => {
 	);
 });
 
+test("open preserves the agent daemon idle-timeout configuration", () => {
+	const stub = path.join(stubDir, "agent-browser");
+	const original = fs.readFileSync(stub, "utf8");
+	writeStub("agent-browser", 'printf "timeout=%s\\n" "${AGENT_BROWSER_IDLE_TIMEOUT_MS-unset}" >> "$STUB_LOG"');
+	try {
+		let result = runScript("open.sh", ["http://localhost:3000"]);
+		assert.equal(result.status, 0, result.stderr);
+		assert.match(log(), /timeout=unset/);
+		result = runScript("open.sh", ["http://localhost:3000"], freshEnv({ AGENT_BROWSER_IDLE_TIMEOUT_MS: "900000" }));
+		assert.equal(result.status, 0, result.stderr);
+		assert.match(log(), /timeout=900000/);
+	} finally {
+		fs.writeFileSync(stub, original);
+	}
+});
+
 test("open with live pane focuses instead of opening a second pane", () => {
 	fs.writeFileSync(path.join(stateDir, "pane-id-w9"), "w9:p7\n");
 	const r = runScript(

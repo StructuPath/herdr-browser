@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { fileURLToPath } from "node:url";
 import {
 	deriveSession,
@@ -1067,6 +1068,64 @@ const jpeg = (w, h) => {
 	return b;
 };
 
+test("goLive receives frames delivered with the WebSocket handshake", async () => {
+	const r = quiet(mkRenderer());
+	r.fitViewport = async () => false;
+	r.browser = {
+		streamEnable: async () => {},
+		streamStatus: async () => ({ port: 9222 }),
+	};
+	const saved = global.WebSocket;
+	global.WebSocket = class {
+		constructor() {
+			queueMicrotask(() => {
+				this.onopen();
+				this.onmessage?.({
+					data: JSON.stringify({ type: "frame", data: jpeg(1280, 720).toString("base64") }),
+				});
+			});
+		}
+		close() {}
+	};
+	try {
+		assert.equal(await r.goLive(), true);
+		assert.equal(r.frameSeq, 1, "the initial frame must not be lost before goLive resumes");
+	} finally {
+		r.dropLive();
+		global.WebSocket = saved;
+	}
+});
+
+test("a connected stream without an image falls back and ignores late messages", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const r = quiet(mkRenderer());
+	r.browser = {
+		streamEnable: async () => {},
+		streamStatus: async () => ({ port: 9222 }),
+	};
+	const saved = global.WebSocket;
+	let socket;
+	global.WebSocket = class {
+		constructor() {
+			socket = this;
+			queueMicrotask(() => this.onopen());
+		}
+		close() { this.closed = true; }
+	};
+	try {
+		assert.equal(await r.goLive(), true);
+		t.mock.timers.tick(5_000);
+		assert.equal(r.live, null);
+		assert.equal(socket.closed, true);
+		assert.equal(socket.onmessage, null);
+		assert.equal(r.shotFormat, "png");
+		assert.match(r.banner, /no image.*polling/);
+	} finally {
+		r.dropLive();
+		global.WebSocket = saved;
+	}
+});
+
 test("jpegDims reads SOF0 dimensions, rejects junk", () => {
 	assert.deepEqual(jpegDims(jpeg(1280, 720)), { w: 1280, h: 720 });
 	assert.equal(jpegDims(Buffer.from("not a jpeg")), null);
@@ -1231,9 +1290,11 @@ test("polling tick tries goLive once, then respects the cooldown", async () => {
 const hasAgentBrowser =
 	spawnSync("sh", ["-c", "command -v agent-browser"]).status === 0;
 test("e2e: goLive receives pushed frames and console from a real session", {
-	skip: !hasAgentBrowser && "agent-browser not installed",
+	skip: process.env.HERDR_BROWSER_REQUIRE_INTEGRATION !== "1" &&
+		(!hasAgentBrowser ? "agent-browser not installed" : !canCdp && "needs Node 22+"),
 	timeout: 30_000,
 }, async () => {
+	assert.ok(hasAgentBrowser && canCdp, "integration requires agent-browser and Node 22+");
 	const session = `hb-itest-${process.pid}`;
 	const { execFile: ef } = await import("node:child_process");
 	const ab = (args) =>
@@ -1245,9 +1306,14 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 				(e, so) => (e ? rej(e) : res(so)),
 			),
 		);
+	const server = http.createServer((_req, res) => {
+		res.setHeader("Content-Type", "text/html");
+		res.end("<!doctype html><title>Browser stream test</title><h1>Local browser fixture</h1>");
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
 	try {
-		await ab(["open", "https://example.com"]);
-		const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
+		await ab(["open", `http://127.0.0.1:${server.address().port}`]);
 		// Viewport fitting has dedicated tests; disabling it here prevents its
 		// queued resize command from racing this stream test's session close.
 		r.fitViewport = async () => false;
@@ -1261,6 +1327,10 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 			imageDims(fs.readFileSync(r.shotJpg)),
 			"frame is a valid image on disk",
 		);
+		const beforeNavigation = r.frameSeq;
+		const fixtureUrl = `http://127.0.0.1:${server.address().port}`;
+		await ab(["open", fixtureUrl]);
+		assert.ok(await until(() => r.frameSeq > beforeNavigation), "navigation produces a fresh streamed frame");
 		await ab(["eval", 'console.warn("hb-itest-marker")']);
 		const cDeadline = Date.now() + 10_000;
 		while (
@@ -1274,8 +1344,21 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 			"console entry streamed live",
 		);
 		r.dropLive();
+		// A late observer may get a connected socket with no frame from the
+		// engine. Prove it recovers a real image through polling in that case.
+		const beforeReconnect = r.frameSeq;
+		assert.equal(await r.goLive(), true);
+		assert.ok(await until(() => r.frameSeq > beforeReconnect || !r.live, 7_000));
+		if (!r.live) {
+			r.attached = true;
+			await r.tick();
+			assert.ok(pngComplete(fs.readFileSync(r.shot)), "fallback captures a complete browser screenshot");
+			assert.ok(r.lastUrl.startsWith(fixtureUrl));
+		}
 	} finally {
+		r.dropLive();
 		await ab(["close"]).catch(() => {});
+		await new Promise((resolve) => server.close(resolve));
 	}
 });
 
@@ -1639,6 +1722,26 @@ test("network format: sanitizes and hard-caps page-controlled URLs", () => {
 		formatNetworkFailure({ method: "POST", url: "http://l:3000/a", status: null }),
 		"no response POST http://l:3000/a",
 	);
+});
+
+test("makeBrowser preserves the caller's idle timeout for reads and batches", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-env-"));
+	const stub = path.join(dir, "ab-stub");
+	const logf = path.join(dir, "timeout");
+	fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "\${AGENT_BROWSER_IDLE_TIMEOUT_MS-unset}" >> '${logf}'\ncase "$*" in *batch*) echo '[{"success":true,"result":{}},{"success":true,"result":{}},{"success":true,"result":{}},{"success":true,"result":{}}]';; *) echo '{"success":true,"data":{}}';; esac\n`, { mode: 0o755 });
+	const saved = process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS;
+	try {
+		delete process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS;
+		await makeBrowser("s", stub).streamStatus();
+		await makeBrowser("s", stub).snapshot("/tmp/unused");
+		process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS = "900000";
+		await makeBrowser("s", stub).streamStatus();
+		assert.equal(fs.readFileSync(logf, "utf8"), "unset\nunset\n900000\n");
+	} finally {
+		if (saved === undefined) delete process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS;
+		else process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS = saved;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("makeBrowser.network passes the type filter, never --clear", async () => {

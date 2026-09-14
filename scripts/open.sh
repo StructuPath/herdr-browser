@@ -55,9 +55,8 @@ elif [ -n "$url" ]; then
 		echo "herdr-browser: refusing URL (must start with http:// or https://, no credentials): $url" >&2
 		exit 2
 	fi
-	# If this call spawns the session daemon, let it self-reap after 30 min
-	# idle instead of living forever (no-op for daemons agents already own).
-	export AGENT_BROWSER_IDLE_TIMEOUT_MS="${AGENT_BROWSER_IDLE_TIMEOUT_MS:-1800000}"
+	# Preserve the caller's daemon configuration. An injected timeout can
+	# restart an existing agent-owned daemon and discard its browser state.
 	if ! with_timeout 15 agent-browser --session "$session" open "$url" >/dev/null; then
 		echo "herdr-browser: agent-browser failed to open $url" >&2
 		exit 3

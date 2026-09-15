@@ -52,7 +52,8 @@ own Chrome engine; a second bundled distribution is unnecessary.
    during navigation. The new watchdog covers initial image delivery, not all
    possible later stalls.
 4. **Interactive browser completeness.** Prioritize keyboard shortcuts,
-   downloads, file upload, dialogs, and explicit target selection. Define
+   downloads, file upload, and dialogs. Explicit target selection and verbatim
+   text insertion now have regression coverage. Define
    behavior separately for owned and externally controlled browsers and prove
    each against a local fixture before adding UI controls.
 5. **Recording across backends.** Recording currently requires agent-browser.

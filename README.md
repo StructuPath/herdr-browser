@@ -151,10 +151,10 @@ Use these controls to drive the shared session directly:
 | `u` | Open the address prompt; `https://` is assumed when omitted |
 | `a` | Attach to a CDP endpoint (`http://host:port` or `ws://…`) |
 | `l` | Launch a local Chromium the pane owns and attach to it |
-| `t` | Attach mode: cycle the pane between the browser's page targets (tabs) |
+| `t` | Attach/launch mode: open the tab picker; arrows or `j`/`k` highlight, Enter selects, `t` refreshes, Esc cancels |
 | `o` | Toggle observe-only: pane input is dropped instead of forwarded |
 | Click the screenshot | Send real Chrome mouse move/down/up events at that page coordinate |
-| `i` | Type into the currently focused page element |
+| `i` | Enter or paste text for the focused page element; Enter inserts it, Esc cancels |
 | `b` / `f` | Navigate backward / forward |
 | `r` | Reload |
 | `j` / `k` | Scroll down / up |
@@ -166,6 +166,13 @@ Use these controls to drive the shared session directly:
 Clicks are mapped through the rendered-frame geometry to page pixels, so they
 work with overlays, canvas content, and shadow DOM. Live sessions usually
 repaint immediately; polling fallback can take up to the configured interval.
+
+The text prompt preserves leading/trailing spaces and Unicode. In a terminal
+that supports bracketed paste, pasted tabs and newlines remain text in the
+prompt until you press Enter to insert it. Newlines appear as `\n` in the
+preview. Inserting text does not send an Enter key to the page or submit a
+form. Paste into the `i` prompt; pasted text outside a prompt is ignored.
+Each paste is limited to 1 MiB. URL and endpoint prompts still trim whitespace.
 
 ## Rendering and streaming
 
@@ -251,8 +258,8 @@ printf 'http://127.0.0.1:9222\n' > "$(herdr plugin config-dir structupath.browse
 Press `a` in the pane to attach at runtime. `u` still means "navigate" — the
 keys are separate because `localhost:9222` is a valid destination as well as a
 valid endpoint. While attached, the pane header shows the endpoint's
-`host:port` instead of a session name, `t` cycles between the browser's page
-targets when your automation has more than one tab open, and `o` toggles
+`host:port` instead of a session name, `t` opens a tab picker with titles and
+URLs, and `o` toggles
 **observe-only**: every pane click, wheel event, keystroke, and navigation —
 including Cmd/Ctrl+click link handoffs in attach mode — is dropped at the
 pane instead of forwarded, so watching a live run cannot blur the field your
@@ -264,6 +271,19 @@ navigates the session daemon directly, outside the pane. Set
 `HERDR_BROWSER_OBSERVE=1` (or the `observe` config file) for
 watch-the-agent workspaces — the pane starts observe-only *and* the open
 action itself refuses link navigation, closing that gap in both modes.
+
+On first connection, a single tab is selected automatically. With multiple
+tabs, input waits for an explicit choice in the picker. Selection uses the
+tab's stable identity, so duplicate titles and changing tab order do not
+redirect it. The picker changes only what this pane observes; it does not
+activate the tab in another client's UI and remains available in observe-only
+mode. Shared agent-browser mode continues following that session's active tab.
+
+If the selected tab closes or detaches, the pane clears its cached image and
+pending text, drops queued input, and keeps the browser connection open.
+Press `t` to select another tab, even if only one remains. It never switches
+automatically to a surviving tab. Reconnection restores the same tab only
+when the browser identity and tab identity both still match.
 
 Launcher recipes: Playwright `chromium.launch({args:['--remote-debugging-port=9222']})`,
 Puppeteer the same `args`, Browser Use its `chrome_remote_debugging_port` option.

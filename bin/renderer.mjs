@@ -505,10 +505,9 @@ export function makeBrowser(session, bin = "agent-browser") {
 		scroll: async (dir, px) => {
 			await run("scroll", dir, String(px));
 		},
-		// 'keyboard type' takes raw text; plain 'type' expects a selector first,
-		// so the prompt's free-form input only works through the keyboard path.
+		// Insert literal text without synthesizing Enter or shortcut key events.
 		type: async (text) => {
-			await run("keyboard", "type", text);
+			await run("keyboard", "inserttext", text);
 		},
 		setViewport: async (w, h) => {
 			await run("set", "viewport", String(w), String(h));
@@ -638,6 +637,10 @@ export class Renderer {
 			truthyConfig(env.HERDR_BROWSER_LAUNCH || this.configValue("launch"));
 		this.launchAttempted = false;
 		this.promptState = null;
+		this.targetPicker = null;
+		this.pasteState = null;
+		this.inputRevision = 0;
+		this.cdpTargetId = null;
 		this.paintQueue = Promise.resolve();
 		this.paintErrors = 0;
 		this.chafaFails = 0;
@@ -710,13 +713,15 @@ export class Renderer {
 		const cols = process.stdout.columns || 80;
 		const rows = process.stdout.rows || 24;
 		let consoleRows = 0;
-		if (this.mode === "text") {
+		if (this.targetPicker) {
+			consoleRows = 0;
+		} else if (this.mode === "text") {
 			consoleRows = Math.max(0, rows - 3);
 		} else if (this.consoleLines.length > 0) {
 			consoleRows = Math.max(4, Math.floor(rows * 0.3));
 		}
 		const imageRows =
-			this.mode === "text" ? 0 : Math.max(0, rows - consoleRows - 4);
+			this.mode === "text" && !this.targetPicker ? 0 : Math.max(0, rows - consoleRows - 4);
 		return {
 			cols,
 			rows,
@@ -879,7 +884,7 @@ export class Renderer {
 		if (this.launchedChild && this.launchedChild.exitCode === null) {
 			// Still running (the pane may have attached elsewhere meanwhile in
 			// a way that kept it): just point back at it.
-			if (this.launchedEndpoint) this.userAction(() => this.attachTo(this.launchedEndpoint));
+			if (this.launchedEndpoint) this.userAction(() => this.attachTo(this.launchedEndpoint), { pageInput: false });
 			return;
 		}
 		// Refuse before spawning: attaching to the result needs the Node 22
@@ -992,7 +997,7 @@ export class Renderer {
 				// latched. Signal deaths leave exitCode null — check both.
 				if (child.exitCode !== null || child.signalCode !== null) return;
 				return this.attachTo(ep, { note: "— launched Chromium —" });
-			});
+			}, { pageInput: false });
 		} catch (err) {
 			// Callers fire-and-forget this promise; an uncaught throw here
 			// (say, an unwritable profile dir) would surface as an unhandled
@@ -1050,6 +1055,7 @@ export class Renderer {
 			}
 			this.cdpGuid = id.guid;
 			this.cdpIdentity = id;
+			this.cdpTargetId = id.targetId;
 			this.attached = true;
 			this.startNavigateWatch();
 			// A click while the launch was still coming up parked its URL here;
@@ -1070,6 +1076,7 @@ export class Renderer {
 				this.loopbackWarned = true;
 				this.banner = `attached to ${id.host}:${id.port} — remote endpoint, traffic is unencrypted`;
 			}
+			if (!this.cdpTargetId) this.banner = "select a tab — press t";
 			this.header();
 			return true;
 		} catch (err) {
@@ -1138,17 +1145,51 @@ export class Renderer {
 	}
 
 	resetBackendState() {
+		this.invalidateTarget();
 		this.consoleState = { count: 0, tail: [] };
 		this.networkState = newNetworkState();
 		this.lastHash = "";
 		this.shotFormat = "png";
 	}
 
+	invalidateTarget() {
+		this.inputRevision++;
+		this.cdpTargetId = null;
+		this.promptState = null;
+		this.lastFrameMeta = null;
+		this.lastFrameAt = 0;
+		this.lastImageDims = null;
+		this.lastUrl = "";
+		this.lastTitle = "";
+		this.lastHash = "";
+		this.staleHandled = false;
+		for (const file of [this.shot, this.shotJpg]) {
+			try { fs.unlinkSync(file); } catch { /* no cached frame */ }
+		}
+		this.enqueue(() => this.redrawAll());
+	}
+
 	// Bridge: adapter messages arrive already shaped like stream messages, so
 	// frames/url/page_error reuse onStreamMessage. Frames additionally carry
 	// the integer ack id, acked once the paint enqueue settles.
 	onCdpMessage(m) {
+		if (m.type === "target_changing" || m.type === "target_gone") {
+			this.invalidateTarget();
+			this.banner = m.type === "target_gone" ? "selected tab closed or detached — press t to select a tab" : "switching tabs…";
+			this.header();
+			return;
+		}
+		if (m.type === "target_selected") {
+			this.cdpTargetId = m.targetId;
+			this.lastUrl = sanitizeText(m.url ?? "");
+			this.lastTitle = sanitizeText(m.title ?? "");
+			this.lastFrameAt = Date.now();
+			this.banner = "";
+			this.header();
+			return;
+		}
 		if (m.type === "frame") {
+			if (!this.cdpTargetId) return;
 			this.lastFrameAt = Date.now();
 			this.lastFrameMeta = m.metadata ?? null;
 			this.onStreamMessage({ type: "frame", data: m.data });
@@ -1174,12 +1215,8 @@ export class Renderer {
 			this.pushLogEntry(m);
 			return;
 		}
-		if (m.type === "target_gone") {
-			this.banner = "the observed page closed — waiting";
-			this.header();
-			return;
-		}
 		if (m.type === "endpoint_gone") {
+			this.invalidateTarget();
 			this.attached = false;
 			this.banner = "browser endpoint closed — waiting";
 			this.header();
@@ -1224,7 +1261,7 @@ export class Renderer {
 	// Hidden tabs and DevTools screencast contention both present as a frozen
 	// frame with no error. One restart attempt, last frame stays on screen.
 	checkFrameStaleness(now = Date.now()) {
-		if (this.backend !== "attach" || !this.attached || !this.lastFrameAt) return;
+		if (this.backend !== "attach" || !this.attached || !this.cdpTargetId || !this.lastFrameAt) return;
 		if (now - this.lastFrameAt < 10_000 || this.staleHandled) return;
 		this.staleHandled = true;
 		this.banner = "frame stale (tab hidden or contended)";
@@ -1332,8 +1369,11 @@ export class Renderer {
 
 	renderBottom() {
 		const { cols, bottomRow } = this.size();
-		if (this.promptState) {
-			const text = ` ${this.promptState.label}${this.promptState.value}█`;
+		if (this.promptState || this.targetPicker) {
+			const p = this.promptState;
+			const value = sanitizeText(p?.literal ? JSON.stringify(p.value).slice(1, -1) : p?.value ?? "");
+			const text = this.targetPicker ? " Tabs: ↑/↓ or j/k · Enter:select · t:refresh · Esc:cancel"
+				: ` ${p.label}${value}█`;
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${truncate(text, cols)}${ESC}[K`,
 			);
@@ -1341,9 +1381,9 @@ export class Renderer {
 			// Every advertised key is handled in both backends (a and l work
 			// everywhere); t only moves targets on an attach backend.
 			const help = this.observeOnly
-				? " observe-only: input is not forwarded  o:enable-input  q:quit"
+				? " observe-only  t:tabs  o:enable-input  q:quit"
 				: this.backend === "attach"
-					? " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  t:target  o:observe  q:quit"
+					? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  q:quit  b/f:hist  r:reload  j/k:scroll"
 					: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
@@ -1352,6 +1392,7 @@ export class Renderer {
 	}
 
 	async renderImage() {
+		if (this.targetPicker) return this.renderTargetPicker();
 		const { cols, imageRows } = this.size();
 		const shotPath = this.shotFormat === "jpg" ? this.shotJpg : this.shot;
 		if (this.mode === "text" || imageRows < 3 || !fs.existsSync(shotPath))
@@ -1439,7 +1480,61 @@ export class Renderer {
 		}
 	}
 
+	renderTargetPicker() {
+		const picker = this.targetPicker;
+		if (!picker) return;
+		const { cols, imageRows, imageTopRow } = this.size();
+		const perPage = Math.max(1, Math.floor((imageRows - 1) / 2));
+		const start = Math.floor(picker.index / perPage) * perPage;
+		const lines = [picker.loading ? " Loading tabs…" : picker.targets.length ? " Select a tab" : " No tabs available — t to refresh"];
+		for (const [i, target] of picker.targets.slice(start, start + perPage).entries()) {
+			lines.push(`${start + i === picker.index ? " ›" : "  "} ${start + i + 1}. ${target.selected ? "(selected) " : ""}${sanitizeText(target.title || "Untitled")}`);
+			lines.push(`   ${sanitizeText(target.url ?? "")}`);
+		}
+		for (let i = 0; i < imageRows; i++) {
+			process.stdout.write(`${ESC}[${imageTopRow + i};1H${truncate(lines[i] ?? "", cols)}${ESC}[K`);
+		}
+	}
+
+	openTargetPicker() {
+		if (this.backend !== "attach" || !this.attached) return;
+		const picker = { targets: [], index: 0, loading: true };
+		this.targetPicker = picker;
+		this.userAction(async () => {
+			try {
+				const targets = await this.browser.listTargets();
+				if (this.targetPicker !== picker) return;
+				picker.targets = targets;
+				picker.index = Math.max(0, targets.findIndex((t) => t.selected));
+			} finally {
+				picker.loading = false;
+				await this.redrawAll();
+			}
+		}, { pageInput: false });
+	}
+
+	targetPickerInput(ch) {
+		const picker = this.targetPicker;
+		if (ch === "\x1b") {
+			this.targetPicker = null;
+			this.enqueue(() => this.redrawAll());
+		} else if (ch === "t") this.openTargetPicker();
+		else if (!picker.loading && (ch === "j" || ch === "\x1b[B" || ch === "k" || ch === "\x1b[A")) {
+			picker.index = Math.max(0, Math.min(picker.targets.length - 1, picker.index + (ch === "j" || ch === "\x1b[B" ? 1 : -1)));
+			this.enqueue(() => this.renderTargetPicker());
+		} else if (!picker.loading && (ch === "\r" || ch === "\n")) {
+			const target = picker.targets[picker.index];
+			if (!target) return;
+			this.targetPicker = null;
+			this.userAction(async () => {
+				try { await this.browser.selectTarget(target.targetId); }
+				finally { await this.redrawAll(); }
+			}, { pageInput: false });
+		}
+	}
+
 	renderConsole() {
+		if (this.targetPicker) return;
 		const { cols, rows, consoleRows } = this.size();
 		if (rows < 8 || consoleRows < 2) return; // below this, lines overpaint the header
 		const top = rows - consoleRows;
@@ -1483,6 +1578,7 @@ export class Renderer {
 			if (Date.now() - this.lastLiveCheck > 15_000) {
 				this.lastLiveCheck = Date.now();
 				if (!(await this.browser.sessionExists())) {
+					this.invalidateTarget();
 					this.attached = false;
 					// Re-discovery, not a re-dial: the browser may have restarted
 					// and minted a fresh token, and a raw ws endpoint has none.
@@ -1692,36 +1788,64 @@ export class Renderer {
 	// reads and several keypresses can arrive coalesced. Buffer partial
 	// escape tails and split everything into single events before dispatch.
 	feed(s) {
+		clearTimeout(this.inputTimer);
 		s = this.inputBuf + s;
-		// Hold a trailing partial escape for the next chunk: ESC-[ alone, or
-		// an incomplete mouse report. A bare ESC (prompt cancel) dispatches
-		// immediately — holding it would swallow the cancel until another key.
-		const tail = /\x1b\[(?:<[\d;]*)?$/.exec(s);
-		this.inputBuf = tail ? tail[0] : "";
-		s = s.slice(0, s.length - this.inputBuf.length);
-		if (!s) return;
-		if (this.promptState) {
-			this.promptInput(s);
-			return;
-		}
-		const mouseRe = /\x1b\[<\d+;\d+;\d+[Mm]/g;
-		let m;
-		let last = 0;
-		const parts = [];
-		const mice = [];
-		while ((m = mouseRe.exec(s))) {
-			parts.push(s.slice(last, m.index));
-			mice.push(m[0]);
-			last = m.index + m[0].length;
-		}
-		parts.push(s.slice(last));
-		for (let i = 0; i < parts.length; i++) {
-			for (const ch of parts[i]) this.onKey(ch);
-			if (i < mice.length) this.onMouse(parseSgrMouse(mice[i]));
+		this.inputBuf = "";
+		while (s) {
+			if (this.pasteState) {
+				const endMarker = `${ESC}[201~`;
+				const end = s.indexOf(endMarker);
+				let keep = 0;
+				if (end < 0) {
+					for (let i = 1; i < endMarker.length; i++) if (s.endsWith(endMarker.slice(0, i))) keep = i;
+				}
+				const part = end >= 0 ? s.slice(0, end) : s.slice(0, s.length - keep);
+				const paste = this.pasteState;
+				paste.bytes += Buffer.byteLength(part);
+				if (paste.bytes > 1024 * 1024) paste.overflow = true;
+				if (!paste.overflow) paste.value += part;
+				if (end < 0) {
+					this.inputBuf = keep ? s.slice(-keep) : "";
+					return;
+				}
+				this.pasteState = null;
+				if (paste.overflow) this.holdBanner("paste exceeds 1 MiB — nothing inserted");
+				else if (paste.prompt && paste.prompt === this.promptState) {
+					paste.prompt.value += paste.value;
+					this.renderBottom();
+				}
+				s = s.slice(end + endMarker.length);
+				continue;
+			}
+			if (s.startsWith(`${ESC}[200~`)) {
+				this.pasteState = { prompt: this.promptState, value: "", bytes: 0, overflow: false };
+				if (!this.promptState) this.holdBanner("press i before pasting text");
+				s = s.slice(6);
+				continue;
+			}
+			if (/^\x1b(?:\[[\d;<]*)?$/.test(s)) {
+				this.inputBuf = s;
+				if (s === ESC) this.inputTimer = setTimeout(() => {
+					this.inputBuf = "";
+					this.onKey(ESC);
+				}, 50);
+				return;
+			}
+			const escape = /^\x1b\[[\d;<]*[A-Za-z~]/.exec(s)?.[0];
+			const ch = escape ?? String.fromCodePoint(s.codePointAt(0));
+			s = s.slice(ch.length);
+			const mouse = parseSgrMouse(ch);
+			if (mouse) this.onMouse(mouse);
+			else {
+				const prompt = this.promptState;
+				this.onKey(ch);
+				if (prompt && !this.promptState) return;
+			}
 		}
 	}
 
 	onMouse(mouse) {
+		if (this.promptState || this.targetPicker || (this.backend === "attach" && !this.cdpTargetId)) return;
 		if (!mouse || mouse.release) return;
 		if (this.observeOnly && this.attached) {
 			this.noteObserveBlocked();
@@ -1784,6 +1908,10 @@ export class Renderer {
 	}
 
 	onKey(ch) {
+		if (this.targetPicker) {
+			this.targetPickerInput(ch);
+			return;
+		}
 		// A prompt owns the keyboard; clicks while typing must not drive the
 		// page behind the prompt.
 		if (this.promptState) {
@@ -1805,6 +1933,11 @@ export class Renderer {
 		// a and l must stay reachable while unattached — no session yet and a
 		// dead endpoint are exactly when attaching or launching is the answer.
 		if (!this.attached && !["u", "a", "l", "q", "\x03"].includes(ch)) return;
+		if (this.backend === "attach" && !this.cdpTargetId && ["u", "i", "b", "f", "r", "j", "k", " "].includes(ch)) {
+			this.banner = "select a tab — press t";
+			this.header();
+			return;
+		}
 		switch (ch) {
 			case "u":
 				this.openPrompt("URL: ", (v) => this.navigate(v));
@@ -1813,31 +1946,18 @@ export class Renderer {
 			// navigation target, so overloading the URL prompt would force a
 			// heuristic that guesses wrong on exactly the common case.
 			case "a":
-				this.openPrompt("attach to endpoint: ", (v) => this.attachTo(v));
+				this.openPrompt("attach to endpoint: ", (v) => this.attachTo(v), { pageInput: false });
 				break;
 			// Deliberately unqueued: the DevTools-port wait can take seconds and
 			// must not stall the paint queue; only the final attach is enqueued.
 			case "l":
 				this.launchChromium();
 				break;
-			// Cycle the pinned page target (attach mode, R6). View-only motion:
-			// it moves the pane's screencast, never focus or page state, so it
-			// stays allowed under observe-only.
 			case "t":
-				if (this.backend !== "attach") break;
-				this.userAction(async () => {
-					const moved = await this.browser.cycleTarget?.();
-					if (!moved) {
-						this.banner = "no other page targets";
-						this.header();
-					} else if (this.banner === "no other page targets") {
-						this.banner = "";
-						this.header();
-					}
-				});
+				this.openTargetPicker();
 				break;
 			case "i":
-				this.openPrompt("type: ", (v) => this.browser.type(v));
+				this.openPrompt("text (Enter:insert, Esc:cancel): ", (v) => this.browser.type(v), { literal: true });
 				break;
 			case "b":
 				this.userAction(() => this.browser.back());
@@ -1862,8 +1982,8 @@ export class Renderer {
 		}
 	}
 
-	openPrompt(label, onSubmit) {
-		this.promptState = { label, value: "", onSubmit };
+	openPrompt(label, onSubmit, { literal = false, pageInput = true } = {}) {
+		this.promptState = { label, value: "", onSubmit, literal, pageInput };
 		this.renderBottom();
 	}
 
@@ -1876,8 +1996,8 @@ export class Renderer {
 			if (ch === "\r" || ch === "\n") {
 				this.promptState = null;
 				this.renderBottom();
-				const v = p.value.trim();
-				if (v) this.userAction(() => p.onSubmit(v));
+				const v = p.literal ? p.value : p.value.trim();
+				if (v) this.userAction(() => p.onSubmit(v), { pageInput: p.pageInput });
 				return;
 			}
 			if (ch === "\x1b") {
@@ -1885,7 +2005,7 @@ export class Renderer {
 				this.renderBottom();
 				return;
 			}
-			if (ch === "\x7f" || ch === "\b") p.value = p.value.slice(0, -1);
+			if (ch === "\x7f" || ch === "\b") p.value = Array.from(p.value).slice(0, -1).join("");
 			// Printable chars only; 8-bit C1 controls (0x80-0x9f) are refused —
 			// the value is echoed to the terminal on every keystroke.
 			else if (ch >= " " && !(ch >= "\x7f" && ch <= "\x9f")) p.value += ch;
@@ -2089,15 +2209,27 @@ export class Renderer {
 
 	// User-initiated drive of the shared session: run the action, then refresh
 	// immediately instead of waiting for the next poll tick.
-	userAction(fn) {
+	userAction(fn, { pageInput = true } = {}) {
+		const browser = this.browser;
+		const revision = this.inputRevision;
 		this.idleTicks = 0; // interaction restores the base poll cadence
 		this.enqueue(async () => {
+			if (browser !== this.browser) return;
+			if (pageInput) {
+				if (revision !== this.inputRevision) return;
+				if (this.observeOnly) return this.noteObserveBlocked();
+				if (this.backend === "attach" && !this.cdpTargetId) {
+					this.banner = "select a tab — press t";
+					this.header();
+					return;
+				}
+			}
 			try {
 				await fn();
-			} catch {
+			} catch (err) {
 				// Poll mode reports daemon failures via the tick failure counter;
 				// live mode's tick never runs that path, so say it directly.
-				this.banner = `command failed — ${this.backendName} not responding`;
+				this.banner = err?.code === "TARGET_GONE" ? sanitizeText(err.message) : `command failed — ${this.backendName} not responding`;
 				this.header();
 			}
 		}).then(() => this.enqueue(() => this.tick()));
@@ -2196,6 +2328,7 @@ export class Renderer {
 	}
 
 	cleanup() {
+		clearTimeout(this.inputTimer);
 		if (this.mode === "kitty") process.stdout.write(KITTY_DELETE_ALL);
 		this.stopNetworkTimer();
 		clearTimeout(this.live?.firstFrameTimer);
@@ -2251,7 +2384,7 @@ export class Renderer {
 		} catch {
 			/* fine */
 		}
-		process.stdout.write(`${ESC}[?1000l${ESC}[?1006l${ESC}[?1049l${ESC}[?25h`);
+		process.stdout.write(`${ESC}[?2004l${ESC}[?1000l${ESC}[?1006l${ESC}[?1049l${ESC}[?25h`);
 	}
 
 	async run() {
@@ -2287,7 +2420,7 @@ export class Renderer {
 			);
 		}
 		await this.redrawAll();
-		process.stdout.write(`${ESC}[?1000h${ESC}[?1006h`);
+		process.stdout.write(`${ESC}[?2004h${ESC}[?1000h${ESC}[?1006h`);
 
 		let resizeTimer = null;
 		process.stdout.on("resize", () => {
@@ -2336,7 +2469,7 @@ if (
 		} catch {
 			/* never set */
 		}
-		process.stdout.write(`${ESC}[?1000l${ESC}[?1006l${ESC}[?1049l${ESC}[?25h`);
+		process.stdout.write(`${ESC}[?2004l${ESC}[?1000l${ESC}[?1006l${ESC}[?1049l${ESC}[?25h`);
 		console.error("herdr-browser renderer crashed:", err.message);
 		setTimeout(() => process.exit(1), 600_000);
 	});

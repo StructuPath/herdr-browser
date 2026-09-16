@@ -252,19 +252,22 @@ test("adapter surface: forbidden methods are absent, required ones present", asy
 	const { b } = await attachBrowser(fake);
 	for (const missing of ["setViewport", "network", "snapshot", "streamEnable", "streamStatus"])
 		assert.equal(b[missing], undefined, `${missing} must not exist — duck-type guards depend on it`);
-	for (const required of ["open", "back", "forward", "reload", "click", "scroll", "type", "sessionExists", "screenshot", "cycleTarget"])
+	for (const required of ["open", "back", "forward", "reload", "click", "scroll", "type", "sessionExists", "screenshot", "listTargets", "selectTarget"])
 		assert.equal(typeof b[required], "function", `${required} missing — a key handler calls it unguarded`);
 });
 
-test("adapter pins the first page target and starts a jpeg screencast", async () => {
+test("adapter requires a choice among multiple pages, then pins the exact target", async () => {
 	const fake = makeFakeCdp({
 		pages: [
 			{ targetId: "T1", type: "page", url: "https://one/", title: "One" },
 			{ targetId: "T2", type: "page", url: "https://two/", title: "Two" },
 		],
 	});
-	const { id } = await attachBrowser(fake);
-	assert.equal(id.url, "https://one/");
+	const { b, id } = await attachBrowser(fake);
+	assert.equal(id.targetId, null);
+	assert.equal(fake.calls("Target.attachToTarget").length, 0);
+	await assert.rejects(b.type("no target"), { code: "TARGET_GONE" });
+	await b.selectTarget("T1");
 	const att = fake.calls("Target.attachToTarget");
 	assert.equal(att.length, 1);
 	assert.deepEqual(att[0].params, { targetId: "T1", flatten: true });
@@ -281,9 +284,11 @@ test("adapter never creates or closes targets across its whole lifecycle", async
 		],
 	});
 	const { b } = await attachBrowser(fake);
+	await b.selectTarget("T1");
 	await b.open("https://elsewhere/");
 	await b.reload();
-	await b.cycleTarget();
+	await b.selectTarget("T2");
+	assert.deepEqual(fake.calls("Target.detachFromTarget")[0].params, { sessionId: "sess-T1" });
 	fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T2" } });
 	await new Promise((r) => setTimeout(r, 10));
 	b.close();
@@ -313,14 +318,15 @@ test("adapter frame events carry the integer ack id; stale-generation acks are d
 	assert.equal(fake.calls("Page.screencastFrameAck").length, 1, "stale ack dropped");
 });
 
-test("adapter emits url for the pinned target only; re-pins on destruction only", async () => {
+test("adapter emits only the selected URL and stops input on target loss with surviving tabs", async () => {
 	const fake = makeFakeCdp({
 		pages: [
 			{ targetId: "T1", type: "page", url: "https://one/", title: "One" },
 			{ targetId: "T2", type: "page", url: "https://two/", title: "Two" },
 		],
 	});
-	const { got } = await attachBrowser(fake);
+	const { b, got } = await attachBrowser(fake);
+	await b.selectTarget("T1");
 	fake.deliver({
 		method: "Target.targetInfoChanged",
 		params: { targetInfo: { targetId: "T2", url: "https://noise/", title: "n" } },
@@ -342,7 +348,75 @@ test("adapter emits url for the pinned target only; re-pins on destruction only"
 	assert.equal(fake.calls("Target.attachToTarget").length, 1, "creation never re-pins");
 	fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T1" } });
 	await new Promise((r) => setTimeout(r, 10));
-	assert.equal(fake.calls("Target.attachToTarget").length, 2, "destruction re-pins");
+	assert.equal(fake.calls("Target.attachToTarget").length, 1, "destruction never re-pins");
+	assert.ok(got.some((m) => m.type === "target_gone"));
+	const before = fake.sent.length;
+	for (const action of [() => b.type("x"), () => b.open("https://two/"), () => b.click(1, 2), () => b.scroll("down", 10), () => b.reload(), () => b.back(), () => b.forward()]) {
+		await assert.rejects(action(), { code: "TARGET_GONE" });
+	}
+	assert.equal(fake.sent.length, before, "no unscoped input reaches the browser socket");
+	assert.equal(await b.sessionExists(), true, "the browser remains connected without a tab");
+	await b.selectTarget("T2");
+	await b.type("selected explicitly");
+	assert.equal(fake.calls("Input.insertText")[0].sessionId, "sess-T2");
+});
+
+test("adapter rejects a stale selection even when titles match and ignores late frames", async () => {
+	const fake = makeFakeCdp();
+	const { b, got } = await attachBrowser(fake);
+	fake.pages.push({ targetId: "T2", type: "page", url: "https://two/", title: "X" });
+	assert.deepEqual((await b.listTargets()).map((t) => t.targetId), ["T1", "T2"]);
+	fake.pages.pop();
+	await assert.rejects(b.selectTarget("T2"), { code: "TARGET_GONE" });
+	fake.deliver({ method: "Target.detachedFromTarget", params: { sessionId: "sess-T1" } });
+	fake.deliver({ method: "Page.screencastFrame", sessionId: "sess-T1", params: { data: "AAAA", sessionId: 1 } });
+	assert.equal(got.filter((m) => m.type === "frame").length, 0);
+	await assert.rejects(b.type("late"), { code: "TARGET_GONE" });
+});
+
+test("adapter stops a multi-command action when its tab is lost mid-command", async () => {
+	const fake = makeFakeCdp();
+	const { b } = await attachBrowser(fake);
+	fake.results["Input.dispatchMouseEvent"] = () => {
+		fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T1" } });
+		return {};
+	};
+	await assert.rejects(b.click(10, 10), { code: "TARGET_GONE" });
+	assert.equal(fake.calls("Input.dispatchMouseEvent").length, 1, "release is never routed to another tab or the browser");
+});
+
+test("adapter refuses a tab that disappears during attachment or screencast restart", async () => {
+	const fake = makeFakeCdp({ pages: [] });
+	const { b } = await attachBrowser(fake);
+	fake.pages.push({ targetId: "T1", type: "page", url: "https://one/", title: "One" });
+	fake.results["Target.attachToTarget"] = () => {
+		fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T1" } });
+		return { sessionId: "sess-T1" };
+	};
+	await assert.rejects(b.selectTarget("T1"), { code: "TARGET_GONE" });
+	assert.equal(fake.calls("Page.startScreencast").length, 0);
+	assert.equal(fake.calls("Target.detachFromTarget").length, 1);
+	delete fake.results["Target.attachToTarget"];
+	await b.selectTarget("T1");
+	fake.results["Page.stopScreencast"] = () => {
+		fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T1" } });
+		return {};
+	};
+	await assert.rejects(b.restartScreencast(), { code: "TARGET_GONE" });
+	assert.equal(fake.calls("Page.startScreencast").length, 1, "restart never sends an unscoped command after loss");
+});
+
+test("adapter survives zero pages and does not auto-select a replacement on reconnect", async () => {
+	const fake = makeFakeCdp({ pages: [] });
+	const { b, id } = await attachBrowser(fake);
+	assert.equal(id.targetId, null);
+	fake.pages.push({ targetId: "T2", type: "page", url: "https://two/", title: "Two" });
+	assert.equal((await b.connect()).targetId, null);
+	await b.selectTarget("T2");
+	assert.equal((await b.connect()).targetId, "T2", "same browser and exact target may reconnect");
+	fake.deliver({ method: "Target.targetDestroyed", params: { targetId: "T2" } });
+	fake.pages[0].targetId = "T3";
+	assert.equal((await b.connect()).targetId, null);
 });
 
 test("adapter destroyed pin with no survivors emits target_gone", async () => {

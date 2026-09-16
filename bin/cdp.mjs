@@ -260,6 +260,13 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	let lastMeta = null; // latest frame metadata (deviceWidth/Height for input scaling)
 	let handler = null; // onMessage subscriber (the Renderer)
 	let attachTimeMs = 0;
+	let connectedOnce = false;
+	let selection = 0;
+	const targetError = () => Object.assign(new Error("select a tab with t before sending input"), { code: "TARGET_GONE" });
+	const requireTarget = (expected = pageSessionId) => {
+		if (!expected || expected !== pageSessionId || !pinnedTargetId || session?.dead) throw targetError();
+		return expected;
+	};
 	const emit = (m) => {
 		try {
 			handler?.(m);
@@ -272,13 +279,21 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		const { targetInfos } = await session.send("Target.getTargets");
 		return targetInfos.filter((t) => t.type === "page");
 	};
+	const clearTarget = (type) => {
+		selection++;
+		gen++;
+		pinnedTargetId = null;
+		pageSessionId = null;
+		lastMeta = null;
+		emit({ type });
+	};
 
-	const startScreencast = async () => {
+	const startScreencast = async (sid = requireTarget()) => {
 		const g = ++gen;
 		await session.send(
 			"Page.startScreencast",
 			{ format: "jpeg", quality, maxWidth: maxDim, maxHeight: maxDim, everyNthFrame: 1 },
-			pageSessionId,
+			requireTarget(sid),
 		);
 		return g;
 	};
@@ -294,12 +309,18 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			await session.send("Runtime.enable", {}, sessionId);
 	};
 
-	const pinTarget = async (targetId) => {
+	const pinTarget = async (target) => {
+		const { targetId } = target;
+		const version = selection;
+		pinnedTargetId = targetId;
 		const { sessionId } = await session.send("Target.attachToTarget", {
 			targetId,
 			flatten: true,
 		});
-		pinnedTargetId = targetId;
+		if (version !== selection || pinnedTargetId !== targetId) {
+			await session.send("Target.detachFromTarget", { sessionId }).catch(() => {});
+			throw targetError();
+		}
 		pageSessionId = sessionId;
 		await session.send("Page.enable", {}, sessionId);
 		await enableFeed(sessionId);
@@ -316,6 +337,8 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		} catch {
 			/* older engines: page-level feed only */
 		}
+		requireTarget(sessionId);
+		emit({ type: "target_selected", targetId, url: target.url, title: target.title });
 		try {
 			await startScreencast();
 		} catch (err) {
@@ -330,7 +353,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	};
 
 	const onCdpEvent = (m) => {
-		if (m.method === "Page.screencastFrame" && m.sessionId === pageSessionId) {
+		if (m.method === "Page.screencastFrame" && pageSessionId && m.sessionId === pageSessionId) {
 			lastMeta = m.params.metadata ?? null;
 			emit({
 				type: "frame",
@@ -352,16 +375,11 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		}
 		if (m.method === "Target.targetDestroyed") {
 			if (m.params.targetId !== pinnedTargetId) return;
-			pinnedTargetId = null;
-			pageSessionId = null;
-			// Re-pin only on destruction of OUR target — never follow creation.
-			pageTargets()
-				.then(async (pages) => {
-					if (!pages.length) return emit({ type: "target_gone" });
-					await pinTarget(pages[0].targetId);
-					emit({ type: "url", url: pages[0].url, title: pages[0].title });
-				})
-				.catch(() => emit({ type: "target_gone" }));
+			clearTarget("target_gone");
+			return;
+		}
+		if (m.method === "Target.detachedFromTarget" && pageSessionId && m.params.sessionId === pageSessionId) {
+			clearTarget("target_gone");
 			return;
 		}
 		if (m.method === "Inspector.targetCrashed" && m.sessionId === pageSessionId) {
@@ -428,6 +446,12 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		// Identity of what we're attached to; the Renderer compares guid across
 		// reattaches so a reused port can't silently swap browsers underneath.
 		async connect() {
+			const previousTarget = pinnedTargetId;
+			const previousGuid = endpoint?.guid;
+			if (session) {
+				session.close();
+				clearTarget("target_changing");
+			}
 			endpoint = await discoverEndpoint(endpointInput, opts);
 			session = makeCdpSession(endpoint.wsUrl, opts);
 			await session.opened;
@@ -435,17 +459,20 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			session.onClose(() => emit({ type: "endpoint_gone" }));
 			await session.send("Target.setDiscoverTargets", { discover: true });
 			const pages = await pageTargets();
-			if (!pages.length) throw new Error("endpoint has no page targets");
 			attachTimeMs = Date.now();
-			await pinTarget(pages[0].targetId);
+			const target = !connectedOnce && pages.length === 1 ? pages[0]
+				: previousGuid && previousGuid === endpoint.guid ? pages.find((p) => p.targetId === previousTarget) : null;
+			connectedOnce = true;
+			if (target) await pinTarget(target);
 			return {
 				host: endpoint.host,
 				port: endpoint.port,
 				browser: endpoint.browser,
 				guid: endpoint.guid,
 				rediscoverable: endpoint.rediscoverable,
-				url: pages[0].url,
-				title: pages[0].title,
+				targetId: pinnedTargetId,
+				url: target?.url ?? "",
+				title: target?.title ?? "",
 			};
 		},
 		onMessage(fn) {
@@ -464,57 +491,64 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			}
 		},
 		async restartScreencast() {
+			const sid = requireTarget();
 			try {
-				await session.send("Page.stopScreencast", {}, pageSessionId);
+				await session.send("Page.stopScreencast", {}, sid);
 			} catch {
 				/* already stopped */
 			}
-			await startScreencast();
+			await startScreencast(sid);
 		},
-		async cycleTarget() {
+		async listTargets() {
+			return (await pageTargets()).map(({ targetId, url, title }) => ({ targetId, url, title, selected: targetId === pinnedTargetId }));
+		},
+		async selectTarget(targetId) {
 			const pages = await pageTargets();
-			if (pages.length < 2) return false;
-			const i = pages.findIndex((t) => t.targetId === pinnedTargetId);
-			const next = pages[(i + 1) % pages.length];
-			try {
-				await session.send("Page.stopScreencast", {}, pageSessionId);
-			} catch {
-				/* old session may be gone */
+			const next = pages.find((p) => p.targetId === targetId);
+			if (!next) throw Object.assign(new Error("that tab closed — press t to refresh the list"), { code: "TARGET_GONE" });
+			if (pinnedTargetId === targetId && pageSessionId) return;
+			const oldSession = pageSessionId;
+			clearTarget("target_changing");
+			if (oldSession) {
+				await session.send("Page.stopScreencast", {}, oldSession).catch(() => {});
+				await session.send("Target.detachFromTarget", { sessionId: oldSession }).catch(() => {});
 			}
-			await pinTarget(next.targetId);
-			emit({ type: "url", url: next.url, title: next.title });
-			return true;
+			try { await pinTarget(next); }
+			catch (err) { clearTarget("target_gone"); throw err; }
 		},
 		async open(u) {
-			await session.send("Page.navigate", { url: u }, pageSessionId);
+			await session.send("Page.navigate", { url: u }, requireTarget());
 		},
 		async back() {
-			const h = await session.send("Page.getNavigationHistory", {}, pageSessionId);
+			const sid = requireTarget();
+			const h = await session.send("Page.getNavigationHistory", {}, sid);
 			if (h.currentIndex <= 0) return;
 			await session.send(
 				"Page.navigateToHistoryEntry",
 				{ entryId: h.entries[h.currentIndex - 1].id },
-				pageSessionId,
+				requireTarget(sid),
 			);
 		},
 		async forward() {
-			const h = await session.send("Page.getNavigationHistory", {}, pageSessionId);
+			const sid = requireTarget();
+			const h = await session.send("Page.getNavigationHistory", {}, sid);
 			if (h.currentIndex >= h.entries.length - 1) return;
 			await session.send(
 				"Page.navigateToHistoryEntry",
 				{ entryId: h.entries[h.currentIndex + 1].id },
-				pageSessionId,
+				requireTarget(sid),
 			);
 		},
 		async reload() {
-			await session.send("Page.reload", {}, pageSessionId);
+			await session.send("Page.reload", {}, requireTarget());
 		},
 		// x/y arrive in page CSS pixels — the Renderer scales pane cells ->
 		// frame pixels -> CSS via the per-frame metadata before calling.
 		async click(x, y) {
+			const sid = requireTarget();
 			const base = { x, y, button: "left", clickCount: 1 };
-			await session.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base }, pageSessionId);
-			await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base }, pageSessionId);
+			await session.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base }, sid);
+			await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base }, requireTarget(sid));
 		},
 		async scroll(dir, px) {
 			const m = lastMeta;
@@ -523,24 +557,24 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			await session.send(
 				"Input.dispatchMouseEvent",
 				{ type: "mouseWheel", x: cx, y: cy, deltaX: 0, deltaY: dir === "down" ? px : -px },
-				pageSessionId,
+				requireTarget(),
 			);
 		},
 		async type(text) {
-			await session.send("Input.insertText", { text }, pageSessionId);
+			await session.send("Input.insertText", { text }, requireTarget());
 		},
 		async screenshot(file) {
 			const { data } = await session.send(
 				"Page.captureScreenshot",
 				{ format: "png" },
-				pageSessionId,
+				requireTarget(),
 				15_000,
 			);
 			const fs = await import("node:fs");
 			fs.writeFileSync(file, Buffer.from(data, "base64"));
 		},
 		async sessionExists() {
-			if (!session || session.dead || !pinnedTargetId) return false;
+			if (!session || session.dead) return false;
 			return session.ping();
 		},
 		close() {

@@ -818,6 +818,107 @@ test("prompt mode swallows mouse reports without cancelling", () => {
 	);
 });
 
+test("literal text preserves whitespace and chunked bracketed paste without submitting", async () => {
+	const value = '  first\n\tsecond\r\n"quoted" \\ $` +^%~(){}[] 漢🙂  ';
+	const framed = `\x1b[200~${value}\x1b[201~`;
+	for (let split = 1; split < framed.length; split++) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		r.tick = async () => {};
+		const inserted = [];
+		r.browser = { type: async text => inserted.push(text) };
+		r.onKey("i");
+		r.feed(framed.slice(0, split));
+		r.feed(framed.slice(split));
+		assert.equal(r.promptState.value, value, `paste split at ${split}`);
+		assert.deepEqual(inserted, [], "paste alone never sends text or Enter");
+		r.feed("\r");
+		await flush();
+		assert.deepEqual(inserted, [value]);
+	}
+});
+
+test("pasted commands outside prompts cannot operate the pane; canceled and oversized pastes send nothing", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.tick = async () => {};
+	const sent = [];
+	r.browser = { type: async value => sent.push(value), reload: async () => sent.push("reload") };
+	r.feed("\x1b[200~rjiu\n\x1b[201~");
+	await flush();
+	assert.equal(r.promptState, null);
+	assert.deepEqual(sent, []);
+	r.onKey("i");
+	r.feed("\x1b[200~hello\n\x1b[201~");
+	r.onKey("\x1b");
+	await flush();
+	assert.deepEqual(sent, []);
+	r.onKey("i");
+	r.feed(`\x1b[200~${"x".repeat(1024 * 1024 + 1)}\x1b[201~`);
+	assert.match(r.banner, /exceeds/);
+	assert.equal(r.promptState.value, "");
+	r.feed("\r");
+	await flush();
+	assert.deepEqual(sent, []);
+});
+
+test("literal input accepts whitespace-only values and keeps typed Unicode intact on backspace", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.tick = async () => {};
+	const values = [];
+	r.browser = { type: async value => values.push(value) };
+	r.onKey("i");
+	r.feed("  \r");
+	await flush();
+	assert.deepEqual(values, ["  "]);
+	r.onKey("i");
+	r.feed("🙂\x7f漢\r");
+	await flush();
+	assert.deepEqual(values, ["  ", "漢"]);
+});
+
+test("tab picker paginates within narrow and wide panes, including text-only mode", () => {
+	const r = quiet(mkRenderer());
+	r.mode = "text";
+	r.targetPicker = { loading: false, index: 12, targets: Array.from({ length: 20 }, (_, i) => ({ targetId: `T${i}`, title: `Tab ${i} ${"long title ".repeat(8)}`, url: `https://localhost/${i}` })) };
+	assert.ok(r.size().imageRows > 0, "text-only panes reserve room for the picker");
+	const write = process.stdout.write;
+	try {
+		for (const [cols, rows] of [[40, 12], [100, 30]]) {
+			const chunks = [];
+			process.stdout.write = value => { chunks.push(value); return true; };
+			r.size = () => ({ cols, rows, imageRows: rows - 4, imageTopRow: 3, bottomRow: rows });
+			r.renderTargetPicker();
+			assert.equal(chunks.length, rows - 4);
+			assert.ok(chunks.some(value => value.includes("13. Tab 12")), "highlighted tab stays in view");
+			for (const chunk of chunks) {
+				const match = /^\x1b\[(\d+);1H([^\x1b]*)\x1b\[K$/.exec(chunk);
+				assert.ok(match, "each row is a single bounded terminal write");
+				assert.ok(Number(match[1]) < rows);
+				assert.ok(match[2].length <= cols);
+			}
+		}
+	} finally { process.stdout.write = write; }
+});
+
+test("paste preview escapes control characters without altering the inserted text", () => {
+	const r = quiet(mkRenderer());
+	const value = "first\n\tsecond\x1b[2J\x9b\u202e";
+	r.openPrompt("text: ", () => {}, { literal: true });
+	r.feed(`\x1b[200~${value}\x1b[201~`);
+	const write = process.stdout.write;
+	const chunks = [];
+	process.stdout.write = text => { chunks.push(text); return true; };
+	try { Renderer.prototype.renderBottom.call(r); }
+	finally { process.stdout.write = write; }
+	assert.equal(r.promptState.value, value);
+	assert.ok(chunks[0].includes("first\\n\\tsecond\\u001b[2J"));
+	assert.ok(!chunks[0].includes("\x1b[2J"));
+	assert.ok(!chunks[0].includes("\x9b"));
+	assert.ok(!chunks[0].includes("\u202e"));
+});
+
 test("feed gates keys and clicks while unattached", async () => {
 	const r = quiet(mkRenderer());
 	const calls = [];
@@ -1308,21 +1409,29 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 		);
 	const server = http.createServer((_req, res) => {
 		res.setHeader("Content-Type", "text/html");
-		res.end("<!doctype html><title>Browser stream test</title><h1>Local browser fixture</h1>");
+		res.end("<!doctype html><title>Browser stream test</title><h1>Local browser fixture</h1><textarea aria-label='Text'></textarea>");
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
+	const streamEvents = {};
+	const onStreamMessage = r.onStreamMessage.bind(r);
+	r.onStreamMessage = (message) => {
+		streamEvents[message.type] = (streamEvents[message.type] ?? 0) + 1;
+		onStreamMessage(message);
+	};
 	try {
-		await ab(["open", `http://127.0.0.1:${server.address().port}`]);
+		await ab(["open", "about:blank"]);
 		// Viewport fitting has dedicated tests; disabling it here prevents its
 		// queued resize command from racing this stream test's session close.
 		r.fitViewport = async () => false;
 		assert.equal(await r.goLive(), true, "stream connects");
+		// Subscribe before navigating so the test observes a new document's paint.
+		await ab(["open", `http://127.0.0.1:${server.address().port}`]);
 		const deadline = Date.now() + 10_000;
 		while (r.frameSeq === 0 && Date.now() < deadline) {
 			await new Promise((res) => setTimeout(res, 100));
 		}
-		assert.ok(r.frameSeq > 0, "a screencast frame arrived");
+		assert.ok(r.frameSeq > 0, `a screencast frame arrived: ${JSON.stringify({ streamEvents, banner: r.banner, paintErrors: r.paintErrors })}`);
 		assert.ok(
 			imageDims(fs.readFileSync(r.shotJpg)),
 			"frame is a valid image on disk",
@@ -1331,6 +1440,11 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 		const fixtureUrl = `http://127.0.0.1:${server.address().port}`;
 		await ab(["open", fixtureUrl]);
 		assert.ok(await until(() => r.frameSeq > beforeNavigation), "navigation produces a fresh streamed frame");
+		await ab(["focus", "textarea"]);
+		const literal = '  spaces\n\ttabs 漢🙂 "quotes"  ';
+		await r.browser.type(literal);
+		const value = await ab(["--json", "get", "value", "textarea"]);
+		assert.equal(JSON.parse(value).data.value, literal, "shared session inserts verbatim multiline text");
 		await ab(["eval", 'console.warn("hb-itest-marker")']);
 		const cDeadline = Date.now() + 10_000;
 		while (
@@ -1521,7 +1635,7 @@ test('userAction surfaces failures in the banner (live mode has no tick report)'
   assert.ok(headers >= 1, 'failure banner painted');
 });
 
-test('feed holds a split ESC-[ but a bare ESC still dispatches immediately', () => {
+test('feed holds split escape sequences and dispatches a bare ESC after a short delay', async () => {
   const r = quiet(mkRenderer());
   const keys = [];
   r.onKey = ch => keys.push(ch);
@@ -1530,9 +1644,9 @@ test('feed holds a split ESC-[ but a bare ESC still dispatches immediately', () 
   r.feed('<0;10;5M');
   assert.deepEqual(keys, [], 'completed report went to the mouse path');
   r.feed('\x1b');
-  // bare ESC reaches the key path at once (prompt cancel must not lag);
-  // onKey ignores it when no prompt is open and it is not a mapped key.
+  await new Promise(resolve => setTimeout(resolve, 70));
   assert.equal(r.inputBuf, '');
+  assert.deepEqual(keys, ['\x1b']);
 });
 
 // --- Pane viewport fitting ---
@@ -2076,6 +2190,7 @@ const fakeCdpBackend = (over = {}) => {
 				port: "9222",
 				guid: "guid-1",
 				browser: "Chrome/150",
+				targetId: "T1",
 				url: "https://x/",
 				title: "X",
 				rediscoverable: true,
@@ -2086,6 +2201,8 @@ const fakeCdpBackend = (over = {}) => {
 		ackFrame: async (ackId, gen) => calls.push(`ack:${ackId}:${gen}`),
 		restartScreencast: async () => calls.push("restart"),
 		click: async (x, y) => calls.push(`click:${x},${y}`),
+		listTargets: async () => [{ targetId: "T1", title: "One", url: "https://one/", selected: true }, { targetId: "T2", title: "Two", url: "https://two/", selected: false }],
+		selectTarget: async (id) => calls.push(`select:${id}`),
 		close: () => calls.push("close"),
 	};
 };
@@ -2360,36 +2477,84 @@ test("navigate: baseline stays pending when the busy guard skips the read", asyn
 	);
 });
 
-test("t cycles the pinned page target in attach mode only", { skip: !canCdp }, async () => {
+test("t opens a stable tab list and selects only on Enter, in attach mode only", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
-	let cycles = 0;
-	r.browser.cycleTarget = async () => {
-		cycles++;
-		return true;
-	};
 	await r.tick();
 	r.onKey("t");
 	await flush();
-	assert.equal(cycles, 1);
+	assert.equal(r.targetPicker.targets.length, 2);
+	assert.ok(!r.browser.calls.some(c => c.startsWith("select:")));
+	r.feed("\x1b[B");
+	r.feed("\r");
+	await flush();
+	assert.ok(r.browser.calls.includes("select:T2"));
 
 	const plain = quiet(mkRenderer());
 	plain.attached = true;
-	let plainCycles = 0;
-	plain.browser = { ...plain.browser, cycleTarget: async () => plainCycles++ };
 	plain.onKey("t");
 	await flush();
-	assert.equal(plainCycles, 0, "agent-browser backend has no target cycling");
+	assert.equal(plain.targetPicker, null, "agent-browser backend keeps its session's active tab");
 });
 
-test("t with a single page target reports instead of failing silently", { skip: !canCdp }, async () => {
+test("empty tab picker can refresh when a new tab arrives", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
-	r.browser.cycleTarget = async () => false;
+	r.browser.listTargets = async () => [];
 	await r.tick();
 	r.onKey("t");
 	await flush();
-	assert.equal(r.banner, "no other page targets");
+	assert.equal(r.targetPicker.targets.length, 0);
+	r.browser.listTargets = async () => [{ targetId: "T2", title: "New", url: "https://new/" }];
+	r.onKey("t");
+	await flush();
+	assert.equal(r.targetPicker.targets[0].targetId, "T2");
+});
+
+test("target loss cancels pending text, clears frame geometry and drops queued input without reconnecting", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	r.browser.type = async () => r.browser.calls.push("type");
+	r.lastFrameMeta = { deviceWidth: 800, deviceHeight: 600 };
+	fs.writeFileSync(r.shotJpg, jpeg(800, 600));
+	r.onKey("i");
+	r.feed("\x1b[200~unfinished");
+	let release;
+	r.enqueue(() => new Promise(resolve => { release = resolve; }));
+	await flush();
+	r.userAction(() => r.browser.type("queued"));
+	r.browser.emit({ type: "target_gone" });
+	r.browser.emit({ type: "target_selected", targetId: "T2", url: "https://two/", title: "Two" });
+	r.feed("\nrest\x1b[201~");
+	release();
+	await flush();
+	assert.equal(r.promptState, null);
+	assert.equal(r.lastFrameMeta, null);
+	assert.equal(fs.existsSync(r.shotJpg), false);
+	assert.ok(!r.browser.calls.includes("type"));
+	assert.equal(r.browser.calls.filter(c => c === "connect").length, 1);
+	r.browser.emit({ type: "target_gone" });
+	r.onKey("i");
+	r.onKey("u");
+	r.onMouse({ button: 0, col: 10, row: 5 });
+	r.checkFrameStaleness(Date.now() + 60_000);
+	await r.tick();
+	assert.equal(r.promptState, null);
+	assert.ok(!r.browser.calls.includes("restart"));
+	assert.equal(r.attached, true);
+	assert.match(r.banner, /select a tab/);
+});
+
+test("observe-only is checked again when queued input executes", { skip: !canCdp }, async () => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	let sent = false;
+	r.userAction(async () => { sent = true; });
+	r.toggleObserveOnly();
+	await flush();
+	assert.equal(sent, false);
 });
 
 test("observe-only: o toggles, page-affecting keys and clicks are dropped", { skip: !canCdp }, async () => {
@@ -2446,16 +2611,11 @@ test("observe-only: u prompt is blocked; a Cmd+click handoff is consumed, not fo
 test("observe-only: t (view-only) and q remain available; header shows the state", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
-	let cycles = 0;
-	r.browser.cycleTarget = async () => {
-		cycles++;
-		return true;
-	};
 	await r.tick();
 	r.onKey("o");
 	r.onKey("t");
 	await flush();
-	assert.equal(cycles, 1, "cycling the pane's own view stays allowed");
+	assert.equal(r.targetPicker.targets.length, 2, "selecting the pane's own view stays allowed");
 });
 
 // --- Wave 5: Chromium launch mode ---

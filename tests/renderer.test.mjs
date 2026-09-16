@@ -1413,17 +1413,25 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
+	const streamEvents = {};
+	const onStreamMessage = r.onStreamMessage.bind(r);
+	r.onStreamMessage = (message) => {
+		streamEvents[message.type] = (streamEvents[message.type] ?? 0) + 1;
+		onStreamMessage(message);
+	};
 	try {
-		await ab(["open", `http://127.0.0.1:${server.address().port}`]);
+		await ab(["open", "about:blank"]);
 		// Viewport fitting has dedicated tests; disabling it here prevents its
 		// queued resize command from racing this stream test's session close.
 		r.fitViewport = async () => false;
 		assert.equal(await r.goLive(), true, "stream connects");
+		// Subscribe before navigating so the test observes a new document's paint.
+		await ab(["open", `http://127.0.0.1:${server.address().port}`]);
 		const deadline = Date.now() + 10_000;
 		while (r.frameSeq === 0 && Date.now() < deadline) {
 			await new Promise((res) => setTimeout(res, 100));
 		}
-		assert.ok(r.frameSeq > 0, "a screencast frame arrived");
+		assert.ok(r.frameSeq > 0, `a screencast frame arrived: ${JSON.stringify({ streamEvents, banner: r.banner, paintErrors: r.paintErrors })}`);
 		assert.ok(
 			imageDims(fs.readFileSync(r.shotJpg)),
 			"frame is a valid image on disk",

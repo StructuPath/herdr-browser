@@ -423,7 +423,7 @@ export function formatNetworkFailure({ method, url, status }) {
 
 // --- agent-browser access ---
 
-export function makeBrowser(session, bin = "agent-browser") {
+export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
 	// maxBuffer would throw on every tick and freeze the pane for good.
 	const maxBuffer = 16 * 1024 * 1024;
@@ -446,7 +446,7 @@ export function makeBrowser(session, bin = "agent-browser") {
 		const { stdout } = await pExecFile(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
-			{ timeout, maxBuffer },
+			{ timeout, maxBuffer, env },
 		);
 		const arr = parse(stdout, "batch output");
 		for (const r of arr) {
@@ -464,6 +464,7 @@ export function makeBrowser(session, bin = "agent-browser") {
 			{
 				timeout: 10_000,
 				maxBuffer,
+				env,
 			},
 		);
 		const parsed = parse(stdout, "output");
@@ -541,6 +542,7 @@ export function makeBrowser(session, bin = "agent-browser") {
 				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
 					timeout: 10_000,
 					maxBuffer,
+					env,
 				});
 				// Exact match only: a substring hit (herdr-ws-w2 vs herdr-ws-w22)
 				// would make the pane attach and auto-create a session it must not.
@@ -592,7 +594,7 @@ export class Renderer {
 		this.browser =
 			this.backend === "attach"
 				? makeCdpBrowser(this.cdpEndpoint)
-				: makeBrowser(this.session, this.bin);
+				: makeBrowser(this.session, this.bin, this.env);
 		// Attach mode observes a browser someone else owns: ownership is never
 		// claimed, so the quit path can never close a stranger's session.
 		this.ownershipEnabled = this.backend !== "attach";
@@ -1883,6 +1885,7 @@ export class Renderer {
 		try {
 			spawnSync(this.bin, ["--session", this.session, "close"], {
 				timeout: 2_000,
+				env: this.env,
 			});
 		} catch {
 			/* already gone */

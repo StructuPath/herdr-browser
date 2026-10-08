@@ -499,6 +499,7 @@ npm run doctor
 npm run build
 npm run validate
 npm run test:integration
+npm run test:qa
 herdr plugin link .
 ```
 
@@ -514,7 +515,15 @@ browser coverage; optional browser tests skip when their prerequisites are
 unavailable. `npm run test:integration` requires both an installed Chrome or
 Chromium and agent-browser with its engine installed, on Node 22+. It fails
 instead of silently skipping either real-browser path. Tests use a local HTTP
-fixture and isolated browser sessions.
+fixture and isolated browser sessions. `npm run test:qa` requires agent-browser
+with its engine installed and runs saved desktop/mobile scenarios, including
+assertion failures and browser error evidence. CI installs pinned agent-browser
+0.33.2 using Node 24, then tests the plugin on Node 22/24 on Linux and macOS.
+
+Before release, require local validation, both strict browser commands, and the
+hosted CI matrix to pass for the reviewed commit. A passing suite with browser
+coverage skipped is insufficient. Manually verify Kitty graphics and symbol
+rendering in Herdr on macOS and Linux.
 
 For backend choices and the remaining readiness work, see the
 [readiness assessment](docs/readiness.md).

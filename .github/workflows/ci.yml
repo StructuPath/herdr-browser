@@ -14,9 +14,8 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        # 20 is the supported floor; 22 exercises live streaming and CDP
-        # attach mode (global WebSocket client).
-        node-version: [20, 22]
+        # 20 is the supported floor; 22/24 support the global WebSocket client.
+        node-version: [20, 22, 24]
     steps:
       - name: Check out repository
         # v4.2.2
@@ -30,11 +29,66 @@ jobs:
         uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Run tests
-        run: npm test
-      - name: Validate shell syntax
-        run: bash -n scripts/*.sh
+      - name: Validate source, manifest, shell scripts, and tests
+        run: npm run validate
       - name: Run ShellCheck
         run: shellcheck scripts/*.sh
-      - name: Validate plugin manifest
-        run: node scripts/check-manifest.mjs
+
+  browser:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node-version: [22, 24]
+    steps:
+      - name: Check out repository
+        # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Node.js for agent-browser installation
+        # agent-browser 0.33.2 requires Node 24 to install its native CLI.
+        # v4.0.3
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
+        with:
+          node-version: 24
+      - name: Install pinned agent-browser
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/agent-browser" agent-browser@0.33.2
+          echo "$RUNNER_TEMP/agent-browser/bin" >> "$GITHUB_PATH"
+      - name: Install Chromium and platform prerequisites
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            agent-browser install --with-deps
+          else
+            agent-browser install
+          fi
+      - name: Export installed Chromium executable
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import os
+          from pathlib import Path
+
+          cache = Path.home() / ".agent-browser" / "browsers"
+          binaries = [p for p in cache.rglob("*")
+                      if p.name in ("chrome", "Google Chrome for Testing")
+                      and p.is_file() and os.access(p, os.X_OK)]
+          if len(binaries) != 1:
+              raise SystemExit(f"Expected one installed Chromium executable, found {binaries}")
+          print(f"HERDR_BROWSER_CHROMIUM={binaries[0]}")
+          PY
+      - name: Set up Node.js under test
+        # v4.0.3
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Check browser prerequisites
+        run: npm run doctor
+      - name: Require real-browser integration coverage
+        run: npm run test:integration
+      - name: Require saved QA browser coverage
+        run: npm run test:qa

@@ -36,13 +36,33 @@ own Chrome engine; a second bundled distribution is unnecessary.
 - Limit test discovery to this checkout's `tests/` directory; Node 20 otherwise
   traverses hidden nested worktrees and runs unrelated, stale test copies.
 
+## Automated readiness gates
+
+CI runs `npm run validate` on Linux with Node 20, 22, and 24. This checks source
+and shell syntax, the plugin manifest, ShellCheck, and the complete test suite.
+Separate browser jobs run on Linux and macOS with Node 22 and 24. They install
+pinned agent-browser 0.33.2 under Node 24, install its Chromium engine (including
+Linux system dependencies), and export the installed executable through
+`HERDR_BROWSER_CHROMIUM` before switching to the Node version under test.
+
+Every browser job runs `npm run doctor`, `npm run test:integration`, and
+`npm run test:qa`. The strict test commands require real local Chromium,
+shared-session streaming, and desktop/mobile saved QA coverage; missing
+prerequisites and installation failures fail the job instead of skipping that
+coverage. Existing tests use local fixtures and clean up their browser sessions.
+
+Readiness requires local validation and both strict browser commands to pass,
+plus a passing hosted matrix for the exact commit being reviewed. Configuring
+these gates does not establish that they have passed. Before release, manually
+verify Kitty graphics and symbol rendering in Herdr on macOS and Linux; hosted
+browser tests do not verify terminal display quality or pane interaction.
+
 ## Next recommendations, in priority order
 
-1. **Release compatibility matrix.** Exercise macOS and Linux, Node 22/24,
-   supported agent-browser versions, and Kitty/symbol rendering in Herdr.
-   Current CI has Node 20/22 but does not install agent-browser, so its passing
-   status alone cannot prove shared-session integration. Adopting the strict
-   integration command in hosted CI is a separate workflow change.
+1. **Release compatibility checks.** Complete the manual Kitty/symbol checks
+   in Herdr on macOS and Linux. Hosted CI now covers both platforms on Node
+   22/24 with agent-browser 0.33.2; expand agent-browser version coverage when
+   claiming support for additional versions.
 2. **CDP transport correctness.** HTTP discovery currently uses `node:http`
    even for an HTTPS input and assumes the local debugging port. Implement
    actual HTTPS discovery with transport tests before advertising secured

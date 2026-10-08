@@ -752,7 +752,7 @@ test("cleanup closes only self-created sessions and removes shot files", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-close-"));
 	const stub = path.join(dir, "ab-stub");
 	const logf = path.join(dir, "log");
-	fs.writeFileSync(stub, `#!/usr/bin/env bash\necho "$@" >> "${logf}"\n`);
+	fs.writeFileSync(stub, `#!/bin/sh\necho "$@" >> "${logf}"\n`);
 	fs.chmodSync(stub, 0o755);
 	const mk = () => quiet(mkRenderer());
 	const own = mk();
@@ -1397,13 +1397,20 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 }, async () => {
 	assert.ok(hasAgentBrowser && canCdp, "integration requires agent-browser and Node 22+");
 	const session = `hb-itest-${process.pid}`;
+	// Keep Unix socket paths below macOS's limit even with a long checkout HOME.
+	const socketDir = fs.mkdtempSync("/tmp/hb-s-");
+	const env = {
+		...process.env,
+		HERDR_BROWSER_SESSION: session,
+		AGENT_BROWSER_SOCKET_DIR: socketDir,
+	};
 	const { execFile: ef } = await import("node:child_process");
 	const ab = (args) =>
 		new Promise((res, rej) =>
 			ef(
 				"agent-browser",
 				["--session", session, ...args],
-				{ timeout: 15_000 },
+				{ timeout: 15_000, env },
 				(e, so) => (e ? rej(e) : res(so)),
 			),
 		);
@@ -1412,7 +1419,7 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 		res.end("<!doctype html><title>Browser stream test</title><h1>Local browser fixture</h1><textarea aria-label='Text'></textarea>");
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-	const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
+	const r = quiet(mkRenderer(env));
 	const streamEvents = {};
 	const onStreamMessage = r.onStreamMessage.bind(r);
 	r.onStreamMessage = (message) => {
@@ -1472,7 +1479,9 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 	} finally {
 		r.dropLive();
 		await ab(["close"]).catch(() => {});
+		r.cleanup();
 		await new Promise((resolve) => server.close(resolve));
+		fs.rmSync(socketDir, { recursive: true, force: true });
 	}
 });
 

@@ -290,9 +290,21 @@ test("truncate", () => {
 	assert.equal(truncate("hello", 10), "hello");
 	assert.equal(truncate("hello world", 8), "hello w…");
 	assert.equal(truncate("x", 0), "", "zero width yields nothing");
+	assert.equal(truncate("x", -1), "", "negative width yields nothing");
+	assert.equal(truncate("xy", 1), "…");
+	assert.equal(truncate("日本", 1), "…");
 	// CJK chars occupy 2 terminal cells: 4 wide chars + ellipsis fill 9 cells
 	assert.equal(truncate("日本語日本語", 9), "日本語日…");
 	assert.equal(truncate("ab日本語", 5), "ab日…");
+	assert.equal(truncate("日本", 4), "日本");
+	assert.equal(truncate("e\u0301", 1), "e\u0301");
+	assert.equal(truncate("e\u0301xy", 2), "e\u0301…");
+	assert.equal(truncate("👍🏽", 2), "👍🏽");
+	assert.equal(truncate("👍🏽xy", 3), "👍🏽…");
+	assert.equal(truncate("👍🏽", 1), "…");
+	assert.equal(truncate("👩‍💻", 2), "👩‍💻");
+	assert.equal(truncate("👩‍💻xy", 3), "👩‍💻…");
+	assert.equal(truncate("✈\ufe0f", 1), "✈\ufe0f");
 });
 
 test("pollDelay backs off on idle, 8x cap within minutes, 30x floor after ~5 min", () => {
@@ -876,6 +888,42 @@ test("literal input accepts whitespace-only values and keeps typed Unicode intac
 	r.feed("🙂\x7f漢\r");
 	await flush();
 	assert.deepEqual(values, ["  ", "漢"]);
+});
+
+for (const literal of [false, true]) {
+	for (const backspace of ["\x7f", "\b"]) {
+		for (const grapheme of ["e\u0301", "👍🏽", "👩‍💻", "🇺🇸", "👨‍👩‍👧‍👦"]) {
+			test(`Backspace removes a complete grapheme ${JSON.stringify(grapheme)} (literal=${literal}, key=${JSON.stringify(backspace)})`, () => {
+				const r = quiet(mkRenderer());
+				r.openPrompt("text: ", () => {}, { literal });
+				r.feed(`A${grapheme}`);
+				r.feed(backspace);
+				assert.equal(r.promptState.value, "A");
+				r.feed(backspace);
+				assert.equal(r.promptState.value, "");
+				r.feed(backspace);
+				assert.equal(r.promptState.value, "", "Backspace on an empty prompt is harmless");
+			});
+		}
+	}
+}
+
+test("Backspace removes a pasted grapheme before literal text submission", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.tick = async () => {};
+	const values = [];
+	r.browser = { type: async value => values.push(value) };
+	const remaining = "  first\n\t漢🙂  ";
+	for (const backspace of ["\x7f", "\b"]) {
+		r.onKey("i");
+		r.feed(`\x1b[200~${remaining}👨‍👩‍👧‍👦\x1b[201~`);
+		r.feed(backspace);
+		assert.equal(r.promptState.value, remaining);
+		r.feed("\r");
+		await flush();
+	}
+	assert.deepEqual(values, [remaining, remaining]);
 });
 
 test("tab picker paginates within narrow and wide panes, including text-only mode", () => {

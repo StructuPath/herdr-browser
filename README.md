@@ -167,7 +167,8 @@ Clicks are mapped through the rendered-frame geometry to page pixels, so they
 work with overlays, canvas content, and shadow DOM. Live sessions usually
 repaint immediately; polling fallback can take up to the configured interval.
 
-The text prompt preserves leading/trailing spaces and Unicode. In a terminal
+The text prompt preserves leading/trailing spaces and Unicode; Backspace
+removes a complete Unicode character, including joined emoji. In a terminal
 that supports bracketed paste, pasted tabs and newlines remain text in the
 prompt until you press Enter to insert it. Newlines appear as `\n` in the
 preview. Inserting text does not send an Enter key to the page or submit a

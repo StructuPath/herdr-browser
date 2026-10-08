@@ -12,6 +12,7 @@ import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
 
 const pExecFile = promisify(execFile);
 const ESC = "\x1b";
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 // Fixed graphics id for the pane's screenshot frame: re-transmitting data
 // for an id auto-replaces the previous frame, and deletes target only our
 // image instead of every image in the terminal (d=A).
@@ -167,13 +168,16 @@ export function kittyImageSequence(pngBuf, pngW, pngH, cols, imageRows) {
 	return out;
 }
 
-// Display-cell width: enough wcwidth for header truncation — CJK wide
-// ranges and emoji count 2 cells, everything else 1.
+// Display-cell width of one grapheme: enough wcwidth for header truncation —
+// CJK wide ranges and emoji count 2 cells, everything else 1. Combining
+// marks, joiners and skin-tone modifiers add no cells.
 function cellWidth(s) {
 	let w = 0;
 	for (const ch of s) {
+		if (/\p{Mark}|[\u200c\u200d\u{1f3fb}-\u{1f3ff}]/u.test(ch)) continue;
 		const cp = ch.codePointAt(0);
-		w +=
+		w = Math.max(
+			w,
 			cp >= 0x1100 &&
 			(cp <= 0x115f ||
 				cp === 0x2329 ||
@@ -187,21 +191,25 @@ function cellWidth(s) {
 				(cp >= 0x1f300 && cp <= 0x1faff) ||
 				(cp >= 0x20000 && cp <= 0x3fffd))
 				? 2
-				: 1;
+				: 1,
+		);
 	}
 	return w;
 }
 
 export function truncate(s, width) {
 	if (width <= 0) return "";
-	if (cellWidth(s) <= width) return s;
+	const clusters = Array.from(graphemeSegmenter.segment(s), ({ segment }) => ({
+		segment,
+		width: cellWidth(segment),
+	}));
+	if (clusters.reduce((sum, cluster) => sum + cluster.width, 0) <= width) return s;
 	let out = "";
 	let w = 0;
-	for (const ch of s) {
-		const cw = cellWidth(ch);
-		if (w + cw > width - 1) break;
-		out += ch;
-		w += cw;
+	for (const cluster of clusters) {
+		if (w + cluster.width > width - 1) break;
+		out += cluster.segment;
+		w += cluster.width;
 	}
 	return out + "…";
 }
@@ -2005,7 +2013,11 @@ export class Renderer {
 				this.renderBottom();
 				return;
 			}
-			if (ch === "\x7f" || ch === "\b") p.value = Array.from(p.value).slice(0, -1).join("");
+			if (ch === "\x7f" || ch === "\b") {
+				let lastIndex = 0;
+				for (const { index } of graphemeSegmenter.segment(p.value)) lastIndex = index;
+				p.value = p.value.slice(0, lastIndex);
+			}
 			// Printable chars only; 8-bit C1 controls (0x80-0x9f) are refused —
 			// the value is echoed to the terminal on every keystroke.
 			else if (ch >= " " && !(ch >= "\x7f" && ch <= "\x9f")) p.value += ch;

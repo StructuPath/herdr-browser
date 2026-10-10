@@ -4,6 +4,7 @@
 // creates or closes targets and exposes no listening port of its own.
 import http from "node:http";
 import net from "node:net";
+import { formatAxNodes, formatRequests } from "./page-text.mjs";
 
 // Attach mode needs a WebSocket client; Node grew a global one in 22.
 // On Node 20 the pane keeps working in agent-browser mode — callers gate on
@@ -262,6 +263,10 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	let attachTimeMs = 0;
 	let connectedOnce = false;
 	let selection = 0;
+	let accessibilitySessionId = null;
+	let networkSessionId = null;
+	const networkRows = [];
+	const networkById = new Map();
 	const targetError = () => Object.assign(new Error("select a tab with t before sending input"), { code: "TARGET_GONE" });
 	const requireTarget = (expected = pageSessionId) => {
 		if (!expected || expected !== pageSessionId || !pinnedTargetId || session?.dead) throw targetError();
@@ -285,6 +290,10 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		pinnedTargetId = null;
 		pageSessionId = null;
 		lastMeta = null;
+		accessibilitySessionId = null;
+		networkSessionId = null;
+		networkRows.length = 0;
+		networkById.clear();
 		emit({ type });
 	};
 
@@ -352,7 +361,37 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		}
 	};
 
+	const recordNetworkEvent = (m) => {
+		if (!networkSessionId || m.sessionId !== pageSessionId || m.sessionId !== networkSessionId) return;
+		const p = m.params ?? {};
+		if (m.method === "Network.requestWillBeSent") {
+			const row = {
+				method: p.request?.method ?? "",
+				status: null,
+				type: p.type ?? "",
+				url: p.request?.url ?? "",
+			};
+			networkRows.push(row);
+			networkById.set(p.requestId, row);
+			if (networkRows.length > 200) {
+				const removed = networkRows.shift();
+				for (const [requestId, current] of networkById) {
+					if (current === removed) networkById.delete(requestId);
+				}
+			}
+			return;
+		}
+		const row = networkById.get(p.requestId);
+		if (!row) return;
+		if (m.method === "Network.responseReceived") row.status = p.response?.status ?? null;
+		else if (m.method === "Network.loadingFailed") row.status = p.errorText || "failed";
+	};
+
 	const onCdpEvent = (m) => {
+		if (m.method?.startsWith("Network.")) {
+			recordNetworkEvent(m);
+			return;
+		}
 		if (m.method === "Page.screencastFrame" && pageSessionId && m.sessionId === pageSessionId) {
 			lastMeta = m.params.metadata ?? null;
 			emit({
@@ -515,6 +554,33 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			}
 			try { await pinTarget(next); }
 			catch (err) { clearTarget("target_gone"); throw err; }
+		},
+		// Accessibility and Network stay opt-in: enabling either domain is the
+		// one honest footprint made only after the user requests its view.
+		async snapshotText() {
+			const sid = requireTarget();
+			try {
+				if (accessibilitySessionId !== sid) {
+					await session.send("Accessibility.enable", {}, sid);
+					requireTarget(sid);
+					accessibilitySessionId = sid;
+				}
+				const { nodes = [] } = await session.send("Accessibility.getFullAXTree", {}, requireTarget(sid));
+				return formatAxNodes(nodes.map(({ nodeId, role, name, childIds }) => ({ nodeId, role, name, childIds })));
+			} catch (err) {
+				if (/wasn't found|not found|not supported|unknown method/i.test(err?.message ?? ""))
+					throw new Error("browser has no Accessibility domain");
+				throw err;
+			}
+		},
+		async networkRequests() {
+			const sid = requireTarget();
+			if (networkSessionId !== sid) {
+				await session.send("Network.enable", {}, sid);
+				requireTarget(sid);
+				networkSessionId = sid;
+			}
+			return formatRequests(networkRows);
 		},
 		async open(u) {
 			await session.send("Page.navigate", { url: u }, requireTarget());

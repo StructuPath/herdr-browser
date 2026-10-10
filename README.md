@@ -39,6 +39,10 @@ guides to this plugin and its three siblings (Guard, Swarm, Conductor).
   guesses; keyboard input, history, reload, and wheel scrolling are supported.
 - **Adaptive rendering** — Kitty graphics when available, ANSI symbols through
   chafa otherwise, and a text-only last resort.
+- **Read the page as text** — press `s` for the accessibility-tree snapshot
+  (interactive elements get `@eN` refs), `n` for the full recent request table,
+  and `d` to diff the page against your last snapshot; the screenshot returns
+  on any page-driving action.
 - **Built-in recording** — capture the workspace session as WebM.
 - **Localhost integration** — Cmd/Ctrl+click a local development URL in Herdr to
   open it in the workspace browser pane.
@@ -160,6 +164,9 @@ Use these controls to drive the shared session directly:
 | `j` / `k` | Scroll down / up |
 | Space | Scroll down |
 | Mouse wheel | Scroll the page |
+| `s` | Toggle the accessibility-tree snapshot (interactive elements carry `@eN` refs) |
+| `n` | Toggle the recent request table |
+| `d` | Diff the current page against the last snapshot (press `s` first) |
 | `Esc` | Cancel the active prompt |
 | `q` | Close the viewer pane |
 

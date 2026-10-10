@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import {
@@ -252,8 +252,98 @@ test("adapter surface: forbidden methods are absent, required ones present", asy
 	const { b } = await attachBrowser(fake);
 	for (const missing of ["setViewport", "network", "snapshot", "streamEnable", "streamStatus"])
 		assert.equal(b[missing], undefined, `${missing} must not exist — duck-type guards depend on it`);
-	for (const required of ["open", "back", "forward", "reload", "click", "scroll", "type", "sessionExists", "screenshot", "listTargets", "selectTarget"])
+	for (const required of ["open", "back", "forward", "reload", "click", "scroll", "type", "sessionExists", "screenshot", "listTargets", "selectTarget", "snapshotText", "networkRequests"])
 		assert.equal(typeof b[required], "function", `${required} missing — a key handler calls it unguarded`);
+});
+
+test("adapter snapshotText enables Accessibility lazily and formats the full AX tree", async () => {
+	const fake = makeFakeCdp({
+		results: {
+			"Accessibility.getFullAXTree": {
+				nodes: [
+					{
+						nodeId: "root",
+						role: { type: "role", value: "RootWebArea" },
+						name: { type: "computedString", value: "Example" },
+						childIds: ["button"],
+						backendDOMNodeId: 99,
+					},
+					{
+						nodeId: "button",
+						role: { type: "role", value: "button" },
+						name: { type: "computedString", value: "Submit" },
+						childIds: [],
+					},
+				],
+			},
+		},
+	});
+	const { b } = await attachBrowser(fake);
+	const snapshot = await b.snapshotText();
+	assert.equal(typeof snapshot.title, "string");
+	assert.ok(snapshot.lines.some((line) => line.includes("RootWebArea") && line.includes("Example")));
+	assert.ok(snapshot.lines.some((line) => line.includes("button") && line.includes("Submit") && /@e1\b/.test(line)));
+	assert.equal(fake.calls("Accessibility.enable").length, 1);
+	assert.equal(fake.calls("Accessibility.getFullAXTree")[0].sessionId, "sess-T1");
+	await b.snapshotText();
+	assert.equal(fake.calls("Accessibility.enable").length, 1, "domain enabled once for the pinned session");
+});
+
+test("adapter networkRequests correlates pinned-page lifecycle events", async () => {
+	const fake = makeFakeCdp();
+	const { b } = await attachBrowser(fake);
+	await b.networkRequests();
+	fake.deliver({
+		method: "Network.requestWillBeSent",
+		sessionId: "sess-T1",
+		params: { requestId: "ok", type: "Document", request: { method: "GET", url: "https://user:pass@example.test/ok?q=secret#part" } },
+	});
+	fake.deliver({
+		method: "Network.responseReceived",
+		sessionId: "sess-T1",
+		params: { requestId: "ok", response: { status: 200 } },
+	});
+	fake.deliver({
+		method: "Network.requestWillBeSent",
+		sessionId: "sess-T1",
+		params: { requestId: "pending", type: "Fetch", request: { method: "POST", url: "https://example.test/pending" } },
+	});
+	fake.deliver({
+		method: "Network.requestWillBeSent",
+		sessionId: "sess-T1",
+		params: { requestId: "failed", type: "Script", request: { method: "GET", url: "https://example.test/app.js" } },
+	});
+	fake.deliver({
+		method: "Network.loadingFailed",
+		sessionId: "sess-T1",
+		params: { requestId: "failed", errorText: "net::ERR_CONNECTION_RESET" },
+	});
+	fake.deliver({
+		method: "Network.requestWillBeSent",
+		sessionId: "sess-OTHER",
+		params: { requestId: "noise", type: "Image", request: { method: "GET", url: "https://noise.test/private" } },
+	});
+	const requests = await b.networkRequests();
+	const text = requests.lines.join("\n");
+	assert.match(text, /GET\s+200\s+Document\s+https:\/\/example\.test\/ok/);
+	assert.match(text, /POST\s+(?:…|-|—|null)?\s*Fetch\s+https:\/\/example\.test\/pending/);
+	assert.match(text, /GET\s+net::ERR_CONNECTION_RESET\s+Script\s+https:\/\/example\.test\/app\.js/);
+	assert.doesNotMatch(text, /secret|user:pass|#part|noise\.test/);
+	assert.equal(fake.calls("Network.enable").length, 1, "domain enabled once for the pinned session");
+});
+
+test("adapter text views reject before a target is pinned", async () => {
+	const fake = makeFakeCdp({
+		pages: [
+			{ targetId: "T1", type: "page", url: "https://one/", title: "One" },
+			{ targetId: "T2", type: "page", url: "https://two/", title: "Two" },
+		],
+	});
+	const { b } = await attachBrowser(fake);
+	await assert.rejects(b.snapshotText(), /select a tab/);
+	await assert.rejects(b.networkRequests(), /select a tab/);
+	assert.equal(fake.calls("Accessibility.enable").length, 0);
+	assert.equal(fake.calls("Network.enable").length, 0);
 });
 
 test("adapter requires a choice among multiple pages, then pins the exact target", async () => {

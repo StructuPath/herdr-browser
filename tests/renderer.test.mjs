@@ -764,7 +764,7 @@ test("cleanup closes only self-created sessions and removes shot files", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-close-"));
 	const stub = path.join(dir, "ab-stub");
 	const logf = path.join(dir, "log");
-	fs.writeFileSync(stub, `#!/usr/bin/env bash\necho "$@" >> "${logf}"\n`);
+	fs.writeFileSync(stub, `#!/bin/sh\necho "$@" >> "${logf}"\n`);
 	fs.chmodSync(stub, 0o755);
 	const mk = () => quiet(mkRenderer());
 	const own = mk();
@@ -1445,13 +1445,20 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 }, async () => {
 	assert.ok(hasAgentBrowser && canCdp, "integration requires agent-browser and Node 22+");
 	const session = `hb-itest-${process.pid}`;
+	// Keep Unix socket paths below macOS's limit even with a long checkout HOME.
+	const socketDir = fs.mkdtempSync("/tmp/hb-s-");
+	const env = {
+		...process.env,
+		HERDR_BROWSER_SESSION: session,
+		AGENT_BROWSER_SOCKET_DIR: socketDir,
+	};
 	const { execFile: ef } = await import("node:child_process");
 	const ab = (args) =>
 		new Promise((res, rej) =>
 			ef(
 				"agent-browser",
 				["--session", session, ...args],
-				{ timeout: 15_000 },
+				{ timeout: 15_000, env },
 				(e, so) => (e ? rej(e) : res(so)),
 			),
 		);
@@ -1460,7 +1467,7 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 		res.end("<!doctype html><title>Browser stream test</title><h1>Local browser fixture</h1><textarea aria-label='Text'></textarea>");
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-	const r = quiet(mkRenderer({ HERDR_BROWSER_SESSION: session }));
+	const r = quiet(mkRenderer(env));
 	const streamEvents = {};
 	const onStreamMessage = r.onStreamMessage.bind(r);
 	r.onStreamMessage = (message) => {
@@ -1520,7 +1527,9 @@ test("e2e: goLive receives pushed frames and console from a real session", {
 	} finally {
 		r.dropLive();
 		await ab(["close"]).catch(() => {});
+		r.cleanup();
 		await new Promise((resolve) => server.close(resolve));
+		fs.rmSync(socketDir, { recursive: true, force: true });
 	}
 });
 
@@ -2969,4 +2978,120 @@ test("switching backends closes a session this pane created instead of leaking i
 	// observable contract is that it never runs the close for foreign sessions
 	// — guarded inside by the selfCreated check.
 	void otherCloses;
+});
+
+test("makeBrowser.snapshotText requests an interactive snapshot and parses it", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-snaptext-"));
+	const logf = path.join(dir, "log");
+	const stub = path.join(dir, "ab-stub");
+	fs.writeFileSync(
+		stub,
+		`#!/usr/bin/env bash
+echo "$@" >> "${logf}"
+printf '%s' '{"success":true,"data":{"snapshot":"Page: Home\\nURL: https://x/\\n\\n@e1 [button] Go"}}'
+`,
+	);
+	fs.chmodSync(stub, 0o755);
+	const res = await makeBrowser("s", stub).snapshotText();
+	assert.match(fs.readFileSync(logf, "utf8"), /snapshot -i -c --json/);
+	assert.deepEqual(res, {
+		title: "Home — https://x/",
+		lines: ["@e1 [button] Go"],
+	});
+});
+
+test("makeBrowser.networkRequests formats the full request log", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-netreq-"));
+	const logf = path.join(dir, "log");
+	const stub = path.join(dir, "ab-stub");
+	fs.writeFileSync(
+		stub,
+		`#!/usr/bin/env bash
+echo "$@" >> "${logf}"
+printf '%s' '{"success":true,"data":{"requests":[{"method":"GET","status":200,"resourceType":"Document","url":"https://x/path?q=secret"},{"method":"POST","status":null,"resourceType":"Fetch","url":"https://x/api#frag"}]}}'
+`,
+	);
+	fs.chmodSync(stub, 0o755);
+	const res = await makeBrowser("s", stub).networkRequests();
+	assert.match(fs.readFileSync(logf, "utf8"), /network requests --json/);
+	assert.equal(res.title, "requests (2)");
+	assert.equal(res.lines.length, 3, "header row plus one row per request");
+	assert.ok(res.lines[1].includes("GET"));
+	assert.ok(res.lines[1].includes("https://x/path"));
+	assert.ok(!res.lines.join("\n").includes("secret"), "query strings are redacted");
+	assert.ok(!res.lines.join("\n").includes("#frag"), "fragments are redacted");
+});
+
+test("s toggles a snapshot text view and re-pressing s dismisses it", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.browser = {
+		snapshotText: async () => ({
+			title: "Home — https://x/",
+			lines: ['@e1 [button] "Save"'],
+		}),
+	};
+	r.feed("s");
+	await flush();
+	assert.equal(r.textView?.mode, "snapshot");
+	assert.deepEqual(r.lastSnapshot, ['@e1 [button] "Save"']);
+	r.feed("s");
+	await flush();
+	assert.equal(r.textView, null);
+});
+
+test("d diffs against the last snapshot, ignoring refs", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	let seq = 0;
+	r.browser = {
+		snapshotText: async () =>
+			++seq === 1
+				? { title: "t", lines: ['@e1 [button] "Save"', '@e2 [link] "Old"'] }
+				: { title: "t", lines: ['@e9 [button] "Save"', '@e10 [textbox] "Name"'] },
+	};
+	r.feed("s");
+	await flush();
+	assert.ok(r.lastSnapshot);
+	r.feed("d");
+	await flush();
+	assert.equal(r.textView?.mode, "diff");
+	assert.ok(r.textView.lines.some((l) => l.startsWith("+ ")), "gained line is prefixed +");
+	assert.ok(r.textView.lines.some((l) => l.startsWith("- ")), "dropped line is prefixed -");
+});
+
+test("n shows the network view; a page-driving key clears the text view", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.browser = {
+		networkRequests: async () => ({ title: "requests (1)", lines: ["GET 200 document https://x/"] }),
+		scroll: async () => {},
+	};
+	r.feed("n");
+	await flush();
+	assert.equal(r.textView?.mode, "network");
+
+	// Scrolling drives the page, so it invalidates the captured text view.
+	r.feed("j");
+	await flush();
+	assert.equal(r.textView, null);
+});
+
+test("d without a prior snapshot banners and leaves no stale view", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.browser = { snapshotText: async () => ({ title: "t", lines: [] }) };
+	r.feed("d");
+	await flush();
+	assert.match(r.banner, /press s first/);
+	assert.equal(r.textView, null);
+});
+
+test("s while unattached banners instead of querying", async () => {
+	const r = quiet(mkRenderer());
+	r.browser = { snapshotText: async () => ({ title: "t", lines: [] }) };
+	r.feed("s");
+	await flush();
+	assert.match(r.banner, /no browser attached/);
+	assert.equal(r.textView, null);
 });

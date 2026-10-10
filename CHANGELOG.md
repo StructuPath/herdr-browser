@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add an on-demand page text view: press `s` for the accessibility-tree
+  snapshot (interactive elements carry `@eN` refs), `n` for the full recent
+  request table, and `d` for a ref-normalized diff against the last snapshot.
+  Works on both backends (agent-browser `snapshot`/`network requests`, CDP
+  `Accessibility`/`Network`); any page-driving action dismisses it.
 - Select attached or locally launched browser tabs explicitly from a title/URL
   picker. Clear stale frames and pending input when the selected tab closes;
   require another selection before forwarding input.

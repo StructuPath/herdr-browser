@@ -9,6 +9,7 @@ import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
+import { formatRequests, parseAgentSnapshot, diffSnapshot } from "./page-text.mjs";
 
 const pExecFile = promisify(execFile);
 const ESC = "\x1b";
@@ -431,7 +432,7 @@ export function formatNetworkFailure({ method, url, status }) {
 
 // --- agent-browser access ---
 
-export function makeBrowser(session, bin = "agent-browser") {
+export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
 	// maxBuffer would throw on every tick and freeze the pane for good.
 	const maxBuffer = 16 * 1024 * 1024;
@@ -454,7 +455,7 @@ export function makeBrowser(session, bin = "agent-browser") {
 		const { stdout } = await pExecFile(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
-			{ timeout, maxBuffer },
+			{ timeout, maxBuffer, env },
 		);
 		const arr = parse(stdout, "batch output");
 		for (const r of arr) {
@@ -472,6 +473,7 @@ export function makeBrowser(session, bin = "agent-browser") {
 			{
 				timeout: 10_000,
 				maxBuffer,
+				env,
 			},
 		);
 		const parsed = parse(stdout, "output");
@@ -544,11 +546,33 @@ export function makeBrowser(session, bin = "agent-browser") {
 			if (Array.isArray(data?.requests)) return data.requests;
 			return Array.isArray(data) ? data : [];
 		},
+		// Page text view: the accessibility tree with @eN refs (agent-browser
+		// `snapshot`, the same primitive Playwright CLI and Stagehand expose).
+		snapshotText: async () => {
+			const data = await run("snapshot", "-i", "-c");
+			const text = typeof data === "string" ? data : data?.snapshot ?? "";
+			return parseAgentSnapshot(text);
+		},
+		// Full recent-request table (not just the xhr/fetch/document failures
+		// the poll feed watches), formatted for the pane's text view.
+		networkRequests: async () => {
+			const data = await run("network", "requests");
+			const rows = Array.isArray(data?.requests) ? data.requests : [];
+			return formatRequests(
+				rows.map((r) => ({
+					method: r.method ?? "",
+					status: r.status ?? null,
+					type: r.resourceType ?? "",
+					url: r.url ?? "",
+				})),
+			);
+		},
 		sessionExists: async () => {
 			try {
 				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
 					timeout: 10_000,
 					maxBuffer,
+					env,
 				});
 				// Exact match only: a substring hit (herdr-ws-w2 vs herdr-ws-w22)
 				// would make the pane attach and auto-create a session it must not.
@@ -600,7 +624,7 @@ export class Renderer {
 		this.browser =
 			this.backend === "attach"
 				? makeCdpBrowser(this.cdpEndpoint)
-				: makeBrowser(this.session, this.bin);
+				: makeBrowser(this.session, this.bin, this.env);
 		// Attach mode observes a browser someone else owns: ownership is never
 		// claimed, so the quit path can never close a stranger's session.
 		this.ownershipEnabled = this.backend !== "attach";
@@ -646,6 +670,10 @@ export class Renderer {
 		this.launchAttempted = false;
 		this.promptState = null;
 		this.targetPicker = null;
+		// Page text view (snapshot/network/diff) replaces the screenshot region
+		// while set; lastSnapshot backs the diff key.
+		this.textView = null;
+		this.lastSnapshot = null;
 		this.pasteState = null;
 		this.inputRevision = 0;
 		this.cdpTargetId = null;
@@ -723,13 +751,15 @@ export class Renderer {
 		let consoleRows = 0;
 		if (this.targetPicker) {
 			consoleRows = 0;
-		} else if (this.mode === "text") {
+		} else if (this.mode === "text" && !this.textView) {
 			consoleRows = Math.max(0, rows - 3);
 		} else if (this.consoleLines.length > 0) {
 			consoleRows = Math.max(4, Math.floor(rows * 0.3));
 		}
 		const imageRows =
-			this.mode === "text" && !this.targetPicker ? 0 : Math.max(0, rows - consoleRows - 4);
+			this.mode === "text" && !this.targetPicker && !this.textView
+				? 0
+				: Math.max(0, rows - consoleRows - 4);
 		return {
 			cols,
 			rows,
@@ -1318,7 +1348,7 @@ export class Renderer {
 				return;
 			}
 			await this.redrawAll();
-			if (this.lastImageDims) {
+			if (!this.textView && this.lastImageDims) {
 				this.lastViewportRequest = "";
 				await this.fitViewport(this.lastImageDims.w, this.lastImageDims.h);
 			}
@@ -1389,10 +1419,10 @@ export class Renderer {
 			// Every advertised key is handled in both backends (a and l work
 			// everywhere); t only moves targets on an attach backend.
 			const help = this.observeOnly
-				? " observe-only  t:tabs  o:enable-input  q:quit"
+				? " observe-only  t:tabs  s:snap  n:reqs  d:diff  o:enable-input  q:quit"
 				: this.backend === "attach"
-					? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  q:quit  b/f:hist  r:reload  j/k:scroll"
-					: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  o:observe  q:quit";
+					? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
+					: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  s:snap  n:reqs  d:diff  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
 			);
@@ -1401,6 +1431,7 @@ export class Renderer {
 
 	async renderImage() {
 		if (this.targetPicker) return this.renderTargetPicker();
+		if (this.textView) return this.renderTextView();
 		const { cols, imageRows } = this.size();
 		const shotPath = this.shotFormat === "jpg" ? this.shotJpg : this.shot;
 		if (this.mode === "text" || imageRows < 3 || !fs.existsSync(shotPath))
@@ -1501,6 +1532,28 @@ export class Renderer {
 		}
 		for (let i = 0; i < imageRows; i++) {
 			process.stdout.write(`${ESC}[${imageTopRow + i};1H${truncate(lines[i] ?? "", cols)}${ESC}[K`);
+		}
+	}
+
+	// Page text view: the screenshot region is replaced by a bounded text
+	// readout (snapshot tree, request table, or a snapshot diff) while
+	// this.textView is set. Mirrors renderTargetPicker's per-line erase/write.
+	renderTextView() {
+		const tv = this.textView;
+		if (!tv) return;
+		const { cols, imageRows, imageTopRow } = this.size();
+		if (imageRows < 3) return;
+		const modeLabel =
+			tv.mode === "diff" ? "diff" : tv.mode === "network" ? "requests" : "snapshot";
+		const head = [` ${modeLabel} — ${sanitizeText(tv.title)}`];
+		const shown = tv.lines.slice(0, Math.max(0, imageRows - head.length));
+		const overflow = tv.lines.length - shown.length;
+		const lines = head.concat(shown);
+		if (overflow > 0) lines.push(` … ${overflow} more`);
+		for (let i = 0; i < imageRows; i++) {
+			process.stdout.write(
+				`${ESC}[${imageTopRow + i};1H${truncate(lines[i] ?? "", cols)}${ESC}[K`,
+			);
 		}
 	}
 
@@ -1678,6 +1731,16 @@ export class Renderer {
 			const snap = await this.browser.snapshot(tmp);
 			this.lastUrl = sanitizeText(snap.url);
 			this.lastTitle = sanitizeText(snap.title);
+			// A navigation invalidates a captured snapshot/diff (the network
+			// list is a session log and survives); drop it so a stale page is
+			// never shown as the current one.
+			if (
+				this.textView &&
+				this.textView.mode !== "network" &&
+				this.textView.url !== this.lastUrl
+			) {
+				this.textView = null;
+			}
 			const { newEntries, marker } = reconcileConsole(
 				this.consoleState,
 				snap.entries,
@@ -1706,14 +1769,14 @@ export class Renderer {
 				this.shotFormat = "png"; // heal after a dropped stream's jpg frames
 				this.lastHash = hash;
 				await this.renderImage();
-				await this.fitViewport(dims.w, dims.h);
+				if (!this.textView) await this.fitViewport(dims.w, dims.h);
 				if (consoleLayoutChanged) this.renderConsole();
 			} else {
 				fs.unlinkSync(tmp);
 				if (consoleLayoutChanged) {
 					await this.redrawAll();
 					this.lastViewportRequest = "";
-					await this.fitViewport(dims.w, dims.h);
+					if (!this.textView) await this.fitViewport(dims.w, dims.h);
 				}
 			}
 			this.banner = "";
@@ -1891,6 +1954,7 @@ export class Renderer {
 		try {
 			spawnSync(this.bin, ["--session", this.session, "close"], {
 				timeout: 2_000,
+				env: this.env,
 			});
 		} catch {
 			/* already gone */
@@ -1915,6 +1979,78 @@ export class Renderer {
 		this.header();
 	}
 
+	// s/n/d: on-demand page text views (snapshot tree, request table, snapshot
+	// diff). Read-only queries — they never drive the page, so they are allowed
+	// in observe-only mode and never claim page input.
+	textViewKey(ch) {
+		if (!this.attached) {
+			this.banner = "no browser attached — press l or open a localhost link";
+			this.header();
+			return;
+		}
+		if (ch === "d") this.showSnapshotDiff();
+		else this.toggleTextView(ch === "s" ? "snapshot" : "network");
+	}
+
+	toggleTextView(mode) {
+		// Re-pressing the active key dismisses the view back to the screenshot.
+		if (this.textView?.mode === mode) {
+			this.textView = null;
+			this.enqueue(() => this.redrawAll());
+			return;
+		}
+		this.userAction(async () => {
+			try {
+				const fn =
+					mode === "snapshot"
+						? this.browser.snapshotText
+						: this.browser.networkRequests;
+				if (typeof fn !== "function")
+					throw new Error(`${mode} not supported in ${this.backendName}`);
+				const res = await fn.call(this.browser);
+				if (!res || !Array.isArray(res.lines)) throw new Error("no data");
+				this.textView = {
+					mode,
+					title: res.title ?? "",
+					lines: res.lines,
+					url: this.lastUrl,
+				};
+				if (mode === "snapshot") this.lastSnapshot = res.lines;
+				await this.redrawAll();
+			} catch (err) {
+				this.banner = sanitizeText(err?.message ?? `${mode} unavailable`);
+				this.header();
+			}
+		}, { pageInput: false });
+	}
+
+	showSnapshotDiff() {
+		if (!this.lastSnapshot) {
+			this.banner = "press s first to capture a snapshot";
+			this.header();
+			return;
+		}
+		this.userAction(async () => {
+			try {
+				if (typeof this.browser.snapshotText !== "function")
+					throw new Error(`snapshot not supported in ${this.backendName}`);
+				const res = await this.browser.snapshotText();
+				if (!res || !Array.isArray(res.lines)) throw new Error("no data");
+				const diff = diffSnapshot(this.lastSnapshot, res.lines);
+				this.textView = {
+					mode: "diff",
+					title: diff.title ?? "",
+					lines: diff.lines,
+					url: this.lastUrl,
+				};
+				await this.redrawAll();
+			} catch (err) {
+				this.banner = sanitizeText(err?.message ?? "diff unavailable");
+				this.header();
+			}
+		}, { pageInput: false });
+	}
+
 	onKey(ch) {
 		if (this.targetPicker) {
 			this.targetPickerInput(ch);
@@ -1929,6 +2065,12 @@ export class Renderer {
 		// The toggle itself must stay reachable while observe-only is on.
 		if (ch === "o") {
 			this.toggleObserveOnly();
+			return;
+		}
+		// Page text views are read-only queries — safe in observe-only mode,
+		// and they need no page target beyond what the backend already guards.
+		if (ch === "s" || ch === "n" || ch === "d") {
+			this.textViewKey(ch);
 			return;
 		}
 		if (
@@ -2169,7 +2311,7 @@ export class Renderer {
 				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
 				this.enqueue(async () => {
 					await this.renderImage();
-					await this.fitViewport(dims.w, dims.h);
+					if (!this.textView) await this.fitViewport(dims.w, dims.h);
 				});
 				break;
 			}
@@ -2237,6 +2379,9 @@ export class Renderer {
 				}
 			}
 			try {
+				// A page-driving action invalidates any text view captured from
+				// the pre-action page: drop it before the page changes.
+				if (pageInput) this.textView = null;
 				await fn();
 			} catch (err) {
 				// Poll mode reports daemon failures via the tick failure counter;
@@ -2441,7 +2586,7 @@ export class Renderer {
 				() =>
 					this.enqueue(async () => {
 						this.lastViewportRequest = "";
-						if (this.lastImageDims) {
+						if (!this.textView && this.lastImageDims) {
 							await this.fitViewport(
 								this.lastImageDims.w,
 								this.lastImageDims.h,

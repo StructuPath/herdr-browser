@@ -39,6 +39,10 @@ guides to this plugin and its three siblings (Guard, Swarm, Conductor).
   guesses; keyboard input, history, reload, and wheel scrolling are supported.
 - **Adaptive rendering** — Kitty graphics when available, ANSI symbols through
   chafa otherwise, and a text-only last resort.
+- **Read the page as text** — press `s` for the accessibility-tree snapshot
+  (interactive elements get `@eN` refs), `n` for the full recent request table,
+  and `d` to diff the page against your last snapshot; the screenshot returns
+  on any page-driving action.
 - **Built-in recording** — capture the workspace session as WebM.
 - **Localhost integration** — Cmd/Ctrl+click a local development URL in Herdr to
   open it in the workspace browser pane.
@@ -160,6 +164,9 @@ Use these controls to drive the shared session directly:
 | `j` / `k` | Scroll down / up |
 | Space | Scroll down |
 | Mouse wheel | Scroll the page |
+| `s` | Toggle the accessibility-tree snapshot (interactive elements carry `@eN` refs) |
+| `n` | Toggle the recent request table |
+| `d` | Diff the current page against the last snapshot (press `s` first) |
 | `Esc` | Cancel the active prompt |
 | `q` | Close the viewer pane |
 
@@ -500,6 +507,7 @@ npm run doctor
 npm run build
 npm run validate
 npm run test:integration
+npm run test:qa
 herdr plugin link .
 ```
 
@@ -515,7 +523,15 @@ browser coverage; optional browser tests skip when their prerequisites are
 unavailable. `npm run test:integration` requires both an installed Chrome or
 Chromium and agent-browser with its engine installed, on Node 22+. It fails
 instead of silently skipping either real-browser path. Tests use a local HTTP
-fixture and isolated browser sessions.
+fixture and isolated browser sessions. `npm run test:qa` requires agent-browser
+with its engine installed and runs saved desktop/mobile scenarios, including
+assertion failures and browser error evidence. CI installs pinned agent-browser
+0.33.2 using Node 24, then tests the plugin on Node 22/24 on Linux and macOS.
+
+Before release, require local validation, both strict browser commands, and the
+hosted CI matrix to pass for the reviewed commit. A passing suite with browser
+coverage skipped is insufficient. Manually verify Kitty graphics and symbol
+rendering in Herdr on macOS and Linux.
 
 For backend choices and the remaining readiness work, see the
 [readiness assessment](docs/readiness.md).

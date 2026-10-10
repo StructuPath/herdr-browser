@@ -45,9 +45,11 @@ pinned agent-browser 0.33.2 under Node 24, install its Chromium engine (includin
 Linux system dependencies), and export the installed executable through
 `HERDR_BROWSER_CHROMIUM` before switching to the Node version under test.
 
-Every browser job runs `npm run doctor`, `npm run test:integration`, and
-`npm run test:qa`. The strict test commands require real local Chromium,
-shared-session streaming, and desktop/mobile saved QA coverage; missing
+Every browser job runs `npm run test:integration` and `npm run test:qa`.
+`npm run doctor` is not run there: it also requires the Herdr CLI, which the
+tests do not use and hosted runners do not have. The strict test commands
+require real local Chromium, shared-session streaming, and desktop/mobile saved
+QA coverage; missing
 prerequisites and installation failures fail the job instead of skipping that
 coverage. Existing tests use local fixtures and clean up their browser sessions.
 

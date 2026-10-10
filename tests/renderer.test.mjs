@@ -29,6 +29,7 @@ import {
 	diffNetworkFailures,
 	formatNetworkFailure,
 	findChromium,
+	chromiumSandboxArgs,
 	truthyConfig,
 } from "../bin/renderer.mjs";
 
@@ -2688,6 +2689,14 @@ test("findChromium: explicit env wins, then config, then first probed candidate"
 		"google-chrome",
 	);
 	assert.equal(findChromium({}, undefined, () => false), null);
+});
+
+test("chromiumSandboxArgs: CI gets the sandbox fallback, a clean box does not", () => {
+	const args = chromiumSandboxArgs({ CI: "true" });
+	assert.ok(args.includes("--no-sandbox"), "CI needs --no-sandbox");
+	assert.ok(args.includes("--disable-dev-shm-usage"), "CI gets --disable-dev-shm-usage");
+	// A non-root, non-CI desktop box (no container markers) keeps the sandbox.
+	assert.deepEqual(chromiumSandboxArgs({}), []);
 });
 
 const fakeChromiumScript = () => {

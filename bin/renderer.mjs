@@ -128,6 +128,33 @@ export function findChromium(env, configDirValue, probe) {
 	return null;
 }
 
+// Chrome's sandbox needs a setuid helper or unprivileged user namespaces.
+// Root, CI runners, and containers often have neither, so Chrome dies before
+// writing DevToolsActivePort — the launch then times out. Mirror the signals
+// agent-browser keys on and fall back to --no-sandbox there. The companion
+// --disable-dev-shm-usage moves shared memory off a tiny container /dev/shm,
+// which crashes Chrome the same way.
+export function chromiumSandboxArgs(env = process.env) {
+	const root = typeof process.getuid === "function" && process.getuid() === 0;
+	let container = false;
+	if (env.CI) {
+		container = true;
+	} else {
+		try {
+			container =
+				fs.existsSync("/.dockerenv") ||
+				fs.existsSync("/run/.containerenv") ||
+				/(?:docker|lxc|kubepods|containerd)/i.test(
+					fs.readFileSync("/proc/1/cgroup", "utf8"),
+				);
+		} catch {
+			container = false;
+		}
+	}
+	if (!root && !container) return [];
+	return container ? ["--no-sandbox", "--disable-dev-shm-usage"] : ["--no-sandbox"];
+}
+
 // Render-mode precedence: explicit config > kitty probe > symbols > text.
 // probeResponse is the raw bytes the terminal answered to a kitty graphics
 // query; empty/undefined means no answer (not supported). Kitty mode emits
@@ -974,9 +1001,8 @@ export class Renderer {
 				// (both support DevTools and screencast); =new was removed in
 				// newer Chromes and would eventually break launches.
 				...(headed ? [] : ["--headless"]),
-				// Chrome refuses to start as root without this; root (containers,
-				// CI) already has no user boundary for the sandbox to defend.
-				...(process.getuid?.() === 0 ? ["--no-sandbox"] : []),
+				// Sandbox fallback for root/CI/containers (see chromiumSandboxArgs).
+				...chromiumSandboxArgs(process.env),
 				"about:blank",
 			];
 			this.banner = "launching Chromium…";

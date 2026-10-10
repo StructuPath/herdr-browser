@@ -10,6 +10,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
 import { formatRequests, parseAgentSnapshot, diffSnapshot } from "./page-text.mjs";
+import { chromiumSandboxArgs, agentBrowserSandboxEnv } from "./chromium-args.mjs";
+
+export { chromiumSandboxArgs } from "./chromium-args.mjs";
 
 const pExecFile = promisify(execFile);
 const ESC = "\x1b";
@@ -126,33 +129,6 @@ export function findChromium(env, configDirValue, probe) {
 	];
 	for (const c of candidates) if (probe(c)) return c;
 	return null;
-}
-
-// Chrome's sandbox needs a setuid helper or unprivileged user namespaces.
-// Root, CI runners, and containers often have neither, so Chrome dies before
-// writing DevToolsActivePort — the launch then times out. Mirror the signals
-// agent-browser keys on and fall back to --no-sandbox there. The companion
-// --disable-dev-shm-usage moves shared memory off a tiny container /dev/shm,
-// which crashes Chrome the same way.
-export function chromiumSandboxArgs(env = process.env) {
-	const root = typeof process.getuid === "function" && process.getuid() === 0;
-	let container = false;
-	if (env.CI) {
-		container = true;
-	} else {
-		try {
-			container =
-				fs.existsSync("/.dockerenv") ||
-				fs.existsSync("/run/.containerenv") ||
-				/(?:docker|lxc|kubepods|containerd)/i.test(
-					fs.readFileSync("/proc/1/cgroup", "utf8"),
-				);
-		} catch {
-			container = false;
-		}
-	}
-	if (!root && !container) return [];
-	return container ? ["--no-sandbox", "--disable-dev-shm-usage"] : ["--no-sandbox"];
 }
 
 // Render-mode precedence: explicit config > kitty probe > symbols > text.
@@ -465,6 +441,9 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	const maxBuffer = 16 * 1024 * 1024;
 	// Inherit the caller's configuration unchanged. Injecting an idle timeout
 	// makes agent-browser restart an existing daemon and lose its browser.
+	// On CI/container boxes agent-browser needs AGENT_BROWSER_ARGS to fall back
+	// to --no-sandbox, or its Chrome dies before any command returns.
+	const runEnv = { ...env, ...agentBrowserSandboxEnv(env) };
 	const parse = (stdout, what) => {
 		let parsed;
 		try {
@@ -482,7 +461,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		const { stdout } = await pExecFile(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
-			{ timeout, maxBuffer, env },
+			{ timeout, maxBuffer, env: runEnv },
 		);
 		const arr = parse(stdout, "batch output");
 		for (const r of arr) {
@@ -500,7 +479,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 			{
 				timeout: 10_000,
 				maxBuffer,
-				env,
+				env: runEnv,
 			},
 		);
 		const parsed = parse(stdout, "output");
@@ -599,7 +578,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
 					timeout: 10_000,
 					maxBuffer,
-					env,
+					env: runEnv,
 				});
 				// Exact match only: a substring hit (herdr-ws-w2 vs herdr-ws-w22)
 				// would make the pane attach and auto-create a session it must not.

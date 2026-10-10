@@ -32,6 +32,7 @@ import {
 	chromiumSandboxArgs,
 	truthyConfig,
 } from "../bin/renderer.mjs";
+import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -2697,6 +2698,10 @@ test("chromiumSandboxArgs: CI gets the sandbox fallback, a clean box does not", 
 	assert.ok(args.includes("--disable-dev-shm-usage"), "CI gets --disable-dev-shm-usage");
 	// A non-root, non-CI desktop box (no container markers) keeps the sandbox.
 	assert.deepEqual(chromiumSandboxArgs({}), []);
+	assert.deepEqual(agentBrowserSandboxEnv({}), {});
+	assert.deepEqual(agentBrowserSandboxEnv({ CI: "true" }), {
+		AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage",
+	});
 });
 
 const fakeChromiumScript = () => {

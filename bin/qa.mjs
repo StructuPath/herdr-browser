@@ -7,6 +7,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
+import { agentBrowserSandboxEnv } from "./chromium-args.mjs";
 
 const execute = promisify(execFile);
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -134,6 +135,10 @@ export function engineEnvironment(env, timeoutMs) {
 	}
 	result.AGENT_BROWSER_DEFAULT_TIMEOUT = String(timeoutMs);
 	result.AGENT_BROWSER_IDLE_TIMEOUT_MS = "60000";
+	// On CI/container boxes the engine needs --no-sandbox or its Chrome dies
+	// before the first command returns. Only the launch-args knob is added;
+	// nothing else from the host environment leaks into the fresh session.
+	Object.assign(result, agentBrowserSandboxEnv(env));
 	return result;
 }
 

@@ -247,6 +247,26 @@ identical failure paints once and stays collapsed until it has been quiet for
 60 seconds, and on very long sessions the feed turns itself off with a one-time note once the daemon's
 request log outgrows the pane's read buffer.
 
+## Read the page as text
+
+The screenshot is the default view, but `s`, `n`, and `d` swap the screenshot
+region for a text readout of the same page. All three are **read-only queries**:
+they work in observe-only mode and never drive the page, so they are safe to use
+while an agent is mid-flow. They are also the only page view in a `text`-mode
+(no-image) terminal.
+
+| Key | View |
+| --- | --- |
+| `s` | **Snapshot** — the accessibility tree as an indented role/name outline; interactive elements carry refs. |
+| `n` | **Requests** — recent network traffic as `METHOD STATUS TYPE URL`, with query strings, fragments, and credentials redacted and the list bounded. |
+| `d` | **Diff** — the current page against the last `s` snapshot, showing added (`+`) and removed (`-`) elements. Refs are ignored, so the diff reflects real page changes, not re-snapshot churn. |
+
+Any page-driving action (navigate, reload, back/forward, scroll, click, type)
+returns to the screenshot; re-pressing `s` or `n` while its own view is up
+dismisses it too. A captured snapshot or diff is dropped if the page navigates
+underneath it rather than shown stale; the request table is a session log and
+stays until dismissed.
+
 ## Attach to any CDP browser
 
 The pane can observe a browser it does not own. Point it at a Chrome DevTools
@@ -342,6 +362,13 @@ The browser starts headless with a fresh ephemeral DevTools port
 per-workspace profile under the plugin state directory, so cookies and
 localStorage survive relaunches. Set `HERDR_BROWSER_LAUNCH_HEADED=1` to get
 a visible browser window instead.
+
+On CI runners and inside containers, the pane adds `--no-sandbox` and
+`--disable-dev-shm-usage` automatically: Chrome's sandbox needs a setuid
+helper or unprivileged user namespaces that those environments typically
+lack, and without them Chrome dies before exposing a DevTools port. A normal
+desktop launch keeps the sandbox. The same fallback is passed to agent-browser
+(through `AGENT_BROWSER_ARGS`) so shared sessions and saved QA work there too.
 
 Unlike plain attach mode, the pane owns what it launches: quitting the pane
 — or attaching to a different endpoint — kills the launched browser rather

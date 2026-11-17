@@ -203,6 +203,29 @@ test("close fails pending requests and fires onClose once", async () => {
 	await assert.rejects(s.send("Page.enable"), /connection closed/);
 });
 
+test("explicit close immediately rejects pending calls and fires onClose once", async () => {
+	const ws = makeFakeWs();
+	const s = makeCdpSession("ws://x/devtools/browser/1", { wsFactory: () => ws });
+	ws.open();
+	await s.opened;
+	let closes = 0;
+	s.onClose(() => closes++);
+	const pending = s.send("Page.enable", {}, undefined, 100).then(() => "resolved", (err) => err.message);
+	s.close();
+	s.close();
+	let timer;
+	const state = await Promise.race([
+		pending,
+		new Promise((resolve) => { timer = setTimeout(() => resolve("pending"), 25); }),
+	]);
+	clearTimeout(timer);
+	await pending;
+	assert.equal(state, "connection closed");
+	assert.equal(closes, 1);
+	assert.equal(s.dead, true);
+	await assert.rejects(s.send("Page.enable"), /connection closed/);
+});
+
 test("ping resolves false on timeout instead of throwing", async () => {
 	const ws = makeFakeWs();
 	const s = makeCdpSession("ws://x/devtools/browser/1", { wsFactory: () => ws });

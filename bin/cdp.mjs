@@ -233,7 +233,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 			return dead;
 		},
 		close() {
-			dead = true;
+			failAll("connection closed");
 			try {
 				ws.close();
 			} catch {

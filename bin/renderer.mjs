@@ -867,6 +867,11 @@ export class Renderer {
 	// console carries one discontinuity line.
 	async attachTo(value, { note } = {}) {
 		const endpoint = String(value ?? "").trim();
+		if (/^(https|wss):\/\//i.test(endpoint)) {
+			this.banner = "TLS is not supported — use http://host:port or ws://…";
+			this.header();
+			return;
+		}
 		if (!/^(wss?|https?):\/\//i.test(endpoint)) {
 			this.banner =
 				"not an endpoint — use http://host:port or ws://… (u navigates, a attaches)";

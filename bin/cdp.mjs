@@ -58,7 +58,7 @@ function getJson(host, port, path, timeout = 5_000) {
 	});
 }
 
-// Resolve a user-supplied endpoint — http(s)://host:port or a browser-level
+// Resolve a user-supplied endpoint — http://host:port or a browser-level
 // ws:// URL — to { wsUrl, host, port, browser (product string), pages }.
 // A pasted page-level URL (/devtools/page/<id>) is refused with a pointer at
 // the browser endpoint: Target.attachToTarget only works browser-level, and
@@ -70,11 +70,13 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 	} catch {
 		throw new Error("not an endpoint URL — use http://host:port or ws://…");
 	}
+	if (u.protocol === "https:" || u.protocol === "wss:")
+		throw new Error("TLS is not supported — use http://host:port or ws://…");
 	if (/\/devtools\/page\//.test(u.pathname))
 		throw new Error(
 			"that is a page-level DevTools URL — use the browser endpoint (http://host:port or /devtools/browser/…)",
 		);
-	if (u.protocol === "ws:" || u.protocol === "wss:") {
+	if (u.protocol === "ws:") {
 		// Raw ws endpoint: no HTTP discovery surface; identity fields best-effort.
 		return {
 			wsUrl: u.href,
@@ -86,7 +88,7 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 			rediscoverable: false,
 		};
 	}
-	if (u.protocol !== "http:" && u.protocol !== "https:")
+	if (u.protocol !== "http:")
 		throw new Error("not an endpoint URL — use http://host:port or ws://…");
 	let host = u.hostname.replace(/^\[|\]$/g, "");
 	if (!net.isIP(host)) {

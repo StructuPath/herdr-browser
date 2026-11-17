@@ -2460,6 +2460,28 @@ test("attach prompt refuses navigation-shaped input and keeps u for URLs", async
 	assert.equal(r.backend, "agent-browser", "bad input must not switch modes");
 });
 
+test("attach prompt rejects TLS endpoints without replacing the backend", async () => {
+	const r = quiet(mkRenderer());
+	r.tick = async () => {};
+	const browser = r.browser;
+	for (const scheme of ["https", "wss"]) {
+		await r.attachTo(`${scheme}://127.0.0.1:9222/devtools/browser/SECRET-TOKEN`);
+		assert.match(r.banner, /TLS is not supported/);
+		assert.ok(!r.banner.includes("SECRET-TOKEN"));
+		assert.equal(r.browser, browser);
+		assert.equal(r.backend, "agent-browser");
+	}
+});
+
+test("attach mode: configured TLS endpoints show a clear error", { skip: !canCdp }, async () => {
+	for (const scheme of ["https", "wss"]) {
+		const r = attachRenderer({ HERDR_BROWSER_CDP_URL: `${scheme}://127.0.0.1:1` });
+		assert.equal(r.backend, "attach", "configured endpoints still select attach mode");
+		assert.equal(await r.attachCdp(), false);
+		assert.match(r.banner, /TLS is not supported/);
+	}
+});
+
 test("attach switch resets reconciliation state and drops ownership", async () => {
 	const r = quiet(mkRenderer());
 	r.selfCreated = true;

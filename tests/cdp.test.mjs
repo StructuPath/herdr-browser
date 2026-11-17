@@ -69,6 +69,27 @@ test("discoverEndpoint sends an IP-literal Host for DNS-name input", async () =>
 	});
 });
 
+test("discoverEndpoint rejects HTTPS without sending plaintext HTTP", async () => {
+	await withStubEndpoint(async (port, seen) => {
+		const error = await discoverEndpoint(`https://127.0.0.1:${port}`).catch((err) => err);
+		assert.equal(seen.hosts.length, 0, "HTTPS must never contact a plaintext server");
+		assert.match(error?.message ?? "", /TLS is not supported/);
+	});
+});
+
+test("discoverEndpoint rejects TLS endpoints before DNS lookup", async () => {
+	for (const scheme of ["https", "wss"]) {
+		let lookups = 0;
+		await assert.rejects(discoverEndpoint(`${scheme}://devbox.local:9222/devtools/browser/secret`, {
+			lookup: async () => {
+				lookups++;
+				throw new Error("unexpected DNS lookup");
+			},
+		}), /TLS is not supported/);
+		assert.equal(lookups, 0);
+	}
+});
+
 test("discoverEndpoint refuses page-level URLs with a pointer to the browser endpoint", async () => {
 	await assert.rejects(
 		discoverEndpoint("ws://127.0.0.1:9222/devtools/page/DEADBEEF"),

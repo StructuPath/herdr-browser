@@ -33,6 +33,7 @@ import {
 	truthyConfig,
 } from "../bin/renderer.mjs";
 import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
+import { makeCdpBrowser } from "../bin/cdp.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -2495,6 +2496,74 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	assert.deepEqual(r.consoleState, { count: 0, tail: [] });
 	assert.equal(r.lastHash, "");
 	assert.ok(r.consoleLines.some((l) => /switched to attach mode/.test(l)));
+});
+
+test("attach switch unsubscribes and closes the old CDP socket", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	const ws = {
+		closed: false,
+		send(raw) {
+			const m = JSON.parse(raw);
+			const result = m.method === "Target.getTargets"
+				? { targetInfos: [{ type: "page", targetId: "old", url: "https://old/" }] }
+				: m.method === "Target.attachToTarget" ? { sessionId: "session-old" } : {};
+			queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ id: m.id, result }) }));
+		},
+		close() { this.closed = true; this.onclose?.(); },
+	};
+	const old = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/old", {
+		wsFactory: () => { queueMicrotask(() => ws.onopen?.()); return ws; },
+	});
+	t.after(async () => { old.close(); await flush(); });
+	const onMessage = old.onMessage;
+	let unsubscribed = false;
+	old.onMessage = (fn) => { unsubscribed = fn === null; onMessage(fn); };
+	r.browser = old;
+	assert.equal(await r.attachCdp(), true);
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	ws.onmessage({ data: JSON.stringify({ method: "Target.targetDestroyed", params: { targetId: "old" } }) });
+	await flush();
+	assert.equal(unsubscribed, true);
+	assert.equal(ws.closed, true);
+	assert.equal(r.cdpTargetId, "new");
+});
+
+test("attach switch ignores queued events from the old adapter", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let late;
+	r.browser = fakeCdpBackend();
+	r.browser.onMessage = (fn) => { if (fn) late = fn; };
+	await r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	late({ type: "target_gone" });
+	late({ type: "endpoint_gone" });
+	assert.equal(r.cdpTargetId, "new");
+	assert.equal(r.attached, true);
+});
+
+test("attach switch ignores completion of an old connection", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let complete;
+	r.browser = fakeCdpBackend();
+	r.browser.connect = () => new Promise((resolve) => { complete = resolve; });
+	const connecting = r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	complete({ guid: "old", targetId: "old" });
+	assert.equal(await connecting, false);
+	assert.equal(r.cdpTargetId, "new");
+	assert.equal(r.attached, true);
 });
 
 test("attach mode: a Cmd+click handoff file navigates the attached target", { skip: !canCdp }, async () => {

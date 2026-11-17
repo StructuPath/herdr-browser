@@ -90,6 +90,23 @@ test("discoverEndpoint rejects TLS endpoints before DNS lookup", async () => {
 	}
 });
 
+test("discoverEndpoint rejects a partial JSON response after connection close", async (t) => {
+	const server = http.createServer((_req, res) => {
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.write('{"webSocketDebuggerUrl":');
+		setTimeout(() => res.destroy(), 20);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => { server.closeAllConnections(); server.close(); });
+	let timer;
+	t.after(() => clearTimeout(timer));
+	const state = await Promise.race([
+		discoverEndpoint(`http://127.0.0.1:${server.address().port}`).then(() => "resolved", () => "rejected"),
+		new Promise((resolve) => { timer = setTimeout(() => resolve("pending"), 5_500); }),
+	]);
+	assert.equal(state, "rejected", "response abort must settle discovery despite the lost request timeout");
+});
+
 test("discoverEndpoint refuses page-level URLs with a pointer to the browser endpoint", async () => {
 	await assert.rejects(
 		discoverEndpoint("ws://127.0.0.1:9222/devtools/page/DEADBEEF"),

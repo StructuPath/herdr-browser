@@ -37,6 +37,8 @@ function getJson(host, port, path, timeout = 5_000) {
 			(res) => {
 				let body = "";
 				res.setEncoding("utf8");
+				res.on("error", reject);
+				res.on("aborted", () => reject(new Error(`endpoint response aborted for ${path}`)));
 				res.on("data", (c) => {
 					body += c;
 					if (body.length > 4 * 1024 * 1024) req.destroy(new Error("oversized /json response"));

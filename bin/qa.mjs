@@ -8,6 +8,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { agentBrowserSandboxEnv } from "./chromium-args.mjs";
+import { sanitizeText } from "./renderer.mjs";
 
 const execute = promisify(execFile);
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -62,19 +63,23 @@ export function validateScenario(value) {
 		integer(viewport.height, 240, 1600, "viewport height");
 	}
 	if (!Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > 40) throw new Error("steps must contain 1–40 entries");
-	if (value.steps[0]?.type !== "navigate") throw new Error("first step must navigate");
-	for (const step of value.steps) {
-		const fields = TYPES[step?.type];
-		if (!fields) throw new Error("unknown step type; scripts and eval are not supported");
-		object(step, ["type", ...fields], "step");
-		for (const field of fields) string(step[field], `step ${field}`);
-		for (const field of ["selector", "value"]) {
-			if (step[field]?.startsWith("-")) throw new Error(`step ${field} must not begin with '-'`);
-		}
-		if (step.type === "screenshot") slug(step.name, "screenshot name");
-		if (step.type === "navigate") {
-			if (!step.path.startsWith("/") || step.path.startsWith("//") || step.path.includes("\\")) throw new Error("navigate path must be an origin-relative /path");
-			if (new URL(step.path, base).origin !== base.origin) throw new Error("navigate must stay on baseUrl origin");
+	for (const [index, step] of value.steps.entries()) {
+		try {
+			if (index === 0 && step?.type !== "navigate") throw new Error("first step must navigate");
+			const fields = TYPES[step?.type];
+			if (!fields) throw new Error("unknown step type; scripts and eval are not supported");
+			object(step, ["type", ...fields], "step");
+			for (const field of fields) string(step[field], `step ${field}`);
+			for (const field of ["selector", "value"]) {
+				if (step[field]?.startsWith("-")) throw new Error(`step ${field} must not begin with '-'`);
+			}
+			if (step.type === "screenshot") slug(step.name, "screenshot name");
+			if (step.type === "navigate") {
+				if (!step.path.startsWith("/") || step.path.startsWith("//") || step.path.includes("\\")) throw new Error("navigate path must be an origin-relative /path");
+				if (new URL(step.path, base).origin !== base.origin) throw new Error("navigate must stay on baseUrl origin");
+			}
+		} catch (error) {
+			throw new Error(`steps[${index}] (type "${sanitizeText(step?.type ?? "unknown").slice(0, 200)}"): ${error.message}`);
 		}
 	}
 	for (const key of ["failOnConsoleError", "failOnPageError", "failOnFailedRequest"]) {
@@ -107,7 +112,9 @@ export function loadScenario(file, override) {
 		if (length > MAX_CONFIG) throw new Error("scenario exceeds 64 KiB");
 		bytes = buffer.subarray(0, length);
 	} finally { fs.closeSync(fd); }
-	const parsed = JSON.parse(bytes);
+	let parsed;
+	try { parsed = JSON.parse(bytes.toString("utf8")); }
+	catch { throw new Error(`${sanitizeText(path.basename(file))}: invalid scenario JSON`); }
 	if (override !== undefined) parsed.baseUrl = override;
 	const scenario = validateScenario(parsed);
 	return { scenario, sha256: hash(JSON.stringify(scenario)) };
@@ -154,15 +161,15 @@ function entries(data, key) {
 	return items;
 }
 
-export function classifyTelemetry(consoleData, errorData, requestData) {
+export function classifyTelemetry(consoleData, errorData, requestData, formatText = text) {
 	const messages = entries(consoleData, "messages");
 	const errors = entries(errorData, "errors");
 	const requests = entries(requestData, "requests");
 	return {
-		consoleErrors: messages.filter((item) => item.type === "error" || item.level === "error").map((item) => ({ message: text(item.text ?? item.message) })),
-		pageErrors: errors.map((item) => ({ message: text(typeof item === "string" ? item : item.message ?? item.text) })),
+		consoleErrors: messages.filter((item) => item.type === "error" || item.level === "error").map((item) => ({ message: formatText(item.text ?? item.message) })),
+		pageErrors: errors.map((item) => ({ message: formatText(typeof item === "string" ? item : item.message ?? item.text) })),
 		failedRequests: requests.filter((item) => Number(item.status) >= 400 || item.failure || item.error).map((item) => ({
-			method: text(item.method ?? "GET"), url: safeUrl(item.url), status: typeof item.status === "number" ? item.status : null,
+			method: formatText(item.method ?? "GET"), url: formatText(safeUrl(item.url)), status: typeof item.status === "number" ? item.status : null,
 		})),
 		unresolvedRequests: requests.filter((item) => item.status == null && !item.failure && !item.error).length,
 	};
@@ -208,6 +215,15 @@ export function boundResult(result) {
 export async function runQa({ config, repo, output, baseUrl: override, binary = "agent-browser", env = process.env, signal, engineFactory = createEngine }) {
 	const loaded = loadScenario(config, override);
 	const scenario = loaded.scenario;
+	const fillValues = scenario.steps.filter((step) => step.type === "fill").map((step) => step.value).sort((a, b) => b.length - a.length);
+	const redact = (value) => {
+		let redacted = String(value ?? "");
+		for (const value of fillValues) redacted = redacted.replaceAll(value, "[redacted]");
+		return redacted;
+	};
+	const text = (value) => redact(value).slice(0, 2000);
+	// Sanitizing can join fragments of a fill value; redact again afterward.
+	const diagnostic = (value) => redact(sanitizeText(redact(value))).slice(0, 200);
 	const before = await gitState(repo, env);
 	const outputDir = output ? path.join(fs.realpathSync(path.dirname(path.resolve(output))), path.basename(path.resolve(output))) : fs.mkdtempSync(path.join(os.tmpdir(), "herdr-qa-"));
 	if (outputDir === before.root || outputDir.startsWith(`${before.root}${path.sep}`)) throw new Error("QA output must be outside the tested repository");
@@ -263,6 +279,7 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 				for (const [index, step] of scenario.steps.entries()) {
 					const outcome = { index, type: step.type, status: "failed" };
 					run.steps.push(outcome);
+					let actual = null;
 					try {
 						if (step.type === "navigate") await engine(["open", new URL(step.path, scenario.baseUrl).href]);
 						else if (step.type === "click") await engine(["click", step.selector]);
@@ -275,11 +292,19 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 									: ["get", step.type === "assertUrl" ? "url" : "title"];
 							const data = await engine(args);
 							const key = { assertVisible: "visible", assertText: "text", assertUrl: "url", assertTitle: "title" }[step.type];
-							const actual = data?.[key];
+							actual = data?.[key];
 							if (step.type === "assertVisible" ? actual !== true : typeof actual !== "string" || !actual.includes(step.contains)) throw new Error(`${step.type} assertion failed`);
 						}
 						outcome.status = "passed";
-					} catch (error) { outcome.error = text(error.message); throw error; }
+					} catch (error) {
+						outcome.error = text(error.message);
+						if (step.type.startsWith("assert")) {
+							outcome.expected = step.type === "assertVisible" ? true : diagnostic(step.contains);
+							outcome.actual = typeof actual === "string" ? diagnostic(actual) : typeof actual === "boolean" ? actual : null;
+							if (step.selector) outcome.selector = diagnostic(step.selector);
+						}
+						throw error;
+					}
 				}
 				run.status = "passed";
 			} catch (error) { run.error = text(error.message); }
@@ -287,7 +312,7 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 				if (launched) {
 					try { await screenshot("final"); } catch (error) { run.status = "failed"; run.evidenceError = text(error.message); }
 					try {
-						Object.assign(run, classifyTelemetry(await engine(["console"]), await engine(["errors"]), await engine(["network", "requests"])));
+						Object.assign(run, classifyTelemetry(await engine(["console"]), await engine(["errors"]), await engine(["network", "requests"]), text));
 						if ((scenario.failOnConsoleError && run.consoleErrors.length) || (scenario.failOnPageError && run.pageErrors.length) || (scenario.failOnFailedRequest && (run.failedRequests.length || run.unresolvedRequests))) run.status = "failed";
 					} catch (error) { run.status = "failed"; run.telemetryError = text(error.message); }
 					try { await engine(["close"], { cleanup: true }); }
@@ -301,7 +326,7 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 		const after = await gitState(repo, env);
 		result.git.changedDuringRun = before.commit !== after.commit || before.branch !== after.branch || before.fingerprint !== after.fingerprint;
 	} catch { result.git.changedDuringRun = true; }
-	result.summary = {
+	const summary = {
 		viewports: scenario.viewports.length,
 		passed: result.runs.filter((run) => run.status === "passed").length,
 		failed: scenario.viewports.length - result.runs.filter((run) => run.status === "passed").length,
@@ -310,12 +335,13 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 		pageErrors: result.runs.reduce((sum, run) => sum + run.pageErrors.length, 0),
 		failedRequests: result.runs.reduce((sum, run) => sum + run.failedRequests.length, 0),
 	};
-	result.status = result.summary.failed === 0 && !result.git.changedDuringRun && result.cleanup.status === "passed" && !result.error ? "passed" : "failed";
+	result.status = summary.failed === 0 && !result.git.changedDuringRun && result.cleanup.status === "passed" && !result.error ? "passed" : "failed";
 	if (signal?.aborted) { result.status = "failed"; result.error = "QA run interrupted"; }
 	result.finishedAt = new Date().toISOString();
-	boundResult(result);
-	saveJson(resultPath, result);
-	return { ...result, resultPath };
+	const finalResult = { ...result, summary };
+	boundResult(finalResult);
+	saveJson(resultPath, finalResult);
+	return { ...finalResult, resultPath };
 }
 
 export async function main(argv = process.argv.slice(2)) {

@@ -6,6 +6,8 @@ import http from "node:http";
 import net from "node:net";
 import { formatAxNodes, formatRequests } from "./page-text.mjs";
 
+/** @typedef {import("./backend.js").Backend} Backend */
+
 // Attach mode needs a WebSocket client; Node grew a global one in 22.
 // On Node 20 the pane keeps working in agent-browser mode — callers gate on
 // this instead of crashing at connect time.
@@ -63,6 +65,10 @@ function getJson(host, port, path, timeout = 5_000) {
 // A pasted page-level URL (/devtools/page/<id>) is refused with a pointer at
 // the browser endpoint: Target.attachToTarget only works browser-level, and
 // this is the most common paste mistake from /json/list output.
+/**
+ * @param {string} input
+ * @param {{lookup?: (host: string) => Promise<{address: string}>}} [options]
+ */
 export async function discoverEndpoint(input, { lookup } = {}) {
 	let u;
 	try {
@@ -119,6 +125,10 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 // requests carry an optional sessionId, responses correlate by id, events
 // route to subscribers. Never throws out of the message handler — a torn
 // frame from a dying browser must not become an uncaughtException.
+/**
+ * @param {string} wsUrl
+ * @param {{wsFactory?: (url: string) => WebSocket}} [options]
+ */
 export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 	const factory = wsFactory ?? ((url) => new WebSocket(url));
 	const ws = factory(wsUrl);
@@ -143,6 +153,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 			}
 		}
 	};
+	/** @type {Promise<void>} */
 	const opened = new Promise((resolve, reject) => {
 		const t = setTimeout(() => {
 			try {
@@ -249,6 +260,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 // The Renderer's existing typeof guards turn those absences into disabled
 // features instead of crashes. It never calls Target.createTarget,
 // Target.closeTarget, or Emulation.* — the pane observes, it does not own.
+/** @returns {Backend} */
 export function makeCdpBrowser(endpointInput, opts = {}) {
 	const quality = opts.quality ?? 60;
 	const maxDim = opts.maxDim ?? 1280;
@@ -518,7 +530,6 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			handler = fn;
 		},
 		attachTime: () => attachTimeMs,
-		frameMetadata: () => lastMeta,
 		// Ack path for the Renderer's paint-settle hook. Generation-guarded so
 		// an ack from before a restart/re-pin can never reach a new screencast.
 		async ackFrame(ackId, frameGen) {
@@ -653,6 +664,5 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				: Promise.resolve();
 			done.finally(() => s.close());
 		},
-		_session: () => session, // U4 console wiring + tests reach the raw session
 	};
 }

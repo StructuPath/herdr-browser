@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import {
 	deriveSession,
@@ -79,6 +80,47 @@ const quiet = (r) => {
 };
 const flush = async () => {
 	for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+};
+
+const fakeOutput = (t) => {
+	const chunks = [];
+	const events = new EventEmitter();
+	let writable = true;
+	const once = process.stdout.once;
+	const write = process.stdout.write;
+	t.mock.method(process.stdout, "write", function (chunk, ...args) {
+		if (typeof chunk !== "string") return write.call(this, chunk, ...args);
+		chunks.push(String(chunk));
+		return writable;
+	});
+	t.mock.method(process.stdout, "once", function (event, fn) {
+		if (event !== "drain") return once.call(this, event, fn);
+		events.once(event, fn);
+		return this;
+	});
+	return {
+		chunks,
+		block: () => { writable = false; },
+		drain: () => { writable = true; events.emit("drain"); },
+	};
+};
+
+const imageRenderer = () => {
+	const r = quiet(mkRenderer());
+	delete r.renderImage;
+	r.mode = "kitty";
+	r.size = () => ({ cols: 80, imageRows: 20 });
+	r.fitViewport = async () => false;
+	return r;
+};
+
+const fakeChafa = (t, r, source) => {
+	const file = path.join(r.stateDir, "chafa");
+	fs.writeFileSync(file, `#!${process.execPath}\n${source}\n`, { mode: 0o700 });
+	const oldPath = process.env.PATH;
+	process.env.PATH = r.stateDir;
+	t.after(() => { process.env.PATH = oldPath; });
+	return file;
 };
 // attachCdp (and launchChromium) refuse on Node < 22 before touching the
 // backend, so attach-behavior tests only make sense where attach is possible.
@@ -1018,6 +1060,116 @@ test("enqueue counts paint failures instead of silently swallowing them", async 
 	assert.equal(r.paintErrors, 1);
 	await r.enqueue(() => {});
 	assert.equal(r.paintErrors, 1, "queue is not poisoned by a throw");
+});
+
+test("renderImage writes the original PNG in Kitty output and honors drain", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	// Complete RGBA PNG, including compressed pixel data and valid CRCs.
+	const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
+	fs.writeFileSync(r.shot, png);
+	out.block();
+	await r.renderImage();
+	assert.equal(out.chunks.join(""), `\x1b[3;1H${kittyImageSequence(png, 1, 1, 80, 20)}`);
+	assert.equal(r.stdoutBlocked, true);
+	await r.renderImage();
+	assert.equal(out.chunks.length, 1, "no second image before drain");
+	out.drain();
+	await r.renderImage();
+	assert.equal(r.stdoutBlocked, false);
+	assert.equal(out.chunks.length, 2, "drain permits the next image");
+});
+
+test("renderImage handles encoder failure and writes recovered chafa bytes", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	r.shotFormat = "jpg";
+	fs.writeFileSync(r.shotJpg, jpeg(80, 40));
+	const file = fakeChafa(t, r, "process.exit(1);");
+	await r.renderImage();
+	assert.equal(r.chafaFails, 1);
+	assert.deepEqual(out.chunks, [], "failed encoder emits no partial image");
+	fs.writeFileSync(file, `#!${process.execPath}\nprocess.stdout.write('encoded-kitty-frame');\n`);
+	await r.renderImage();
+	assert.equal(r.chafaFails, 0);
+	assert.equal(out.chunks.at(-1), "encoded-kitty-frame");
+});
+
+test("stream burst coalesces before decode and writes; input waits for one paint", async (t) => {
+	const r = quiet(mkRenderer());
+	r.tick = async () => {};
+	r.fitViewport = async () => false;
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const painted = [];
+	const order = [];
+	r.renderImage = async () => {
+		painted.push(fs.readFileSync(r.shotJpg));
+		order.push("paint");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	};
+	const decode = t.mock.method(Buffer, "from");
+	const write = t.mock.method(fs, "writeFileSync");
+	const frames = Array.from({ length: 61 }, (_, i) => jpeg(80 + i, 40).toString("base64"));
+	decode.mock.resetCalls();
+	r.onStreamMessage({ type: "frame", data: frames[0] });
+	await flush();
+	for (const data of frames.slice(1)) r.onStreamMessage({ type: "frame", data });
+	r.userAction(async () => { order.push("input"); });
+	assert.equal(write.mock.callCount(), 1, "pending frames cause no file writes");
+	assert.equal(decode.mock.calls.filter(({ arguments: args }) => args[1] === "base64").length, 1);
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(order, ["paint", "input", "paint"]);
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(painted, [jpeg(80, 40), jpeg(140, 40)], "only the latest pending frame survives");
+	assert.equal(write.mock.callCount(), 2);
+});
+
+test("stream frames queued behind a paint collapse to the latest before IO", async (t) => {
+	const r = quiet(mkRenderer());
+	r.fitViewport = async () => false;
+	let release;
+	r.enqueue(() => new Promise((resolve) => { release = resolve; }));
+	await flush();
+	const latest = jpeg(140, 40);
+	const data = latest.toString("base64");
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let i = 0; i < 1000; i++) r.onStreamMessage({ type: "frame", data });
+	assert.equal(write.mock.callCount(), 0);
+	release();
+	await r.paintQueue;
+	await flush();
+	assert.equal(write.mock.callCount(), 1);
+	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
+});
+
+test("slow stdout retains only the latest frame until drain without image IO", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	fakeChafa(t, r, "process.stdout.write('encoded-frame');");
+	out.block();
+	r.onStreamMessage({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	await r.paintQueue;
+	await flush();
+	assert.equal(r.stdoutBlocked, true);
+	const before = out.chunks.length;
+	const latest = jpeg(200, 100);
+	const data = latest.toString("base64");
+	const decode = t.mock.method(Buffer, "from");
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let i = 0; i < 1000; i++) r.onStreamMessage({ type: "frame", data });
+	await r.paintQueue;
+	assert.equal(write.mock.callCount(), 0, "blocked frames do not touch disk");
+	assert.equal(decode.mock.calls.filter(({ arguments: args }) => args[1] === "base64").length, 0);
+	assert.equal(out.chunks.length, before);
+	out.drain();
+	await flush();
+	await r.paintQueue;
+	assert.equal(write.mock.callCount(), 1);
+	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
+	assert.equal(out.chunks.at(-1), "encoded-frame");
+	assert.equal(out.chunks.filter((chunk) => chunk === "encoded-frame").length, 2);
 });
 
 test("reconcile edge matrix: empty tail, ring boundary, duplicate texts", () => {
@@ -2163,20 +2315,42 @@ test("live timer: fires the shared poll and paints while streaming", async () =>
 	assert.match(r.consoleLines[0], /^✖ 500 GET/);
 });
 
-test("live timer: painted polls hold base cadence, empty polls back off", async () => {
+test("live timer: painted polls hold base cadence, empty polls back off", async (t) => {
 	const r = quietPoll(mkRenderer());
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
 	r.attached = true;
 	r.live = { ws: { close: () => {} } };
 	r.browser = { network: async () => [] };
 	let painted = true;
-	r.pollNetwork = async () => painted;
-	r.startNetworkTimer(5);
-	await new Promise((res) => setTimeout(res, 40));
-	assert.equal(r.networkIdleTicks, 0, "painted failures reset the counter");
+	let polls = 0;
+	r.pollNetwork = async () => { polls++; return painted; };
+	r.startNetworkTimer(1000);
+	t.after(() => r.stopNetworkTimer());
+	for (let i = 0; i < 3; i++) {
+		t.mock.timers.tick(1000);
+		await flush();
+		assert.equal(polls, i + 1);
+		assert.equal(r.networkIdleTicks, 0, "painted failures reset the counter");
+	}
 	painted = false;
-	await new Promise((res) => setTimeout(res, 40));
-	r.stopNetworkTimer();
-	assert.ok(r.networkIdleTicks > 0, "quiet polls accumulate idle ticks");
+	const start = Date.now();
+	for (let tick = 1; tick <= 301; tick++) {
+		const delay = tick <= 10 ? 1000 : tick <= 30 ? 2000 : tick <= 60 ? 4000 : tick <= 300 ? 8000 : 30000;
+		t.mock.timers.tick(delay - 1);
+		await flush();
+		assert.equal(polls, tick + 2, `tick ${tick} must wait its full delay`);
+		t.mock.timers.tick(1);
+		await flush();
+		assert.equal(polls, tick + 3);
+		if (tick === 300) assert.equal(Date.now() - start, 2_090_000, "300 idle ticks take about 35 minutes at a 1s base");
+	}
+	painted = true;
+	t.mock.timers.tick(30_000);
+	await flush();
+	assert.equal(r.networkIdleTicks, 0);
+	t.mock.timers.tick(1000);
+	await flush();
+	assert.equal(polls, 306, "painted poll restores the base delay");
 });
 
 test("live timer: dropLive clears it first; no fire after drop", async () => {
@@ -2292,12 +2466,14 @@ test("attach mode: tick connects, then only watches liveness", { skip: !canCdp }
 	assert.deepEqual(r.browser.calls, ["connect"], "no polling while attached");
 });
 
-test("attach mode: frames paint and ack with the integer id after the paint settles", { skip: !canCdp }, async () => {
+test("attach mode: frames paint and ack with the integer id after the paint settles", { skip: !canCdp }, async (t) => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	let renders = 0;
 	r.renderImage = async () => {
 		renders++;
+		await new Promise((resolve) => setTimeout(resolve, 10));
 	};
 	await r.tick();
 	r.browser.emit({
@@ -2309,7 +2485,77 @@ test("attach mode: frames paint and ack with the integer id after the paint sett
 	});
 	await flush();
 	assert.equal(renders, 1, "frame painted");
-	assert.ok(r.browser.calls.includes("ack:42:1"), "acked after paint");
+	assert.ok(!r.browser.calls.includes("ack:42:1"), "no ack during the paint");
+	t.mock.timers.tick(9);
+	await flush();
+	assert.ok(!r.browser.calls.includes("ack:42:1"), "no ack before the paint settles");
+	t.mock.timers.tick(1);
+	await flush();
+	assert.equal(r.browser.calls.filter((c) => c === "ack:42:1").length, 1, "acked once after paint");
+});
+
+test("attach mode: coalesced frames each ack after their paint; input uses painted geometry", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	let paints = 0;
+	r.renderImage = async () => {
+		paints++;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	};
+	const emit = (ackId, width) => r.browser.emit({
+		type: "frame", ackId, gen: 1,
+		data: jpeg(width, 40).toString("base64"),
+		metadata: { deviceWidth: width * 2, deviceHeight: 80 },
+	});
+	const acks = () => r.browser.calls.filter((c) => c.startsWith("ack:"));
+	let inputState;
+	emit(1, 80);
+	await flush();
+	for (let id = 2; id <= 60; id++) emit(id, 100 + id);
+	r.userAction(async () => {
+		inputState = {
+			paints, width: imageDims(fs.readFileSync(r.shotJpg)).w,
+			point: r.cdpPagePoint({ x: 20, y: 10 }, { w: 80, h: 40 }),
+		};
+	});
+	assert.deepEqual(acks(), []);
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(inputState, { paints: 1, width: 80, point: { x: 40, y: 20 } });
+	assert.equal(paints, 2);
+	assert.deepEqual(acks(), ["ack:1:1"], "pending frame acks wait for the second paint");
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(acks(), Array.from({ length: 60 }, (_, i) => `ack:${i + 1}:1`));
+	assert.equal(r.lastFrameMeta.deviceWidth, 320);
+});
+
+test("attach mode: skipped and failed paints ack every frame and keep the queue usable", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	const emit = (ackId, data = jpeg(80, 40).toString("base64")) => r.browser.emit({ type: "frame", ackId, gen: 1, data });
+	r.stdoutBlocked = true;
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let id = 1; id <= 100; id++) emit(id);
+	await flush();
+	assert.equal(write.mock.callCount(), 0);
+	assert.equal(r.browser.calls.filter((c) => c.startsWith("ack:")).length, 100);
+	r.stdoutBlocked = false;
+	emit(101, "invalid JPEG");
+	await flush();
+	r.renderImage = async () => { throw new Error("paint failed"); };
+	emit(102);
+	await flush();
+	assert.equal(r.paintErrors, 1);
+	assert.ok(r.browser.calls.includes("ack:101:1"));
+	assert.ok(r.browser.calls.includes("ack:102:1"));
+	r.renderImage = async () => {};
+	emit(103);
+	await flush();
+	assert.equal(r.browser.calls.filter((c) => c === "ack:103:1").length, 1);
 });
 
 test("attach mode: clicks scale from frame pixels to page pixels per frame", async () => {

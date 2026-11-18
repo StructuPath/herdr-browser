@@ -221,7 +221,7 @@ export function truncate(s, width) {
 // Poll backoff: each tick spawns 4 agent-browser subprocesses, so a quiet
 // page should not be polled at full rate forever. Any observed change (or
 // user input) resets idleTicks to 0 and restores the base cadence. After
-// ~5 quiet minutes the floor drops to 30x — an unwatched pane costs ~zero.
+// 300 quiet ticks (~35 minutes at a 1s base) the delay reaches 30x.
 export function pollDelay(baseMs, idleTicks) {
 	const mult =
 		idleTicks < 10
@@ -684,6 +684,8 @@ export class Renderer {
 		this.inputRevision = 0;
 		this.cdpTargetId = null;
 		this.paintQueue = Promise.resolve();
+		this.framePaint = false;
+		this.pendingFrame = null;
 		this.paintErrors = 0;
 		this.chafaFails = 0;
 		this.chafaCooldownUntil = 0;
@@ -749,6 +751,58 @@ export class Renderer {
 			}
 		});
 		return this.paintQueue;
+	}
+
+	// Keep raw data until its turn: one paint plus one latest pending frame.
+	// Schedule the next paint after queued input, never ahead of it.
+	queueFrame(message, ack) {
+		if (message) {
+			this.pendingFrame ??= { acks: [] };
+			Object.assign(this.pendingFrame, {
+				message, browser: this.browser, revision: this.inputRevision,
+			});
+			if (ack) this.pendingFrame.acks.push(ack);
+		}
+		if (this.framePaint || !this.pendingFrame ||
+			(this.stdoutBlocked && !this.pendingFrame.acks.length)) return;
+		this.framePaint = true;
+		this.enqueue(async () => {
+			const frame = this.pendingFrame;
+			this.pendingFrame = null;
+			try {
+				if (frame.browser !== this.browser || frame.revision !== this.inputRevision) return;
+				if (this.stdoutBlocked) {
+					// Retain the latest image for drain, but settle skipped CDP acks.
+					this.pendingFrame = { ...frame, acks: [] };
+					return;
+				}
+				if (typeof frame.message.data !== "string") return;
+				const buf = Buffer.from(frame.message.data, "base64");
+				const dims = jpegDims(buf);
+				if (!dims) return;
+				const tmp = `${this.shotJpg}.${process.pid}.tmp`;
+				try {
+					fs.writeFileSync(tmp, buf);
+					fs.renameSync(tmp, this.shotJpg);
+					fs.chmodSync(this.shotJpg, 0o600);
+				} catch {
+					return;
+				}
+				this.shotFormat = "jpg";
+				if (this.backend === "attach") this.lastFrameMeta = frame.message.metadata ?? null;
+				this.frameSeq++;
+				this.networkIdleTicks = 0;
+				await this.renderImage();
+				if (!this.textView) await this.fitViewport(dims.w, dims.h);
+			} finally {
+				for (const ack of frame.acks) {
+					try { Promise.resolve(ack()).catch(() => {}); } catch { /* disconnected */ }
+				}
+			}
+		}).then(() => {
+			this.framePaint = false;
+			this.queueFrame();
+		});
 	}
 
 	size() {
@@ -1234,12 +1288,10 @@ export class Renderer {
 		if (m.type === "frame") {
 			if (!this.cdpTargetId) return;
 			this.lastFrameAt = Date.now();
-			this.lastFrameMeta = m.metadata ?? null;
-			this.onStreamMessage({ type: "frame", data: m.data });
-			// Ack after the paint queue drains. A skipped paint (blocked stdout,
-			// chafa cooldown) still acks — a frozen stream is worse than a
-			// dropped frame, and quality/max-dimension knobs bound the cost.
-			this.enqueue(() => {}).then(() => this.browser.ackFrame?.(m.ackId, m.gen));
+			const browser = this.browser;
+			const { ackId, gen } = m;
+			// Every frame acks after its coalesced paint (or skip) settles.
+			this.queueFrame(m, () => browser.ackFrame?.(ackId, gen));
 			return;
 		}
 		if (m.type === "url") {
@@ -1461,6 +1513,7 @@ export class Renderer {
 					this.stdoutBlocked = true;
 					process.stdout.once("drain", () => {
 						this.stdoutBlocked = false;
+						this.queueFrame();
 					});
 				}
 			} catch {
@@ -1512,6 +1565,7 @@ export class Renderer {
 				this.stdoutBlocked = true;
 				process.stdout.once("drain", () => {
 					this.stdoutBlocked = false;
+					this.queueFrame();
 				});
 			}
 		} catch {
@@ -2299,25 +2353,7 @@ export class Renderer {
 	onStreamMessage(m) {
 		switch (m.type) {
 			case "frame": {
-				if (typeof m.data !== "string") return;
-				const buf = Buffer.from(m.data, "base64");
-				const dims = jpegDims(buf);
-				if (!dims) return;
-				const tmp = `${this.shotJpg}.${process.pid}.tmp`;
-				try {
-					fs.writeFileSync(tmp, buf);
-					fs.renameSync(tmp, this.shotJpg);
-					fs.chmodSync(this.shotJpg, 0o600);
-				} catch {
-					return;
-				}
-				this.shotFormat = "jpg";
-				this.frameSeq++;
-				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
-				this.enqueue(async () => {
-					await this.renderImage();
-					if (!this.textView) await this.fitViewport(dims.w, dims.h);
-				});
+				this.queueFrame(m);
 				break;
 			}
 			case "console": {

@@ -16,6 +16,8 @@ const MAX_CONFIG = 64 * 1024;
 const MAX_OUTPUT = 2 * 1024 * 1024;
 const MAX_RESULT = 1024 * 1024;
 const MAX_ENTRIES = 100;
+// Cut by UTF-16 units, then drop a dangling high surrogate so no lone half reaches JSON.
+const clip = (value, max) => { const cut = value.slice(0, max); return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut; };
 const TYPES = {
 	navigate: ["path"], click: ["selector"], fill: ["selector", "value"],
 	waitFor: ["selector"], assertText: ["selector", "contains"],
@@ -66,7 +68,7 @@ export function validateScenario(value) {
 	for (const [index, step] of value.steps.entries()) {
 		try {
 			if (index === 0 && step?.type !== "navigate") throw new Error("first step must navigate");
-			const fields = TYPES[step?.type];
+			const fields = typeof step?.type === "string" && Object.hasOwn(TYPES, step.type) ? TYPES[step.type] : null;
 			if (!fields) throw new Error("unknown step type; scripts and eval are not supported");
 			object(step, ["type", ...fields], "step");
 			for (const field of fields) string(step[field], `step ${field}`);
@@ -79,7 +81,7 @@ export function validateScenario(value) {
 				if (new URL(step.path, base).origin !== base.origin) throw new Error("navigate must stay on baseUrl origin");
 			}
 		} catch (error) {
-			throw new Error(`steps[${index}] (type "${sanitizeText(step?.type ?? "unknown").slice(0, 200)}"): ${error.message}`);
+			throw new Error(`steps[${index}] (type "${clip(sanitizeText(typeof step?.type === "string" ? step.type : "unknown"), 200)}"): ${error.message}`);
 		}
 	}
 	for (const key of ["failOnConsoleError", "failOnPageError", "failOnFailedRequest"]) {
@@ -149,9 +151,9 @@ export function engineEnvironment(env, timeoutMs) {
 	return result;
 }
 
-function text(value) { return String(value ?? "").slice(0, 2000); }
+function text(value) { return clip(String(value ?? ""), 2000); }
 function safeUrl(value) {
-	try { const url = new URL(value); url.username = ""; url.password = ""; url.search = ""; url.hash = ""; return text(url.href); }
+	try { const url = new URL(value); url.username = ""; url.password = ""; url.search = ""; url.hash = ""; return url.href; }
 	catch { return "[unavailable URL]"; }
 }
 function entries(data, key) {
@@ -179,20 +181,23 @@ export function createEngine({ binary, session, configFile, cwd, env, timeoutMs,
 	return async (args, { cleanup = false } = {}) => {
 		const remaining = cleanup ? 10_000 : Math.min(timeoutMs + 1000, deadline - Date.now());
 		if (remaining <= 0) throw new Error("QA run deadline exceeded");
+		let output;
 		try {
-			const { stdout } = await execute(binary, ["--config", configFile, "--session", session, "--json", ...args], {
+			({ stdout: output } = await execute(binary, ["--config", configFile, "--session", session, "--json", ...args], {
 				cwd, env, timeout: remaining, maxBuffer: MAX_OUTPUT, signal: cleanup ? undefined : signal,
 				killSignal: "SIGKILL",
-			});
-			const result = JSON.parse(stdout);
-			if (result.success !== true) throw new Error(text(result.error || "engine command failed"));
-			return result.data;
+			}));
 		} catch (error) {
 			if (error.killed || error.name === "AbortError") throw new Error("engine command timed out or was interrupted");
 			// execFile errors embed arguments/stdout; do not accidentally publish filled values.
-			if (error.code) throw new Error(`engine command failed (${error.code})`);
-			throw new Error(text(error.message));
+			throw new Error(error.code ? `engine command failed (${error.code})` : "engine command failed");
 		}
+		let result;
+		// JSON.parse quotes the start of its input; never let engine output reach the message.
+		try { result = JSON.parse(output); } catch { throw new Error("engine returned invalid JSON"); }
+		// Uncut: the caller redacts fill values first, then bounds the length.
+		if (result?.success !== true) throw new Error(String(result?.error || "engine command failed"));
+		return result.data;
 	};
 }
 
@@ -216,14 +221,15 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 	const loaded = loadScenario(config, override);
 	const scenario = loaded.scenario;
 	const fillValues = scenario.steps.filter((step) => step.type === "fill").map((step) => step.value).sort((a, b) => b.length - a.length);
-	const redact = (value) => {
-		let redacted = String(value ?? "");
-		for (const value of fillValues) redacted = redacted.replaceAll(value, "[redacted]");
-		return redacted;
-	};
-	const text = (value) => redact(value).slice(0, 2000);
+	const MARK = "[redacted]";
+	const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	// One pass, longest value first; the marker itself is matched first and kept, so a
+	// second pass (after sanitizing) never redacts inside an earlier marker.
+	const pattern = fillValues.length ? new RegExp([escape(MARK), ...fillValues.filter(Boolean).map(escape)].join("|"), "g") : null;
+	const redact = (value) => pattern ? String(value ?? "").replace(pattern, () => MARK) : String(value ?? "");
+	const text = (value) => clip(redact(value), 2000);
 	// Sanitizing can join fragments of a fill value; redact again afterward.
-	const diagnostic = (value) => redact(sanitizeText(redact(value))).slice(0, 200);
+	const diagnostic = (value) => clip(redact(sanitizeText(redact(value))), 200);
 	const before = await gitState(repo, env);
 	const outputDir = output ? path.join(fs.realpathSync(path.dirname(path.resolve(output))), path.basename(path.resolve(output))) : fs.mkdtempSync(path.join(os.tmpdir(), "herdr-qa-"));
 	if (outputDir === before.root || outputDir.startsWith(`${before.root}${path.sep}`)) throw new Error("QA output must be outside the tested repository");
@@ -300,7 +306,7 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 						outcome.error = text(error.message);
 						if (step.type.startsWith("assert")) {
 							outcome.expected = step.type === "assertVisible" ? true : diagnostic(step.contains);
-							outcome.actual = typeof actual === "string" ? diagnostic(actual) : typeof actual === "boolean" ? actual : null;
+							outcome.actual = typeof actual === "string" ? diagnostic(step.type === "assertUrl" ? safeUrl(actual) : actual) : typeof actual === "boolean" ? actual : null;
 							if (step.selector) outcome.selector = diagnostic(step.selector);
 						}
 						throw error;

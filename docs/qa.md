@@ -125,9 +125,12 @@ name and SHA-256, engine version, and:
   sanitizer (control and invisible format characters removed, tabs replaced
   with spaces), then truncated to 200 characters without an ellipsis.
   `assertVisible` expects boolean `true`; its observed boolean is preserved.
-  Actual values other than strings or booleans use `null`. Literal `fill` values are
-  redacted as `[redacted]` in diagnostics, error messages, and telemetry before
-  truncation; fill steps never copy their values into the result.
+  Actual values other than strings or booleans use `null`. An `assertUrl` actual
+  drops credentials, query, and fragment, like failed-request URLs. Literal `fill`
+  values are redacted as `[redacted]` in diagnostics, error messages, and telemetry
+  before truncation; fill steps never copy their values into the result. Only the
+  literal value is matched: JSON-escaped, URL-encoded, or HTML-encoded echoes of it
+  are not redacted, and screenshots are not altered.
 - `cleanup.status`: `passed` or `failed`. Failed cleanup fails the result.
 
 These assertion fields are additive; the evidence schema stays at version 1.

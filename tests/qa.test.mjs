@@ -83,6 +83,7 @@ test("QA malformed scenario errors name the file and exit 2", (t) => {
 		const result = spawnSync(process.execPath, ["bin/qa.mjs", action, "--config", f.config, "--repo", f.repo], { encoding: "utf8" });
 		assert.equal(result.status, 2);
 		assert.ok(result.stderr.includes(path.basename(f.config)), result.stderr);
+		assert.doesNotMatch(result.stderr, /nope/);
 	}
 });
 
@@ -271,4 +272,64 @@ test("QA engine times out a hanging command and never exposes filled text in sub
 	fs.writeFileSync(f.binary, '#!/usr/bin/env node\nsetTimeout(() => {}, 10000);\n');
 	const engine = createEngine({ binary: f.binary, session: "owned", configFile: f.config, cwd: f.root, env: process.env, timeoutMs: 100, deadline: Date.now() + 100, signal: undefined });
 	await assert.rejects(engine(["fill", "#input", "private-value"]), (error) => /timed out/.test(error.message) && !error.message.includes("private-value"));
+});
+
+test("QA engine never quotes raw engine output and leaves long errors uncut for redaction", async (t) => {
+	const f = fixture(t);
+	const engine = () => createEngine({ binary: f.binary, session: "owned", configFile: f.config, cwd: f.root, env: process.env, timeoutMs: 5000, deadline: Date.now() + 5000, signal: undefined });
+	fs.writeFileSync(f.binary, '#!/bin/sh\nprintf "correcthorsebatterystaple not json\\n"\n', { mode: 0o700 });
+	await assert.rejects(engine()(["fill", "#pw", "correcthorsebatterystaple"]), (error) =>
+		error.message === "engine returned invalid JSON");
+	const long = "x".repeat(1995) + "correcthorsebatterystaple";
+	fs.writeFileSync(f.binary, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ success: false, error: long })}'\n`, { mode: 0o700 });
+	await assert.rejects(engine()(["get", "text", "h1"]), (error) => error.message === long);
+});
+
+test("QA redaction survives a long engine error, keeps its marker intact, and covers selectors", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" },
+		{ type: "fill", selector: "#pw", value: "correcthorsebatterystaple" },
+		{ type: "fill", selector: "#short", value: "e" },
+		{ type: "assertText", selector: "#correcthorsebatterystaple", contains: "Welcome" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return async (args, opts) => {
+			if (args[0] === "get") throw new Error("x".repeat(1995) + "correcthorsebatterystaple");
+			return engine(args, opts);
+		};
+	} });
+	const json = JSON.stringify(result);
+	assert.doesNotMatch(json, /corre/);
+	const failed = result.runs[0].steps[3];
+	assert.equal(failed.error, "x".repeat(1995) + "[reda");
+	assert.equal(failed.selector, "#[redacted]");
+	assert.doesNotMatch(json, /\[r\[redacted\]/);
+});
+
+test("QA assertUrl actual drops credentials, query, and fragment", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" }, { type: "assertUrl", contains: "/dashboard" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return (args, opts) => args[0] === "get" ? { url: "http://user:pw@localhost:3456/cb?code=OAUTHCODE#access_token=TOKEN" } : engine(args, opts);
+	} });
+	assert.equal(result.runs[0].steps[1].actual, "http://localhost:3456/cb");
+});
+
+test("QA diagnostics never split a surrogate pair at the length bound", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" }, { type: "assertText", selector: "h1", contains: "Dashboard" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return (args, opts) => args[0] === "get" ? { text: "x".repeat(199) + "\u{1F600}tail" } : engine(args, opts);
+	} });
+	assert.equal(result.runs[0].steps[1].actual, "x".repeat(199));
+});
+
+test("QA validation rejects non-string and prototype step types by index", () => {
+	for (const type of [["fill"], "constructor", "__proto__", "toString", 7]) {
+		const steps = [{ type: "navigate", path: "/" }, { type, selector: "#a", value: "b" }];
+		assert.throws(() => validateScenario(scenario({ steps })), (error) =>
+			/^steps\[1\] \(type "[^"]*"\): unknown step type/.test(error.message));
+	}
 });

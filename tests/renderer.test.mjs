@@ -3646,6 +3646,7 @@ test("truncate stops scanning once the output width is reached", () => {
 		best = Math.min(best, performance.now() - start);
 	}
 	assert.ok(best < 30, `truncate of a 2M-char string took ${best.toFixed(1)} ms`);
+});
 
 // --- Review regressions: frame arrival vs paint, stale frames, retained drain ---
 
@@ -3766,6 +3767,7 @@ test("a stream frame retained behind a blocked Kitty PNG paints when stdout drai
 	await flush();
 	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
 	assert.equal(out.chunks.at(-1), "encoded-frame");
+});
 
 // --- page text view: input isolation, staleness, paging, help/banners ---
 

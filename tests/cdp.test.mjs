@@ -726,6 +726,7 @@ test("adapter close during discovery or handshake never attaches to the abandone
 	fake.ws.onopen?.();
 	assert.equal((await handshaking)?.code, "ABANDONED");
 	assert.deepEqual(fake.sent.map((m) => m.method), [], "no CDP command reaches the abandoned browser");
+});
 
 test("adapter reports a new main-frame document, including a same-URL reload", async () => {
 	const fake = makeFakeCdp();

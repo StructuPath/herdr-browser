@@ -82,10 +82,14 @@ function safeHref(value) {
 // - else the word is kept as is (no userinfo, no query, nothing to strip).
 // data: payloads are withheld whole. A trailing "…" (truncate()'s cut
 // marker) is kept. Over-redaction is the accepted cost.
-// blob:/data: need a non-word char before them so "metadata:" is left alone.
-const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)/i;
+// Words split at ASCII whitespace only: sanitizeText keeps Unicode spaces
+// such as U+00A0, and a URL may contain one, so they must not end a word.
+// A scheme counts with "://" anywhere (even glued to a word), or with just
+// ":" at a word boundary (new URL() accepts "https:host/…" and
+// "wss:user@host"); the boundary keeps "metadata:" and "profile:" out.
+const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![A-Za-z0-9+.-])(?:https?|wss?|file|blob|data):)/i;
 export function redactUrls(text) {
-	return String(text).replace(/\S+/g, (word) => {
+	return String(text).replace(/[^ \t\n\r\f\v]+/g, (word) => {
 		const at = word.search(URL_START);
 		if (at < 0) return word;
 		const head = word.slice(0, at);

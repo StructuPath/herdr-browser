@@ -752,16 +752,20 @@ test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret",
 	// low bits); the high bits are the well-mixed ones.
 	const rnd = (n) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 16) % n;
 	const pick = (xs) => xs[rnd(xs.length)];
-	const junk = () => Array.from({ length: rnd(4) }, () => pick(["<", ">", "…", "'", '"', ")", "(", ";", "/", "[", "]", ":", "x"])).join("");
+	const junk = () => Array.from({ length: rnd(4) }, () => pick(["<", ">", "…", "'", '"', ")", "(", ";", "/", "[", "]", ":", "x", "\u00a0", "\u3000", "\u2009"])).join("");
 	let withUserinfo = 0;
 	let withQuery = 0;
 	for (let i = 0; i < 5_000; i++) {
-		const scheme = pick(["http://", "https://", "ws://", "wss://", "HTTPS://", "https:///", "https:////", "blob:https://", "file://"]);
+		const scheme = pick(["http://", "https://", "ws://", "wss://", "HTTPS://", "https:///", "https:////", "blob:https://", "file://", "https:", "wss:", "HTTP:"]);
 		const userinfo = rnd(2) ? `u${junk()}:pw${junk()}SECRETU${junk()}@` : "";
 		const host = pick(["example.test", "[::1]", "127.0.0.1:9222", "h"]);
 		const query = rnd(2) ? `?${junk()}t=${junk()}SECRETQ${junk()}` : "";
 		const frag = rnd(2) ? `#${junk()}SECRETF` : "";
-		const word = `${junk()}${scheme}${userinfo}${host}/${junk()}p${query}${frag}${junk()}`;
+		// A letter or digit glued before a slashless scheme makes another scheme
+		// ("xhttps:"), which no parser reads as https; keep a boundary there.
+		const pre = junk();
+		const sep = !scheme.includes("//") && /[A-Za-z0-9+.-]$/.test(pre) ? "(" : "";
+		const word = `${pre}${sep}${scheme}${userinfo}${host}/${junk()}p${query}${frag}${junk()}`;
 		if (userinfo) withUserinfo++;
 		if (query) withQuery++;
 		const out = redactUrls(`before ${word} after`);
@@ -770,4 +774,20 @@ test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret",
 	}
 	// The generator really produced the shapes it claims to test.
 	assert.ok(withUserinfo > 2_000 && withQuery > 2_000, `${withUserinfo} userinfo, ${withQuery} query cases`);
+});
+
+test("pane state: Unicode spaces and slashless schemes never shield a URL secret", () => {
+	const lines = [
+		"x https://u:pw\u00a0SECRET@h.test/ y",
+		"x https://h.test/p?token=\u00a0SECRET y",
+		"x https://h.test/p#frag\u3000SECRET y",
+		"x wss:u:SECRET@h.test/ y",
+		"x https:example.test/?token=SECRET y",
+		"x HTTP:u:SECRET@h.test/ y",
+	];
+	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
+	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
+	assert.equal(redactUrls("x https:example.test/?token=SECRET y"), "x https://example.test/ y");
+	// The boundary keeps ordinary words that end in a scheme name alone.
+	assert.equal(redactUrls("metadata:a@b profile:x?y"), "metadata:a@b profile:x?y");
 });

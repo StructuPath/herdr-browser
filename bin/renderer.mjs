@@ -515,7 +515,8 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Inherit the caller's configuration unchanged. Injecting an idle timeout
 	// makes agent-browser restart an existing daemon and lose its browser.
 	// On CI/container boxes agent-browser needs AGENT_BROWSER_ARGS to fall back
-	// to --no-sandbox, or its Chrome dies before any command returns.
+	// to --no-sandbox, or its Chrome dies before any command returns. The
+	// fallback is appended; the caller's own AGENT_BROWSER_ARGS are kept.
 	const runEnv = { ...env, ...agentBrowserSandboxEnv(env) };
 	const parse = (stdout, what) => {
 		let parsed;
@@ -1132,7 +1133,7 @@ export class Renderer {
 				// newer Chromes and would eventually break launches.
 				...(headed ? [] : ["--headless"]),
 				// Sandbox fallback for root/CI/containers (see chromiumSandboxArgs).
-				...chromiumSandboxArgs(process.env),
+				...chromiumSandboxArgs(this.env),
 				"about:blank",
 			];
 			this.banner = "launching Chromium…";
@@ -1312,7 +1313,10 @@ export class Renderer {
 			let age = 0;
 			try {
 				age = Date.now() - fs.statSync(this.navigateFile).mtimeMs;
-				url = fs.readFileSync(this.navigateFile, "utf8").split("\n")[0].trim();
+				const text = fs.readFileSync(this.navigateFile, "utf8");
+				// Empty or unterminated: a writer is mid-write; leave it.
+				if (!text.includes("\n")) return;
+				url = text.split("\n")[0].trim();
 				fs.unlinkSync(this.navigateFile);
 			} catch {
 				return; // nothing pending

@@ -119,6 +119,11 @@ test("QA engine does not inherit shared sessions, remote providers, profiles, in
 	assert.deepEqual(Object.keys(env).sort(), ["AGENT_BROWSER_DEFAULT_TIMEOUT", "AGENT_BROWSER_EXECUTABLE_PATH", "AGENT_BROWSER_IDLE_TIMEOUT_MS", "HOME", "PATH"].sort());
 });
 
+test("QA engine gets the CI sandbox fallback but never the host's AGENT_BROWSER_ARGS", () => {
+	const env = engineEnvironment({ PATH: "/bin", CI: "1", AGENT_BROWSER_ARGS: "--load-extension=/ext" }, 1000);
+	assert.equal(env.AGENT_BROWSER_ARGS, "--no-sandbox,--disable-dev-shm-usage");
+});
+
 test("QA telemetry distinguishes failed HTTP responses from incomplete requests and strips URL secrets", () => {
 	const observed = classifyTelemetry({ messages: [{ type: "error", text: "broken" }, { type: "log", text: "fine" }] }, { errors: ["page threw"] }, { requests: [
 		{ status: 500, url: "https://user:pass@example.test/api?token=private#secret", method: "POST" },

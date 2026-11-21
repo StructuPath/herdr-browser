@@ -433,9 +433,12 @@ echo "my-agent-session" \
 ## Recording
 
 Recording captures the workspace's **agent-browser session**. Attach and
-launch workspaces have no such session, so the record actions refuse with
-an explanation instead of silently recording a fresh, unrelated headless
+launch workspaces have no such session, so Start recording refuses with an
+explanation instead of silently recording a fresh, unrelated headless
 browser — record from the automation client that owns the browser instead.
+This holds whether attach or launch is configured or chosen at runtime with
+`a` or `l`. Stop recording still finishes a recording that is already
+running.
 
 Start and stop recording through the existing recording actions. Each new
 capture is a run-scoped observation bundle:

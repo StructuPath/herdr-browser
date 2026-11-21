@@ -23,11 +23,8 @@ if cdp_endpoint_configured || launch_configured; then
 fi
 # Runtime switches (the a/l keys) are invisible to static sources; the pane
 # leaves a marker while attached. Only a live pane's marker counts.
-if [ "$pane_owns_navigation" -eq 0 ] && [ -f "$(backend_marker_file)" ]; then
-	marker_pane="$(cat "$(pane_id_file)" 2>/dev/null || true)"
-	if pane_alive "$marker_pane"; then
-		pane_owns_navigation=1
-	fi
+if [ "$pane_owns_navigation" -eq 0 ] && runtime_backend_live; then
+	pane_owns_navigation=1
 fi
 
 # A workspace configured observe-only exists to watch a run untouched; a
@@ -45,10 +42,21 @@ if [ -n "$url" ] && [ "$pane_owns_navigation" -eq 1 ]; then
 	fi
 	# Hand the URL to the pane, which navigates its attached or launched
 	# target. The renderer watches this file, so pickup does not wait for a
-	# backed-off poll tick.
-	handoff="$(state_dir)/navigate-$(ws_id)"
+	# backed-off poll tick. Write a private temp file in the same directory,
+	# then rename it into place: the watcher must never see a half-written
+	# (or empty) handoff. The dot-prefixed temp name never matches its filter.
+	sd="$(state_dir)"
+	handoff="$sd/navigate-$(ws_id)"
 	umask 077
-	printf '%s\n' "$url" > "$handoff"
+	if ! tmp="$(mktemp "$sd/.navigate-$(ws_id).XXXXXX")"; then
+		echo "herdr-browser: cannot create the navigate handoff in $sd" >&2
+		exit 3
+	fi
+	if ! { printf '%s\n' "$url" >"$tmp" && mv -f "$tmp" "$handoff"; }; then
+		rm -f "$tmp"
+		echo "herdr-browser: cannot write the navigate handoff $handoff" >&2
+		exit 3
+	fi
 elif [ -n "$url" ]; then
 	require_agent_browser
 	if ! validate_url "$url"; then
@@ -57,6 +65,8 @@ elif [ -n "$url" ]; then
 	fi
 	# Preserve the caller's daemon configuration. An injected timeout can
 	# restart an existing agent-owned daemon and discard its browser state.
+	# Only the CI/container sandbox fallback is appended to its launch args.
+	export_agent_browser_args
 	if ! with_timeout 15 agent-browser --session "$session" open "$url" >/dev/null; then
 		echo "herdr-browser: agent-browser failed to open $url" >&2
 		exit 3

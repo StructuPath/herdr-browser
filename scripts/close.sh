@@ -54,6 +54,7 @@ if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
 fi
 
 if command -v agent-browser >/dev/null 2>&1; then
+	export_agent_browser_args
 	with_timeout 10 agent-browser --session "$session" close >/dev/null 2>&1 || true
 fi
 

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { chromiumSandboxArgs } from "../bin/chromium-args.mjs";
 import {
 	atomicWriteJson,
 	inspectArtifact,
@@ -29,6 +30,7 @@ function fixture(t, overrides = {}) {
 		path.join(bin, "agent-browser"),
 		`#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$AB_CALLS"
+[ -n "${"$"}{AB_ENV:-}" ] && printf '%s' "${"$"}{AGENT_BROWSER_ARGS-<unset>}" > "$AB_ENV"
 if [ "$4" = "start" ]; then
   if [ "${"$"}{AB_START_FAIL:-0}" = 1 ]; then
     [ -n "${"$"}{AB_ACTIVE:-}" ] && printf active > "$AB_ACTIVE"
@@ -761,4 +763,84 @@ test("concurrent stale-lock reclamation still permits only one workspace action"
 		.readdirSync(path.join(f.state, "runs"))
 		.filter((name) => name.startsWith("active-"));
 	assert.deepEqual(pointers, ["active-workspace_1.json"]);
+});
+
+// A herdr stub whose `pane read` succeeds: the pane recorded in pane-id-<ws>
+// is alive, so its runtime backend marker counts.
+function liveHerdr(f) {
+	const herdr = path.join(f.base, "bin", "herdr");
+	fs.writeFileSync(herdr, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+	fs.mkdirSync(f.state, { recursive: true, mode: 0o700 });
+	return herdr;
+}
+
+function markRuntimeAttach(f) {
+	fs.writeFileSync(path.join(f.state, "backend-workspace_1"), "attach\n");
+	fs.writeFileSync(path.join(f.state, "pane-id-workspace_1"), "w1:p1\n");
+}
+
+test("start refuses when a live pane switched to attach/launch at runtime", (t) => {
+	const f = fixture(t);
+	const herdr = liveHerdr(f);
+	markRuntimeAttach(f);
+	const start = invoke(f, "start", { HERDR_BIN_PATH: herdr });
+	assert.notEqual(start.status, 0);
+	assert.match(start.stderr, /attach\/launch mode/);
+	assert.equal(fs.existsSync(f.calls), false, "agent-browser must not be called");
+	assert.equal(fs.existsSync(bundle(f).dir), false);
+});
+
+test("a dead pane's stale backend marker does not block start", (t) => {
+	const f = fixture(t);
+	const herdr = path.join(f.base, "bin", "herdr");
+	fs.writeFileSync(herdr, "#!/usr/bin/env bash\nexit 1\n", { mode: 0o755 });
+	fs.mkdirSync(f.state, { recursive: true, mode: 0o700 });
+	markRuntimeAttach(f);
+	const start = invoke(f, "start", { HERDR_BIN_PATH: herdr });
+	assert.equal(start.status, 0, start.stderr);
+});
+
+test("stop completes an existing journal after the pane switched to attach", (t) => {
+	const f = fixture(t);
+	const herdr = liveHerdr(f);
+	assert.equal(invoke(f, "start", { HERDR_BIN_PATH: herdr }).status, 0);
+	markRuntimeAttach(f);
+	const stop = invoke(f, "stop", { HERDR_BIN_PATH: herdr });
+	assert.equal(stop.status, 0, stop.stderr);
+	assert.equal(json(bundle(f).manifest).status, "complete");
+	assert.match(fs.readFileSync(f.calls, "utf8"), /record stop/);
+});
+
+test("stop completes an existing journal after a cdp-url was configured", (t) => {
+	const f = fixture(t);
+	assert.equal(invoke(f, "start").status, 0);
+	const stop = invoke(f, "stop", { HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222" });
+	assert.equal(stop.status, 0, stop.stderr);
+	assert.equal(json(bundle(f).manifest).status, "complete");
+});
+
+test("record start and stop pass the CI sandbox fallback to agent-browser", (t) => {
+	const f = fixture(t);
+	const out = path.join(f.base, "ab-env");
+	const start = invoke(f, "start", { CI: "1", AB_ENV: out, AGENT_BROWSER_ARGS: undefined });
+	assert.equal(start.status, 0, start.stderr);
+	assert.match(fs.readFileSync(out, "utf8"), /(^|,)--no-sandbox(,|$)/);
+	const stop = invoke(f, "stop", {
+		CI: "1",
+		AB_ENV: out,
+		AGENT_BROWSER_ARGS: "--proxy-server=x",
+	});
+	assert.equal(stop.status, 0, stop.stderr);
+	const seen = fs.readFileSync(out, "utf8").split(/[,\n]/);
+	assert.ok(seen.includes("--proxy-server=x"), "the user's args survive");
+	assert.ok(seen.includes("--no-sandbox"), "the fallback is appended");
+});
+
+test("record leaves AGENT_BROWSER_ARGS unchanged off CI on a desktop box", { skip: chromiumSandboxArgs({}).length > 0 }, (t) => {
+	const f = fixture(t);
+	const out = path.join(f.base, "ab-env");
+	assert.equal(invoke(f, "start", { CI: "", AB_ENV: out, AGENT_BROWSER_ARGS: undefined }).status, 0);
+	assert.equal(fs.readFileSync(out, "utf8"), "<unset>");
+	assert.equal(invoke(f, "stop", { CI: "", AB_ENV: out, AGENT_BROWSER_ARGS: "--proxy-server=x" }).status, 0);
+	assert.equal(fs.readFileSync(out, "utf8"), "--proxy-server=x");
 });

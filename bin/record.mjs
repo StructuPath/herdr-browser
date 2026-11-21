@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { agentBrowserSandboxEnv } from "./chromium-args.mjs";
 
 const PLUGIN_ID = "structupath.browser";
 // Single-sourced from package.json so a release bump cannot miss it. The
@@ -269,6 +270,8 @@ function withPrivateUmask(callback) {
 function engine(session, args) {
 	const result = withPrivateUmask(() =>
 		spawnSync("agent-browser", ["--session", session, "record", ...args], {
+			// The CI/container sandbox fallback, appended to the caller's args.
+			env: { ...process.env, ...agentBrowserSandboxEnv(process.env) },
 			stdio: ["ignore", "ignore", "pipe"],
 			encoding: "utf8",
 			timeout: 15_000,

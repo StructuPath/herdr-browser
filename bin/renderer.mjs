@@ -3,7 +3,6 @@
 // It stays passive until explicit pane input, never clears the console buffer,
 // and closes only sessions that its own successful navigation created.
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
@@ -14,7 +13,6 @@ import { chromiumSandboxArgs, agentBrowserSandboxEnv } from "./chromium-args.mjs
 
 export { chromiumSandboxArgs } from "./chromium-args.mjs";
 
-const pExecFile = promisify(execFile);
 const ESC = "\x1b";
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 // Fixed graphics id for the pane's screenshot frame: re-transmitting data
@@ -58,6 +56,7 @@ export function deriveSession(env, cwd) {
 	const res = spawnSync("sh", ["-c", "printf '%s\\n' \"$HB_CWD\" | cksum"], {
 		env: { ...process.env, HB_CWD: cwd },
 		timeout: 5000,
+		killSignal: "SIGKILL",
 	});
 	const sum = res.stdout ? res.stdout.toString().split(" ")[0].trim() : "";
 	return `herdr-cwd-${sum || "unknown"}`;
@@ -435,6 +434,31 @@ export function formatNetworkFailure({ method, url, status }) {
 
 // --- agent-browser access ---
 
+// promisify(execFile) with a hard bound: execFile's timeout only sends
+// SIGTERM, and a child that ignores it keeps the call pending forever. After
+// the grace, SIGKILL the child and drop its pipes (a grandchild holding them
+// open would also hold the call).
+export function execFileBounded(bin, args, opts, graceMs = 2_000) {
+	return new Promise((resolve, reject) => {
+		let killTimer = null;
+		const child = execFile(bin, args, opts, (err, stdout, stderr) => {
+			clearTimeout(timeoutTimer);
+			clearTimeout(killTimer);
+			if (err) reject(Object.assign(err, { stdout, stderr }));
+			else resolve({ stdout, stderr });
+		});
+		const timeoutTimer = opts?.timeout > 0
+			? setTimeout(() => {
+					killTimer = setTimeout(() => {
+						child.kill("SIGKILL");
+						child.stdout?.destroy();
+						child.stderr?.destroy();
+					}, graceMs);
+				}, opts.timeout)
+			: null;
+	});
+}
+
 export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
 	// maxBuffer would throw on every tick and freeze the pane for good.
@@ -458,7 +482,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// batch --json returns an array of {command, error, result, success};
 	// --bail shortens the array after the first failure.
 	const batch = async (cmds, timeout = 10_000) => {
-		const { stdout } = await pExecFile(
+		const { stdout } = await execFileBounded(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
 			{ timeout, maxBuffer, env: runEnv },
@@ -473,7 +497,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		return arr.map((r) => r.result);
 	};
 	const run = async (...args) => {
-		const { stdout } = await pExecFile(
+		const { stdout } = await execFileBounded(
 			bin,
 			["--session", session, ...args, "--json"],
 			{
@@ -575,7 +599,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		},
 		sessionExists: async () => {
 			try {
-				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
+				const { stdout } = await execFileBounded(bin, ["session", "list", "--json"], {
 					timeout: 10_000,
 					maxBuffer,
 					env: runEnv,
@@ -636,8 +660,10 @@ export class Renderer {
 		this.ownershipEnabled = this.backend !== "attach";
 		this.backendName = this.backend === "attach" ? "browser endpoint" : "agent-browser";
 		const onPath = (cmd) =>
-			spawnSync("sh", ["-c", `command -v ${cmd}`], { timeout: 5000 }).status ===
-			0;
+			spawnSync("sh", ["-c", `command -v ${cmd}`], {
+				timeout: 5000,
+				killSignal: "SIGKILL",
+			}).status === 0;
 		this.agentBrowser = onPath(this.bin);
 		this.chafa = onPath("chafa");
 		// Clamp both ends: tiny/negative values busy-loop; values past the
@@ -945,6 +971,7 @@ export class Renderer {
 			const bin = findChromium(this.env, this.configValue("chromium"), (c) =>
 				spawnSync("sh", ["-c", 'command -v -- "$1"', "sh", c], {
 					timeout: 5000,
+					killSignal: "SIGKILL",
 					env: this.env,
 				}).status === 0,
 			);
@@ -1474,7 +1501,7 @@ export class Renderer {
 		// 15s timeout on every changed frame, freezing the pane's image forever.
 		if (this.chafaFails >= 3 && Date.now() < this.chafaCooldownUntil) return;
 		try {
-			const { stdout } = await pExecFile(
+			const { stdout } = await execFileBounded(
 				"chafa",
 				[
 					"-f",
@@ -1953,12 +1980,14 @@ export class Renderer {
 	// on switching backends alike — instead of idling as a leaked daemon
 	// until the 30-minute reaper. Sessions others created are never touched.
 	// Short timeout: a wedged daemon must not freeze the caller — its own
-	// idle reaper collects the session anyway.
+	// idle reaper collects the session anyway. SIGKILL: a synchronous call
+	// cannot escalate, and a close that ignores SIGTERM would hold quit.
 	closeOwnSession() {
 		if (!this.selfCreated || !this.ownershipEnabled) return;
 		try {
 			spawnSync(this.bin, ["--session", this.session, "close"], {
 				timeout: 2_000,
+				killSignal: "SIGKILL",
 				env: this.env,
 			});
 		} catch {

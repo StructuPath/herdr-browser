@@ -31,6 +31,7 @@ import {
 	findChromium,
 	chromiumSandboxArgs,
 	truthyConfig,
+	execFileBounded,
 } from "../bin/renderer.mjs";
 import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
 
@@ -3109,3 +3110,79 @@ test("s while unattached banners instead of querying", async () => {
 	assert.match(r.banner, /no browser attached/);
 	assert.equal(r.textView, null);
 });
+
+// --- Lifecycle and bounded memory ---
+
+// A child that ignores SIGTERM: `trap '' TERM` survives the exec, so the
+// sleep itself ignores SIGTERM and only SIGKILL ends it. It writes its pid
+// first so a test can check (and clean up) the exact process.
+const sigtermIgnoringScript = (seconds = 30) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-stubborn-"));
+	const bin = path.join(dir, "stubborn");
+	const pidFile = path.join(dir, "pid");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+trap '' TERM
+echo $$ > ${JSON.stringify(pidFile)}
+exec /bin/sleep ${seconds}
+`,
+		{ mode: 0o755 },
+	);
+	return { bin, pidFile };
+};
+const readPid = (file) => {
+	try {
+		return Number(fs.readFileSync(file, "utf8")) || null;
+	} catch {
+		return null;
+	}
+};
+const isAlive = (pid) => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+const killQuietly = (pid) => {
+	try {
+		if (pid) process.kill(pid, "SIGKILL");
+	} catch {
+		/* already gone */
+	}
+};
+
+test("execFileBounded: a child that ignores SIGTERM is SIGKILLed after the grace", { timeout: 10_000 }, async () => {
+	const { bin, pidFile } = sigtermIgnoringScript();
+	try {
+		await assert.rejects(
+			execFileBounded(bin, [], { timeout: 300 }, 200),
+			(err) => err.signal === "SIGKILL",
+		);
+		assert.equal(isAlive(readPid(pidFile)), false);
+	} finally {
+		killQuietly(readPid(pidFile));
+	}
+});
+
+test("closeOwnSession: a close that ignores SIGTERM cannot hold quit past its timeout", () => {
+	// Self-exits after 6 s, so without SIGKILL the synchronous call returns
+	// at ~6 s instead of hanging the suite.
+	const { bin, pidFile } = sigtermIgnoringScript(6);
+	const r = quiet(mkRenderer());
+	r.bin = bin;
+	r.selfCreated = true;
+	r.ownershipEnabled = true;
+	const start = Date.now();
+	try {
+		r.closeOwnSession();
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 4_000, `close returned after ${elapsed} ms (timeout is 2 s)`);
+		assert.equal(isAlive(readPid(pidFile)), false);
+	} finally {
+		killQuietly(readPid(pidFile));
+	}
+});
+

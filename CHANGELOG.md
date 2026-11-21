@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add bounded expected/actual values and selectors to failed QA assertions,
+  redact literal fill values from text evidence, identify invalid steps by index
+  and type, and name malformed scenario files without echoing their contents.
 - Add an on-demand page text view: press `s` for the accessibility-tree
   snapshot (interactive elements carry `@eN` refs), `n` for the full recent
   request table, and `d` for a ref-normalized diff against the last snapshot.

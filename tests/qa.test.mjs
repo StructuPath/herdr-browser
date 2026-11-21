@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import test from "node:test";
 import { validateScenario, loadScenario, gitState, engineEnvironment, classifyTelemetry, boundResult, createEngine, runQa } from "../bin/qa.mjs";
 
@@ -58,6 +58,33 @@ test("QA config is byte-bounded and resolved overrides affect its evidence diges
 	assert.notEqual(loadScenario(f.config, "http://localhost:1234").sha256, first.sha256);
 	fs.writeFileSync(f.config, " ".repeat(65 * 1024));
 	assert.throws(() => loadScenario(f.config), /64 KiB/);
+});
+
+test("QA validation identifies the index and type of each invalid step", () => {
+	for (const [index, step] of [
+		[1, { type: "clik" }], [1, { type: "click", selector: "" }],
+		[1, { type: "click", selector: "h1", extra: true }],
+		[1, { type: "fill", selector: "#input", value: "--option" }],
+		[1, { type: "screenshot", name: "../bad" }],
+		[0, { type: "navigate", path: "//foreign.test" }],
+		[0, { type: "click", selector: "h1" }],
+	]) {
+		const steps = [{ type: "navigate", path: "/" }];
+		steps[index] = step;
+		assert.throws(() => validateScenario(scenario({ steps })), (error) =>
+			error.message.startsWith(`steps[${index}] (type "${step.type}")`));
+	}
+});
+
+test("QA malformed scenario errors name the file and exit 2", (t) => {
+	const f = fixture(t);
+	fs.writeFileSync(f.config, '{"steps": nope}');
+	for (const action of ["check", "run"]) {
+		const result = spawnSync(process.execPath, ["bin/qa.mjs", action, "--config", f.config, "--repo", f.repo], { encoding: "utf8" });
+		assert.equal(result.status, 2);
+		assert.ok(result.stderr.includes(path.basename(f.config)), result.stderr);
+		assert.doesNotMatch(result.stderr, /nope/);
+	}
 });
 
 test("QA config rejects symlinks and FIFOs without blocking", (t) => {
@@ -156,6 +183,68 @@ test("QA assertions fail visibly, still collect final evidence and clean up", as
 	assert.equal(log.filter(({ args }) => args[0] === "close").length, 2);
 });
 
+test("QA failed assertions record bounded expected, actual, and applicable selectors", async (t) => {
+	for (const [type, data, expected, actual, selector] of [
+		["assertText", { text: "Welcome back" }, "Dashboard", "Welcome back", "h1"],
+		["assertTitle", { title: "Welcome back" }, "Dashboard", "Welcome back"],
+		["assertUrl", { url: "http://localhost/login" }, "Dashboard", "http://localhost/login"],
+		["assertVisible", { visible: false }, true, false, "h1"],
+		["assertText", { text: "\0\x1b\u009b\u202e" + "x".repeat(250) }, "Dashboard", "x".repeat(200), "h1"],
+		["assertText", { text: "\0".repeat(2500) + "Welcome back" }, "Dashboard", "Welcome back", "h1"],
+		["assertText", { text: "Welcome" }, "D".repeat(1000), "Welcome", "h1"],
+		["assertText", {}, "Dashboard", null, "h1"],
+	]) await t.test(type + ": " + String(actual).slice(0, 20), async (t) => {
+		const assertion = { type, ...(selector ? { selector } : {}), ...(type === "assertVisible" ? {} : { contains: expected }) };
+		const f = fixture(t, { steps: [{ type: "navigate", path: "/" }, assertion] });
+		const factory = fakeFactory([]);
+		const result = await runQa({ ...f, engineFactory: (options) => {
+			const engine = factory(options);
+			return (args, opts) => ["get", "is"].includes(args[0]) ? data : engine(args, opts);
+		} });
+		const failed = result.runs[0].steps[1];
+		assert.equal(failed.status, "failed");
+		assert.equal(failed.expected, typeof expected === "string" ? expected.slice(0, 200) : expected);
+		assert.equal(failed.actual, actual);
+		assert.equal(failed.selector, selector);
+		assert.equal(result.schemaVersion, 1);
+	});
+});
+
+test("QA never echoes fill values in summary JSON or stderr after a later failure", (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" },
+		{ type: "fill", selector: "#password", value: "hunter2" },
+		{ type: "assertText", selector: "h1", contains: "Dashboard" }] });
+	const binary = path.join(f.root, "agent-browser");
+	fs.writeFileSync(binary, `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('agent-browser 0.33.2'); process.exit(0); }
+const command = args[5];
+if (command === 'get' && args[7] === '#throws') {
+  console.log(JSON.stringify({ success: false, error: 'failed after hunter2' })); process.exit(0);
+}
+if (command === 'screenshot') fs.writeFileSync(args[6], Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+const data = command === 'get' ? { text: 'Welcome hun' + String.fromCharCode(0) + 'ter2' }
+  : command === 'console' ? { messages: [{ type: 'error', text: 'hunter2' }] }
+  : command === 'errors' ? { errors: ['hunter2'] }
+  : command === 'network' ? { requests: [] } : {};
+console.log(JSON.stringify({ success: true, data }));
+`, { mode: 0o700 });
+	for (const selector of ["h1", "#throws"]) {
+		const config = JSON.parse(fs.readFileSync(f.config, "utf8"));
+		config.steps[2].selector = selector;
+		fs.writeFileSync(f.config, JSON.stringify(config));
+		const output = f.output + (selector === "h1" ? "-assertion" : "-engine");
+		const result = spawnSync(process.execPath, ["bin/qa.mjs", "run", "--config", f.config, "--repo", f.repo, "--output", output, "--json"], {
+			encoding: "utf8", env: { ...process.env, PATH: `${f.root}${path.delimiter}${process.env.PATH}` },
+		});
+		assert.equal(result.status, 1, result.stderr);
+		assert.doesNotMatch(result.stdout + result.stderr + fs.readFileSync(path.join(output, "result.json"), "utf8"), /hunter2/);
+		const summary = JSON.parse(result.stdout);
+		assert.equal(summary.runs[0].steps[2].actual, selector === "h1" ? "Welcome [redacted]" : null);
+	}
+});
+
 test("QA detects Git changes and cleanup failures without claiming success", async (t) => {
 	const f = fixture(t);
 	const result = await runQa({ ...f, engineFactory: fakeFactory([], (args) => {
@@ -183,4 +272,64 @@ test("QA engine times out a hanging command and never exposes filled text in sub
 	fs.writeFileSync(f.binary, '#!/usr/bin/env node\nsetTimeout(() => {}, 10000);\n');
 	const engine = createEngine({ binary: f.binary, session: "owned", configFile: f.config, cwd: f.root, env: process.env, timeoutMs: 100, deadline: Date.now() + 100, signal: undefined });
 	await assert.rejects(engine(["fill", "#input", "private-value"]), (error) => /timed out/.test(error.message) && !error.message.includes("private-value"));
+});
+
+test("QA engine never quotes raw engine output and leaves long errors uncut for redaction", async (t) => {
+	const f = fixture(t);
+	const engine = () => createEngine({ binary: f.binary, session: "owned", configFile: f.config, cwd: f.root, env: process.env, timeoutMs: 5000, deadline: Date.now() + 5000, signal: undefined });
+	fs.writeFileSync(f.binary, '#!/bin/sh\nprintf "correcthorsebatterystaple not json\\n"\n', { mode: 0o700 });
+	await assert.rejects(engine()(["fill", "#pw", "correcthorsebatterystaple"]), (error) =>
+		error.message === "engine returned invalid JSON");
+	const long = "x".repeat(1995) + "correcthorsebatterystaple";
+	fs.writeFileSync(f.binary, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ success: false, error: long })}'\n`, { mode: 0o700 });
+	await assert.rejects(engine()(["get", "text", "h1"]), (error) => error.message === long);
+});
+
+test("QA redaction survives a long engine error, keeps its marker intact, and covers selectors", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" },
+		{ type: "fill", selector: "#pw", value: "correcthorsebatterystaple" },
+		{ type: "fill", selector: "#short", value: "e" },
+		{ type: "assertText", selector: "#correcthorsebatterystaple", contains: "Welcome" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return async (args, opts) => {
+			if (args[0] === "get") throw new Error("x".repeat(1995) + "correcthorsebatterystaple");
+			return engine(args, opts);
+		};
+	} });
+	const json = JSON.stringify(result);
+	assert.doesNotMatch(json, /corre/);
+	const failed = result.runs[0].steps[3];
+	assert.equal(failed.error, "x".repeat(1995) + "[reda");
+	assert.equal(failed.selector, "#[redacted]");
+	assert.doesNotMatch(json, /\[r\[redacted\]/);
+});
+
+test("QA assertUrl actual drops credentials, query, and fragment", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" }, { type: "assertUrl", contains: "/dashboard" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return (args, opts) => args[0] === "get" ? { url: "http://user:pw@localhost:3456/cb?code=OAUTHCODE#access_token=TOKEN" } : engine(args, opts);
+	} });
+	assert.equal(result.runs[0].steps[1].actual, "http://localhost:3456/cb");
+});
+
+test("QA diagnostics never split a surrogate pair at the length bound", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" }, { type: "assertText", selector: "h1", contains: "Dashboard" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return (args, opts) => args[0] === "get" ? { text: "x".repeat(199) + "\u{1F600}tail" } : engine(args, opts);
+	} });
+	assert.equal(result.runs[0].steps[1].actual, "x".repeat(199));
+});
+
+test("QA validation rejects non-string and prototype step types by index", () => {
+	for (const type of [["fill"], "constructor", "__proto__", "toString", 7]) {
+		const steps = [{ type: "navigate", path: "/" }, { type, selector: "#a", value: "b" }];
+		assert.throws(() => validateScenario(scenario({ steps })), (error) =>
+			/^steps\[1\] \(type "[^"]*"\): unknown step type/.test(error.message));
+	}
 });

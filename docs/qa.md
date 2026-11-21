@@ -39,6 +39,9 @@ The saved `result.json` contains the same evidence without that absolute path.
 Exit 0 means all requested viewports passed and cleanup succeeded; exit 1 means
 a failed run (including failed engine preflight); exit 2 means invalid command,
 configuration, repository, or output setup.
+Malformed JSON errors name the scenario file (basename) without echoing file
+contents. Step validation errors start with `steps[i] (type "…")`, where `i`
+is the zero-based step index.
 
 ## Scenario contract
 
@@ -117,7 +120,20 @@ name and SHA-256, engine version, and:
 - `runs[]`: viewport geometry, status, indexed step outcomes, error details,
   bounded telemetry, unresolved request count, and artifact metadata. Each
   artifact records a relative path, byte count, and SHA-256.
+- Failed assertion steps add `expected` and `actual`, plus `selector` for
+  `assertText` and `assertVisible`. Text fields are sanitized with the pane's
+  sanitizer (control and invisible format characters removed, tabs replaced
+  with spaces), then truncated to 200 characters without an ellipsis.
+  `assertVisible` expects boolean `true`; its observed boolean is preserved.
+  Actual values other than strings or booleans use `null`. An `assertUrl` actual
+  drops credentials, query, and fragment, like failed-request URLs. Literal `fill`
+  values are redacted as `[redacted]` in diagnostics, error messages, and telemetry
+  before truncation; fill steps never copy their values into the result. Only the
+  literal value is matched: JSON-escaped, URL-encoded, or HTML-encoded echoes of it
+  are not redacted, and screenshots are not altered.
 - `cleanup.status`: `passed` or `failed`. Failed cleanup fails the result.
+
+These assertion fields are additive; the evidence schema stays at version 1.
 
 The Git record does **not** prove the served app was built from that commit.
 Run the server from the intended checkout and review its build/deployment

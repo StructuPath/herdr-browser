@@ -85,12 +85,22 @@ export function redactUrls(text) {
 	return String(text).replace(URL_IN_TEXT, (m) => {
 		const cut = m.endsWith("…") ? "…" : "";
 		let url = cut ? m.slice(0, -1) : m;
+		if (/^data:/i.test(url)) return safeHref(url) + cut; // payload withheld whole
 		let after = "";
-		// data: is withheld whole, so there is no tail to give back.
-		if (!/[?#]/.test(url) && !/^data:/i.test(url)) {
-			const tail = /[.,;:!)\]}>'"]+$/.exec(url)?.[0] ?? "";
+		// A raw "<" or ">" is never part of a URL. Before any query or fragment
+		// it ends this one, and the rest is text, redacted on its own (it may
+		// hold another URL). After a "?" or "#" it may be hiding a token, so the
+		// whole run goes.
+		const stop = url.search(/[<>]/);
+		const query = url.search(/[?#]/);
+		if (stop > 0 && (query < 0 || stop < query)) {
+			after = redactUrls(url.slice(stop));
+			url = url.slice(0, stop);
+		}
+		if (!/[?#]/.test(url)) {
+			const tail = /[.,;:!)\]}'"]+$/.exec(url)?.[0] ?? "";
 			url = url.slice(0, url.length - tail.length);
-			after = tail;
+			after = tail + after;
 		}
 		return safeHref(url) + after + cut;
 	});

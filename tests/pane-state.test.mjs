@@ -691,6 +691,11 @@ test("redactUrls: <, >, and a literal … inside a URL never shield a secret", (
 		["<https://u:p@x.test/p>", "<https://x.test/p>"],
 		["cut https://h/path…", "cut https://h/path…"], // truncate()'s own marker stays
 		["cut https://h/p?token=SEC…", "cut https://h/p…"],
+		// No query: the text glued after ">" is kept, and redacted in its own right.
+		["request <https://example.com>net::ERR_CONNECTION_REFUSED", "request <https://example.com/>net::ERR_CONNECTION_REFUSED"],
+		["<https://a.test/x>https://u:p@b.test/y?t=SEC", "<https://a.test/x>https://b.test/y"],
+		// After "?", a "<" may hide the rest of a token: the whole run goes.
+		["get https://h/?q=<b>SECRET done", "get https://h/ done"],
 	];
 	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
 	for (const [input] of cases) assert.doesNotMatch(redactUrls(input), /SECRET|SEC|u:p@/);

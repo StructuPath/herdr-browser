@@ -3079,14 +3079,15 @@ test("n shows the network view; a page-driving key clears the text view", async 
 	r.attached = true;
 	r.browser = {
 		networkRequests: async () => ({ title: "requests (1)", lines: ["GET 200 document https://x/"] }),
-		scroll: async () => {},
+		reload: async () => {},
 	};
 	r.feed("n");
 	await flush();
 	assert.equal(r.textView?.mode, "network");
 
-	// Scrolling drives the page, so it invalidates the captured text view.
-	r.feed("j");
+	// Reloading drives the page, so it invalidates the captured text view.
+	// (j/k page the text view itself while it is open.)
+	r.feed("r");
 	await flush();
 	assert.equal(r.textView, null);
 });
@@ -3108,4 +3109,201 @@ test("s while unattached banners instead of querying", async () => {
 	await flush();
 	assert.match(r.banner, /no browser attached/);
 	assert.equal(r.textView, null);
+});
+
+// --- page text view: input isolation, staleness, paging, help/banners ---
+
+const textViewSize = (r, imageRows = 10) => {
+	r.size = () => ({ cols: 80, rows: imageRows + 4, imageRows, consoleRows: 0, imageTopRow: 3, bottomRow: imageRows + 4 });
+};
+const openSnapshot = async (r, lines) => {
+	r.browser = { ...r.browser, snapshotText: async () => ({ title: "page", lines }) };
+	r.feed("s");
+	await flush();
+	assert.equal(r.textView?.mode, "snapshot");
+};
+const captureStdout = (fn) => {
+	const write = process.stdout.write;
+	const chunks = [];
+	process.stdout.write = (text) => { chunks.push(String(text)); return true; };
+	try { fn(); } finally { process.stdout.write = write; }
+	return chunks.join("");
+};
+
+test("text view: clicks and wheel never reach the page behind the text", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.mode = "symbols";
+	fs.writeFileSync(r.shot, PNG_1PX);
+	const calls = [];
+	r.browser = {
+		click: async (x, y) => calls.push(["click", x, y]),
+		scroll: async (dir) => calls.push(["scroll", dir]),
+	};
+	await openSnapshot(r, ['button "Delete account" @e1']);
+	r.feed("\x1b[<0;2;4M");
+	r.feed("\x1b[<65;2;4M");
+	await flush();
+	assert.deepEqual(calls, [], "the text view hides the screenshot: no click-through");
+	assert.equal(r.textView?.mode, "snapshot", "the view stays open");
+});
+
+test("text view: a click queued before the view opened is dropped when it runs", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.mode = "symbols";
+	fs.writeFileSync(r.shot, PNG_1PX);
+	const clicks = [];
+	let release;
+	r.browser = {
+		click: async (x, y) => clicks.push([x, y]),
+		snapshotText: () => new Promise((resolve) => { release = () => resolve({ title: "page", lines: ["x"] }); }),
+	};
+	r.feed("s");
+	await flush();
+	r.feed("\x1b[<0;2;4M"); // view not open yet: the click is queued behind s
+	release();
+	await flush();
+	assert.equal(r.textView?.mode, "snapshot");
+	assert.deepEqual(clicks, [], "the queued click re-checks the text view before it runs");
+});
+
+test("text view: every push path drops a stale snapshot or diff on navigation", async () => {
+	const pushes = [
+		["stream url", (r) => r.onStreamMessage({ type: "url", url: "https://b/" })],
+		["stream tabs", (r) => r.onStreamMessage({ type: "tabs", tabs: [{ active: true, url: "https://b/", title: "B" }] })],
+		["cdp url", (r) => r.onCdpMessage({ type: "url", url: "https://b/" })],
+		["cdp target_selected", (r) => r.onCdpMessage({ type: "target_selected", targetId: "T2", url: "https://b/", title: "B" })],
+	];
+	for (const [name, push] of pushes) {
+		for (const mode of ["snapshot", "diff", "network"]) {
+			const r = quiet(mkRenderer());
+			r.attached = true;
+			r.lastUrl = "https://a/";
+			r.textView = { mode, title: "a", lines: ["x"], url: "https://a/" };
+			push(r);
+			await flush();
+			if (mode === "network") assert.equal(r.textView?.mode, "network", `${name}: the request log survives navigation`);
+			else assert.equal(r.textView, null, `${name}: a ${mode} view of the old page is dropped`);
+		}
+	}
+	// A push for the same page keeps the view.
+	const r = quiet(mkRenderer());
+	r.lastUrl = "https://a/";
+	r.textView = { mode: "snapshot", title: "a", lines: ["x"], url: "https://a/" };
+	r.onStreamMessage({ type: "tabs", tabs: [{ active: true, url: "https://a/", title: "A" }] });
+	assert.equal(r.textView?.mode, "snapshot");
+});
+
+test("text view: a backend switch forgets the last snapshot and the open view", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	await openSnapshot(r, ['@e1 [button] "Save"']);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	await flush();
+	assert.equal(r.lastSnapshot, null);
+	assert.equal(r.textView, null);
+	r.attached = true;
+	r.browser = { snapshotText: async () => ({ title: "other", lines: ["y"] }) };
+	r.feed("d");
+	await flush();
+	assert.match(r.banner, /press s first/);
+	assert.equal(r.textView, null);
+});
+
+test("text view: j/k, space/b, PgDn/PgUp and g/G page the text without touching the page", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	textViewSize(r, 10); // 1 title row + 8 text rows + 1 footer row
+	r.renderTextView = () => {};
+	const scrolls = [];
+	r.browser = { scroll: async (dir) => scrolls.push(dir) };
+	await openSnapshot(r, Array.from({ length: 50 }, (_, i) => `line ${i}`));
+	const offset = () => r.textView.offset ?? 0;
+	r.feed("j"); assert.equal(offset(), 1);
+	r.feed("j"); assert.equal(offset(), 2);
+	r.feed("k"); assert.equal(offset(), 1);
+	r.feed("k"); r.feed("k"); assert.equal(offset(), 0, "k stops at the top");
+	r.feed(" "); assert.equal(offset(), 8);
+	r.feed("\x1b[6~"); assert.equal(offset(), 16);
+	r.feed("\x1b[5~"); assert.equal(offset(), 8);
+	r.feed("b"); assert.equal(offset(), 0);
+	r.feed("G"); assert.equal(offset(), 42, "G shows the last line");
+	r.feed("j"); assert.equal(offset(), 42, "j stops at the bottom");
+	r.feed("g"); assert.equal(offset(), 0);
+	await flush();
+	assert.deepEqual(scrolls, [], "paging never calls browser.scroll");
+	assert.equal(r.textView?.mode, "snapshot", "paging keeps the view open");
+});
+
+test("text view: paging works in observe-only mode", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	textViewSize(r, 10);
+	r.renderTextView = () => {};
+	r.browser = {};
+	await openSnapshot(r, Array.from({ length: 50 }, (_, i) => `line ${i}`));
+	r.feed("o");
+	assert.equal(r.observeOnly, true);
+	r.banner = "";
+	r.feed("j");
+	r.feed(" ");
+	assert.equal(r.textView.offset, 9);
+	assert.doesNotMatch(r.banner, /observe-only/, "paging is not page input");
+});
+
+test("text view: Esc or the view's own key closes it; other view keys switch", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.browser = {}; // a plain fake: the real agent-browser would slow every queued tick
+	await openSnapshot(r, ["a"]);
+	r.onKey("\x1b");
+	await flush();
+	assert.equal(r.textView, null, "Esc closes the snapshot");
+
+	r.browser.networkRequests = async () => ({ title: "requests (1)", lines: ["GET 200"] });
+	r.feed("n");
+	await flush();
+	assert.equal(r.textView?.mode, "network");
+	r.feed("n");
+	await flush();
+	assert.equal(r.textView, null, "n closes the request table");
+
+	r.feed("s");
+	await flush();
+	r.feed("d");
+	await flush();
+	assert.equal(r.textView?.mode, "diff");
+	r.feed("d");
+	await flush();
+	assert.equal(r.textView, null, "d closes the diff");
+});
+
+test("text view: the overflow footer is visible and tracks the scroll position", () => {
+	const r = quiet(mkRenderer());
+	textViewSize(r, 10);
+	r.textView = { mode: "snapshot", title: "page", lines: Array.from({ length: 50 }, (_, i) => `line ${i}`), url: "" };
+	let out = captureStdout(() => r.renderTextView());
+	assert.match(out, /line 7\b/);
+	assert.doesNotMatch(out, /line 8\b/);
+	assert.match(out, /… 42 more/, "the footer row is inside the image region");
+	r.feed("G");
+	out = captureStdout(() => r.renderTextView());
+	assert.match(out, /line 49\b/);
+	assert.doesNotMatch(out, /more/);
+	// The footer row is the last image row, never below it.
+	const rowsWritten = [...out.matchAll(/\x1b\[(\d+);1H/g)].map((m) => Number(m[1]));
+	assert.ok(Math.max(...rowsWritten) <= 3 + 10 - 1);
+});
+
+test("text view: the help line names the view keys", () => {
+	const r = quiet(mkRenderer());
+	r.textView = { mode: "snapshot", title: "page", lines: ["a"], url: "" };
+	const out = captureStdout(() => Renderer.prototype.renderBottom.call(r));
+	assert.match(out, /j\/k/);
+	assert.match(out, /PgUp\/PgDn/);
+	assert.match(out, /g\/G/);
+	assert.match(out, /s\/Esc:close/);
+	assert.doesNotMatch(out, /scroll/);
 });

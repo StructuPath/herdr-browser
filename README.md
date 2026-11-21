@@ -166,8 +166,8 @@ Use these controls to drive the shared session directly:
 | Mouse wheel | Scroll the page |
 | `s` | Toggle the accessibility-tree snapshot (interactive elements carry `@eN` refs) |
 | `n` | Toggle the recent request table |
-| `d` | Diff the current page against the last snapshot (press `s` first) |
-| `Esc` | Cancel the active prompt |
+| `d` | Toggle a diff of the current page against the last snapshot (press `s` first) |
+| `Esc` | Cancel the active prompt, or close the open text view |
 | `q` | Close the viewer pane |
 
 Clicks are mapped through the rendered-frame geometry to page pixels, so they
@@ -261,11 +261,26 @@ while an agent is mid-flow. They are also the only page view in a `text`-mode
 | `n` | **Requests** — recent network traffic as `METHOD STATUS TYPE URL`, with query strings, fragments, and credentials redacted and the list bounded. |
 | `d` | **Diff** — the current page against the last `s` snapshot, showing added (`+`) and removed (`-`) elements. Refs are ignored, so the diff reflects real page changes, not re-snapshot churn. |
 
-Any page-driving action (navigate, reload, back/forward, scroll, click, type)
-returns to the screenshot; re-pressing `s` or `n` while its own view is up
-dismisses it too. A captured snapshot or diff is dropped if the page navigates
-underneath it rather than shown stale; the request table is a session log and
-stays until dismissed.
+While a text view is open, the paging keys move the text, not the page:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | One line down / up |
+| Space / `b`, PgDn / PgUp | One page down / up |
+| `g` / `G` | Top / bottom |
+| `Esc`, or the view's own key (`s`, `n`, `d`) | Close the view and return to the screenshot |
+
+Paging never calls the browser, so it also works in observe-only mode. The
+last row shows the position (`1–8 of 50  … 42 more`). Mouse clicks and wheel
+events are ignored while a view is open: the view covers the screenshot, so a
+click could otherwise land on a page element you cannot see.
+
+Any other page-driving action (navigate, reload, forward, type) returns to the
+screenshot. A captured snapshot or diff is dropped if the page navigates
+underneath it — in polling, live-stream, and attach modes alike — rather than
+shown stale; the request table is a session log and stays until dismissed.
+Switching to a different browser (`a` or `l`) also forgets the last snapshot,
+so `d` asks for a fresh `s` instead of diffing two unrelated browsers.
 
 ## Attach to any CDP browser
 

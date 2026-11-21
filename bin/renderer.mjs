@@ -107,6 +107,13 @@ export function truthyConfig(value) {
 	return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
 }
 
+// Text rows a page text view shows between its title row and footer: the
+// footer row is only spent when the text does not fit.
+function textViewBodyRows(total, imageRows) {
+	const all = Math.max(1, imageRows - 1);
+	return total <= all ? all : Math.max(1, imageRows - 2);
+}
+
 // Locate a launchable Chromium for launch mode (the l key). An explicit
 // choice (env, then config file) is trusted as-is — it may name a binary
 // that is not on PATH; probing covers the common names plus the macOS app
@@ -1193,6 +1200,10 @@ export class Renderer {
 		this.networkState = newNetworkState();
 		this.lastHash = "";
 		this.shotFormat = "png";
+		// A different browser: neither the open view nor the diff baseline
+		// describes it.
+		this.textView = null;
+		this.lastSnapshot = null;
 	}
 
 	invalidateTarget() {
@@ -1228,6 +1239,7 @@ export class Renderer {
 			this.lastTitle = sanitizeText(m.title ?? "");
 			this.lastFrameAt = Date.now();
 			this.banner = "";
+			this.dropStaleTextView();
 			this.header();
 			return;
 		}
@@ -1245,6 +1257,7 @@ export class Renderer {
 		if (m.type === "url") {
 			this.lastUrl = sanitizeText(m.url ?? "");
 			if (m.title !== undefined) this.lastTitle = sanitizeText(m.title);
+			this.dropStaleTextView();
 			this.enqueue(() => {
 				this.header();
 			});
@@ -1422,12 +1435,16 @@ export class Renderer {
 			);
 		} else {
 			// Every advertised key is handled in both backends (a and l work
-			// everywhere); t only moves targets on an attach backend.
-			const help = this.observeOnly
-				? " observe-only  t:tabs  s:snap  n:reqs  d:diff  o:enable-input  q:quit"
-				: this.backend === "attach"
-					? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
-					: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  s:snap  n:reqs  d:diff  o:observe  q:quit";
+			// everywhere); t only moves targets on an attach backend. An open
+			// text view shows its paging keys.
+			const tv = this.textView;
+			const help = tv
+				? ` ${tv.mode === "diff" ? "diff" : tv.mode === "network" ? "requests" : "snapshot"}  j/k:line  space/b PgUp/PgDn:page  g/G:top/end  ${{ snapshot: "s", network: "n", diff: "d" }[tv.mode]}/Esc:close  q:quit`
+				: this.observeOnly
+					? " observe-only  t:tabs  s:snap  n:reqs  d:diff  o:enable-input  q:quit"
+					: this.backend === "attach"
+						? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
+						: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  s:snap  n:reqs  d:diff  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
 			);
@@ -1550,11 +1567,17 @@ export class Renderer {
 		if (imageRows < 3) return;
 		const modeLabel =
 			tv.mode === "diff" ? "diff" : tv.mode === "network" ? "requests" : "snapshot";
-		const head = [` ${modeLabel} — ${sanitizeText(tv.title)}`];
-		const shown = tv.lines.slice(0, Math.max(0, imageRows - head.length));
-		const overflow = tv.lines.length - shown.length;
-		const lines = head.concat(shown);
-		if (overflow > 0) lines.push(` … ${overflow} more`);
+		const total = tv.lines.length;
+		const body = textViewBodyRows(total, imageRows);
+		// Clamp at paint time too: a resize can shrink the page under it.
+		const offset = Math.min(tv.offset ?? 0, Math.max(0, total - body));
+		const shown = tv.lines.slice(offset, offset + body);
+		const lines = [` ${modeLabel} — ${sanitizeText(tv.title)}`, ...shown];
+		// The footer owns the last image row, so it is always on screen.
+		if (total > body) {
+			const below = total - offset - shown.length;
+			lines[imageRows - 1] = ` ${offset + 1}–${offset + shown.length} of ${total}${below > 0 ? `  … ${below} more` : "  (end)"}`;
+		}
 		for (let i = 0; i < imageRows; i++) {
 			process.stdout.write(
 				`${ESC}[${imageTopRow + i};1H${truncate(lines[i] ?? "", cols)}${ESC}[K`,
@@ -1736,16 +1759,7 @@ export class Renderer {
 			const snap = await this.browser.snapshot(tmp);
 			this.lastUrl = sanitizeText(snap.url);
 			this.lastTitle = sanitizeText(snap.title);
-			// A navigation invalidates a captured snapshot/diff (the network
-			// list is a session log and survives); drop it so a stale page is
-			// never shown as the current one.
-			if (
-				this.textView &&
-				this.textView.mode !== "network" &&
-				this.textView.url !== this.lastUrl
-			) {
-				this.textView = null;
-			}
+			this.dropStaleTextView();
 			const { newEntries, marker } = reconcileConsole(
 				this.consoleState,
 				snap.entries,
@@ -1923,6 +1937,9 @@ export class Renderer {
 	onMouse(mouse) {
 		if (this.promptState || this.targetPicker || (this.backend === "attach" && !this.cdpTargetId)) return;
 		if (!mouse || mouse.release) return;
+		// A text view covers the screenshot: a click on its text must not
+		// land on whatever the hidden page has at those coordinates.
+		if (this.textView) return;
 		if (this.observeOnly && this.attached) {
 			this.noteObserveBlocked();
 			return;
@@ -1932,12 +1949,12 @@ export class Renderer {
 			if (this.attached) {
 				this.userAction(() =>
 					this.browser.scroll(mouse.button === 64 ? "up" : "down", 300),
-				);
+				{ pointer: true });
 			}
 			return;
 		}
 		if (mouse.button !== 0 || !this.attached) return;
-		this.userAction(() => this.clickAt(mouse.col, mouse.row));
+		this.userAction(() => this.clickAt(mouse.col, mouse.row), { pointer: true });
 	}
 
 	// A banner that names a real failure must outlive the next poll tick, or
@@ -1993,17 +2010,18 @@ export class Renderer {
 			this.header();
 			return;
 		}
-		if (ch === "d") this.showSnapshotDiff();
-		else this.toggleTextView(ch === "s" ? "snapshot" : "network");
-	}
-
-	toggleTextView(mode) {
+		const mode = ch === "d" ? "diff" : ch === "s" ? "snapshot" : "network";
 		// Re-pressing the active key dismisses the view back to the screenshot.
 		if (this.textView?.mode === mode) {
 			this.textView = null;
 			this.enqueue(() => this.redrawAll());
 			return;
 		}
+		if (mode === "diff") this.showSnapshotDiff();
+		else this.toggleTextView(mode);
+	}
+
+	toggleTextView(mode) {
 		this.userAction(async () => {
 			try {
 				const fn =
@@ -2027,6 +2045,46 @@ export class Renderer {
 				this.header();
 			}
 		}, { pageInput: false });
+	}
+
+	// A navigation invalidates a captured snapshot/diff (the request table is
+	// a session log and survives): drop it so a stale page is never shown as
+	// the current one. Every URL source calls this — poll, stream, and CDP.
+	dropStaleTextView() {
+		const tv = this.textView;
+		if (!tv || tv.mode === "network" || tv.url === this.lastUrl) return;
+		this.textView = null;
+		this.enqueue(() => this.redrawAll());
+	}
+
+	// Paging keys while a text view is open. Pure pane-side scrolling of the
+	// captured text: never a browser call, so it works in observe-only mode
+	// and while unattached. Returns false for keys it does not own.
+	textViewNav(ch) {
+		const tv = this.textView;
+		if (ch === ESC) {
+			this.textView = null;
+			this.enqueue(() => this.redrawAll());
+			return true;
+		}
+		const body = textViewBodyRows(tv.lines.length, this.size().imageRows);
+		const max = Math.max(0, tv.lines.length - body);
+		const cur = Math.min(tv.offset ?? 0, max);
+		let next;
+		switch (ch) {
+			case "j": next = cur + 1; break;
+			case "k": next = cur - 1; break;
+			case " ":
+			case `${ESC}[6~`: next = cur + body; break;
+			case "b":
+			case `${ESC}[5~`: next = cur - body; break;
+			case "g": next = 0; break;
+			case "G": next = max; break;
+			default: return false;
+		}
+		tv.offset = Math.max(0, Math.min(max, next));
+		this.enqueue(() => this.renderTextView());
+		return true;
 	}
 
 	showSnapshotDiff() {
@@ -2078,6 +2136,9 @@ export class Renderer {
 			this.textViewKey(ch);
 			return;
 		}
+		// An open text view owns the paging keys (j/k, space/b, PgUp/PgDn,
+		// g/G, Esc) — they move the text, not the page behind it.
+		if (this.textView && this.textViewNav(ch)) return;
 		if (
 			this.observeOnly &&
 			["u", "i", "b", "f", "r", "j", "k", " "].includes(ch)
@@ -2350,6 +2411,7 @@ export class Renderer {
 				if (active) {
 					this.lastUrl = sanitizeText(active.url ?? "");
 					this.lastTitle = sanitizeText(active.title ?? "");
+					this.dropStaleTextView();
 					this.enqueue(() => {
 						this.header();
 					});
@@ -2358,6 +2420,7 @@ export class Renderer {
 			}
 			case "url":
 				this.lastUrl = sanitizeText(m.url ?? "");
+				this.dropStaleTextView();
 				this.enqueue(() => {
 					this.header();
 				});
@@ -2368,12 +2431,15 @@ export class Renderer {
 
 	// User-initiated drive of the shared session: run the action, then refresh
 	// immediately instead of waiting for the next poll tick.
-	userAction(fn, { pageInput = true } = {}) {
+	userAction(fn, { pageInput = true, pointer = false } = {}) {
 		const browser = this.browser;
 		const revision = this.inputRevision;
 		this.idleTicks = 0; // interaction restores the base poll cadence
 		this.enqueue(async () => {
 			if (browser !== this.browser) return;
+			// A click/wheel queued behind s/n/d aims at the screenshot, which
+			// the text view now covers: drop it rather than click blind.
+			if (pointer && this.textView) return;
 			if (pageInput) {
 				if (revision !== this.inputRevision) return;
 				if (this.observeOnly) return this.noteObserveBlocked();

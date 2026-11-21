@@ -65,6 +65,8 @@ elif [ -n "$url" ]; then
 	fi
 	# Preserve the caller's daemon configuration. An injected timeout can
 	# restart an existing agent-owned daemon and discard its browser state.
+	# Only the CI/container sandbox fallback is appended to its launch args.
+	export_agent_browser_args
 	if ! with_timeout 15 agent-browser --session "$session" open "$url" >/dev/null; then
 		echo "herdr-browser: agent-browser failed to open $url" >&2
 		exit 3

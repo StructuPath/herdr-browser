@@ -136,9 +136,10 @@ export function engineEnvironment(env, timeoutMs) {
 	result.AGENT_BROWSER_DEFAULT_TIMEOUT = String(timeoutMs);
 	result.AGENT_BROWSER_IDLE_TIMEOUT_MS = "60000";
 	// On CI/container boxes the engine needs --no-sandbox or its Chrome dies
-	// before the first command returns. Only the launch-args knob is added;
-	// nothing else from the host environment leaks into the fresh session.
-	Object.assign(result, agentBrowserSandboxEnv(env));
+	// before the first command returns. Only the sandbox fallback is added:
+	// the host's own AGENT_BROWSER_ARGS (extensions, proxies) stay out of the
+	// fresh session like every other host setting.
+	Object.assign(result, agentBrowserSandboxEnv({ ...env, AGENT_BROWSER_ARGS: undefined }));
 	return result;
 }
 

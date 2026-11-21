@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { chromiumSandboxArgs } from "../bin/chromium-args.mjs";
 import {
 	atomicWriteJson,
 	inspectArtifact,
@@ -29,6 +30,7 @@ function fixture(t, overrides = {}) {
 		path.join(bin, "agent-browser"),
 		`#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$AB_CALLS"
+[ -n "${"$"}{AB_ENV:-}" ] && printf '%s' "${"$"}{AGENT_BROWSER_ARGS-<unset>}" > "$AB_ENV"
 if [ "$4" = "start" ]; then
   if [ "${"$"}{AB_START_FAIL:-0}" = 1 ]; then
     [ -n "${"$"}{AB_ACTIVE:-}" ] && printf active > "$AB_ACTIVE"
@@ -815,4 +817,30 @@ test("stop completes an existing journal after a cdp-url was configured", (t) =>
 	const stop = invoke(f, "stop", { HERDR_BROWSER_CDP_URL: "http://127.0.0.1:9222" });
 	assert.equal(stop.status, 0, stop.stderr);
 	assert.equal(json(bundle(f).manifest).status, "complete");
+});
+
+test("record start and stop pass the CI sandbox fallback to agent-browser", (t) => {
+	const f = fixture(t);
+	const out = path.join(f.base, "ab-env");
+	const start = invoke(f, "start", { CI: "1", AB_ENV: out, AGENT_BROWSER_ARGS: undefined });
+	assert.equal(start.status, 0, start.stderr);
+	assert.match(fs.readFileSync(out, "utf8"), /(^|,)--no-sandbox(,|$)/);
+	const stop = invoke(f, "stop", {
+		CI: "1",
+		AB_ENV: out,
+		AGENT_BROWSER_ARGS: "--proxy-server=x",
+	});
+	assert.equal(stop.status, 0, stop.stderr);
+	const seen = fs.readFileSync(out, "utf8").split(/[,\n]/);
+	assert.ok(seen.includes("--proxy-server=x"), "the user's args survive");
+	assert.ok(seen.includes("--no-sandbox"), "the fallback is appended");
+});
+
+test("record leaves AGENT_BROWSER_ARGS unchanged off CI on a desktop box", { skip: chromiumSandboxArgs({}).length > 0 }, (t) => {
+	const f = fixture(t);
+	const out = path.join(f.base, "ab-env");
+	assert.equal(invoke(f, "start", { CI: "", AB_ENV: out, AGENT_BROWSER_ARGS: undefined }).status, 0);
+	assert.equal(fs.readFileSync(out, "utf8"), "<unset>");
+	assert.equal(invoke(f, "stop", { CI: "", AB_ENV: out, AGENT_BROWSER_ARGS: "--proxy-server=x" }).status, 0);
+	assert.equal(fs.readFileSync(out, "utf8"), "--proxy-server=x");
 });

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromiumSandboxArgs } from "../bin/chromium-args.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -727,4 +728,85 @@ test("open replaces the handoff file atomically and leaves no temp file", () => 
 	const leftovers = fs.readdirSync(stateDir).filter((n) => /navigate/.test(n) && n !== "navigate-w9");
 	assert.deepEqual(leftovers, [], "no temp file remains");
 	fs.rmSync(handoff, { force: true });
+});
+
+// --- agent-browser sandbox fallback ---
+
+// The stub writes the AGENT_BROWSER_ARGS it received, byte for byte.
+function withEnvStub(fn) {
+	const stub = path.join(stubDir, "agent-browser");
+	const original = fs.readFileSync(stub, "utf8");
+	const out = path.join(stubDir, "ab-env");
+	fs.rmSync(out, { force: true });
+	writeStub(
+		"agent-browser",
+		`echo "agent-browser $@" >> "$STUB_LOG"
+printf '%s' "\${AGENT_BROWSER_ARGS-<unset>}" > "${out}"
+echo '{"success":true,"data":{}}'`,
+	);
+	try {
+		return fn(() => fs.readFileSync(out, "utf8"));
+	} finally {
+		fs.writeFileSync(stub, original);
+	}
+}
+
+const split = (v) => v.split(/[,\n]/);
+
+test("open on CI passes --no-sandbox to the agent-browser session it creates", () => {
+	withEnvStub((seen) => {
+		const r = runScript("open.sh", ["http://localhost:3000"], freshEnv({ CI: "1" }));
+		assert.equal(r.status, 0, r.stderr);
+		assert.ok(split(seen()).includes("--no-sandbox"), seen());
+	});
+});
+
+test("open on CI appends to the user's AGENT_BROWSER_ARGS instead of replacing them", () => {
+	withEnvStub((seen) => {
+		const r = runScript(
+			"open.sh",
+			["http://localhost:3000"],
+			freshEnv({ CI: "1", AGENT_BROWSER_ARGS: "--proxy-server=x" }),
+		);
+		assert.equal(r.status, 0, r.stderr);
+		assert.ok(split(seen()).includes("--proxy-server=x"), seen());
+		assert.ok(split(seen()).includes("--no-sandbox"), seen());
+	});
+});
+
+test("open keeps newline-separated user args intact when it appends", () => {
+	withEnvStub((seen) => {
+		const user = "--proxy-server=x\n--window-size=1280,720";
+		const r = runScript(
+			"open.sh",
+			["http://localhost:3000"],
+			freshEnv({ CI: "1", AGENT_BROWSER_ARGS: user }),
+		);
+		assert.equal(r.status, 0, r.stderr);
+		assert.ok(seen().startsWith(`${user}\n`), JSON.stringify(seen()));
+		assert.ok(seen().split("\n").includes("--no-sandbox"), JSON.stringify(seen()));
+	});
+});
+
+test("close on CI passes --no-sandbox to agent-browser", () => {
+	withEnvStub((seen) => {
+		const r = runScript("close.sh", [], freshEnv({ CI: "1" }));
+		assert.equal(r.status, 0, r.stderr);
+		assert.match(log(), /agent-browser --session herdr-ws-w9 close/);
+		assert.ok(split(seen()).includes("--no-sandbox"), seen());
+	});
+});
+
+test("off CI on a desktop box the launchers leave AGENT_BROWSER_ARGS unchanged", { skip: chromiumSandboxArgs({}).length > 0 }, () => {
+	withEnvStub((seen) => {
+		let r = runScript("open.sh", ["http://localhost:3000"]);
+		assert.equal(r.status, 0, r.stderr);
+		assert.equal(seen(), "<unset>");
+		r = runScript("open.sh", ["http://localhost:3000"], freshEnv({ AGENT_BROWSER_ARGS: "--proxy-server=x" }));
+		assert.equal(r.status, 0, r.stderr);
+		assert.equal(seen(), "--proxy-server=x");
+		r = runScript("close.sh", []);
+		assert.equal(r.status, 0, r.stderr);
+		assert.equal(seen(), "<unset>");
+	});
 });

@@ -3152,3 +3152,84 @@ test("the handoff watcher ignores open.sh's temp file", { skip: !canCdp }, async
 	assert.ok(fs.existsSync(tmp), "the watcher never touches the temp name");
 	r.navigateWatcher?.close();
 });
+
+test("agentBrowserSandboxEnv appends to the user's AGENT_BROWSER_ARGS", () => {
+	assert.deepEqual(agentBrowserSandboxEnv({ AGENT_BROWSER_ARGS: "--proxy-server=x" }), {});
+	assert.deepEqual(agentBrowserSandboxEnv({ CI: "1", AGENT_BROWSER_ARGS: "--proxy-server=x" }), {
+		AGENT_BROWSER_ARGS: "--proxy-server=x,--no-sandbox,--disable-dev-shm-usage",
+	});
+	// A newline-separated value keeps its separator, so commas inside a
+	// value (--window-size=1280,720) are not reinterpreted.
+	assert.deepEqual(
+		agentBrowserSandboxEnv({ CI: "1", AGENT_BROWSER_ARGS: "--window-size=1280,720\n" }),
+		{ AGENT_BROWSER_ARGS: "--window-size=1280,720\n--no-sandbox\n--disable-dev-shm-usage" },
+	);
+	// Already present: nothing to add, nothing to change.
+	assert.deepEqual(
+		agentBrowserSandboxEnv({ CI: "1", AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage" }),
+		{},
+	);
+});
+
+test("chromium-args CLI emits a NUL-terminated record the shell reads without eval", () => {
+	const cli = path.join(repoRoot, "bin", "chromium-args.mjs");
+	const run = (env) =>
+		execFileSync(process.execPath, [cli, "--agent-browser-args"], { env, encoding: "utf8" });
+	assert.equal(
+		run({ CI: "1", AGENT_BROWSER_ARGS: "a\nb" }),
+		"set\0a\nb\n--no-sandbox\n--disable-dev-shm-usage\0",
+	);
+	if (chromiumSandboxArgs({}).length === 0) assert.equal(run({}), "keep\0");
+});
+
+test("makeBrowser keeps the caller's AGENT_BROWSER_ARGS when it adds the CI fallback", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-abenv-"));
+	const stub = path.join(dir, "ab-stub");
+	const out = path.join(dir, "env");
+	fs.writeFileSync(
+		stub,
+		`#!/usr/bin/env bash\nprintf '%s' "$AGENT_BROWSER_ARGS" > "${out}"\necho '{"success":true,"data":{"sessions":[]}}'\n`,
+	);
+	fs.chmodSync(stub, 0o755);
+	await makeBrowser("s", stub, {
+		PATH: process.env.PATH,
+		CI: "1",
+		AGENT_BROWSER_ARGS: "--proxy-server=x",
+	}).sessionExists();
+	const seen = fs.readFileSync(out, "utf8").split(",");
+	assert.ok(seen.includes("--proxy-server=x"), "the user's args survive");
+	assert.ok(seen.includes("--no-sandbox"), "the fallback is appended");
+});
+
+test("launch mode reads the sandbox fallback from the renderer's env, not process.env", { skip: !canCdp }, async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-args-"));
+	const bin = path.join(dir, "fake-chromium");
+	const argsOut = path.join(dir, "args");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+printf '%s\\n' "$@" > "${argsOut}"
+d=""
+for a in "$@"; do case "$a" in --user-data-dir=*) d="\${a#--user-data-dir=}";; esac; done
+printf '9876\\n/devtools/browser/fake-guid\\n' > "$d/DevToolsActivePort"
+exec sleep 30
+`,
+		{ mode: 0o755 },
+	);
+	const savedCi = process.env.CI;
+	delete process.env.CI;
+	try {
+		const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin, CI: "1" }));
+		r.attachTo = async () => {};
+		await r.launchChromium();
+		await until(() => fs.existsSync(argsOut));
+		r.cleanup();
+		assert.ok(
+			fs.readFileSync(argsOut, "utf8").split("\n").includes("--no-sandbox"),
+			"CI in the injected env must reach the launch args",
+		);
+	} finally {
+		if (savedCi === undefined) delete process.env.CI;
+		else process.env.CI = savedCi;
+	}
+});

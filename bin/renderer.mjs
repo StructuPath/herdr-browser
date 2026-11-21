@@ -442,7 +442,8 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Inherit the caller's configuration unchanged. Injecting an idle timeout
 	// makes agent-browser restart an existing daemon and lose its browser.
 	// On CI/container boxes agent-browser needs AGENT_BROWSER_ARGS to fall back
-	// to --no-sandbox, or its Chrome dies before any command returns.
+	// to --no-sandbox, or its Chrome dies before any command returns. The
+	// fallback is appended; the caller's own AGENT_BROWSER_ARGS are kept.
 	const runEnv = { ...env, ...agentBrowserSandboxEnv(env) };
 	const parse = (stdout, what) => {
 		let parsed;
@@ -981,7 +982,7 @@ export class Renderer {
 				// newer Chromes and would eventually break launches.
 				...(headed ? [] : ["--headless"]),
 				// Sandbox fallback for root/CI/containers (see chromiumSandboxArgs).
-				...chromiumSandboxArgs(process.env),
+				...chromiumSandboxArgs(this.env),
 				"about:blank",
 			];
 			this.banner = "launching Chromium…";

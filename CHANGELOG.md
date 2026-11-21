@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Publish the pane's observed state for the coding agent beside it: the
+  renderer writes `pane-<workspace-id>.json` (schema version 1, mode `0600`,
+  atomic, only on change, removed on exit) with backend, session, CDP
+  `host:port`, URL, title, observe-only, and the last 20 console and
+  failed-request lines. URLs lose credentials, query, and fragment; the file
+  is capped at 64 KiB. Add `bin/hb.mjs`: `hb status [--json]` reads it (exit 3
+  and `{"status":"no-pane"}` when no live pane), `hb session [--json]` names the
+  session and endpoint to drive. See README "For agents: reading the pane".
 - Add bounded expected/actual values and selectors to failed QA assertions,
   redact literal fill values from text evidence, identify invalid steps by index
   and type, and name malformed scenario files without echoing their contents.

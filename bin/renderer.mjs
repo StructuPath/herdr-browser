@@ -22,6 +22,8 @@ const KITTY_IMAGE_ID = 1;
 // chafa emits anonymous kitty placements (no id), and full repaints/cleanup
 // must clear everything — our id-addressed frames included.
 const KITTY_DELETE_ALL = `${ESC}_Ga=d,d=A${ESC}\\`;
+// Stored console line length. Far past any pane width; the overflow is noise.
+const CONSOLE_LINE_MAX_CHARS = 2_000;
 
 // --- pure helpers (unit-tested) ---
 
@@ -200,21 +202,35 @@ function cellWidth(s) {
 	return w;
 }
 
+// One lazy pass: segmenting stops as soon as the string is known not to fit,
+// so a huge input costs only what the output width needs.
 export function truncate(s, width) {
 	if (width <= 0) return "";
-	const clusters = Array.from(graphemeSegmenter.segment(s), ({ segment }) => ({
-		segment,
-		width: cellWidth(segment),
-	}));
-	if (clusters.reduce((sum, cluster) => sum + cluster.width, 0) <= width) return s;
 	let out = "";
+	let cut = null; // the longest prefix that leaves room for "…"
 	let w = 0;
-	for (const cluster of clusters) {
-		if (w + cluster.width > width - 1) break;
-		out += cluster.segment;
-		w += cluster.width;
+	for (const { segment } of graphemeSegmenter.segment(s)) {
+		const cw = cellWidth(segment);
+		if (cut === null && w + cw > width - 1) cut = out;
+		w += cw;
+		if (w > width) return cut + "…";
+		out += segment;
 	}
-	return out + "…";
+	return s;
+}
+
+// Cap a string at maxLen UTF-16 units without splitting a grapheme cluster.
+// A break depends on the text before it and only one code point after it,
+// so segmenting the first maxLen + 2 units (that code point kept whole)
+// finds the same boundaries up to maxLen as segmenting the full string.
+export function capLength(s, maxLen) {
+	if (s.length <= maxLen) return s;
+	let end = 0;
+	for (const { index, segment } of graphemeSegmenter.segment(s.slice(0, maxLen + 2))) {
+		if (index + segment.length > maxLen) break;
+		end = index + segment.length;
+	}
+	return s.slice(0, end) + "…";
 }
 
 // Poll backoff: each tick spawns 4 agent-browser subprocesses, so a quiet
@@ -1672,7 +1688,10 @@ export class Renderer {
 						? "⚠ "
 						: "  ";
 			// Sanitize the display copy only — reconcile matching needs raw texts.
-			this.consoleLines.push(prefix + sanitizeText(e.text ?? ""));
+			// The line count is capped below; cap each line's length too, before
+			// sanitizing, so one huge log cannot pin megabytes in the store.
+			const text = capLength(String(e.text ?? ""), CONSOLE_LINE_MAX_CHARS);
+			this.consoleLines.push(prefix + sanitizeText(text));
 		}
 		if (this.consoleLines.length > 500) {
 			this.consoleLines = this.consoleLines.slice(-500);

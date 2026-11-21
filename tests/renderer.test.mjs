@@ -32,6 +32,7 @@ import {
 	chromiumSandboxArgs,
 	truthyConfig,
 	execFileBounded,
+	capLength,
 } from "../bin/renderer.mjs";
 import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
 
@@ -3255,3 +3256,36 @@ test("attach network dedupe expires keys past the window and caps the map", (t) 
 	assert.equal(r.consoleLines.length, 2, "repeat after the window paints again");
 });
 
+test("pushConsole caps stored line length on a grapheme boundary", () => {
+	const r = quiet(mkRenderer());
+	r.pushConsole([{ text: "x".repeat(1_000_000), type: "log" }], false);
+	const stored = r.consoleLines.at(-1);
+	assert.ok(stored.length <= 2_100, `stored ${stored.length} chars for one line`);
+	assert.ok(stored.endsWith("…"), "a capped line says it was cut");
+	// "á̂" is 3 UTF-16 units (base + two marks that sanitize keeps), so the
+	// cut lands inside a cluster, which must be dropped whole.
+	const cluster = "a\u0301\u0302";
+	r.pushConsole([{ text: cluster.repeat(100_000), type: "log" }], false);
+	const body = r.consoleLines.at(-1).slice(2, -1);
+	assert.ok(body.length > 0);
+	assert.equal(body, cluster.repeat(body.length / 3));
+});
+
+test("capLength never splits a grapheme cluster", () => {
+	// "👩‍💻" is 5 UTF-16 units joined by a ZWJ.
+	assert.equal(capLength("👩‍💻".repeat(10), 12), "👩‍💻👩‍💻…");
+	assert.equal(capLength("👩‍💻".repeat(10), 10), "👩‍💻👩‍💻…");
+	assert.equal(capLength("🇺🇸🇺🇸", 6), "🇺🇸…");
+	assert.equal(capLength("short", 10), "short");
+});
+
+test("truncate stops scanning once the output width is reached", () => {
+	const big = "x".repeat(2_000_000);
+	let best = Infinity;
+	for (let i = 0; i < 3; i++) {
+		const start = performance.now();
+		assert.equal(truncate(big, 80), `${"x".repeat(79)}…`);
+		best = Math.min(best, performance.now() - start);
+	}
+	assert.ok(best < 30, `truncate of a 2M-char string took ${best.toFixed(1)} ms`);
+});

@@ -2566,6 +2566,23 @@ test("attach switch ignores completion of an old connection", { skip: !canCdp },
 	assert.equal(r.attached, true);
 });
 
+test("attach switch ignores a late failure of an old connection", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let fail;
+	r.browser = fakeCdpBackend();
+	r.browser.connect = () => new Promise((_resolve, reject) => { fail = reject; });
+	const connecting = r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.banner = "";
+	fail(new Error("endpoint timed out"));
+	assert.equal(await connecting, false);
+	assert.equal(r.attached, true, "the new endpoint stays attached");
+	assert.equal(r.banner, "", "no banner from the abandoned endpoint");
+});
+
 test("attach mode: a Cmd+click handoff file navigates the attached target", { skip: !canCdp }, async () => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();

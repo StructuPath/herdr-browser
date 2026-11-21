@@ -37,6 +37,8 @@ function getJson(host, port, path, timeout = 5_000) {
 			(res) => {
 				let body = "";
 				res.setEncoding("utf8");
+				// Either listener settles a torn body alone; both stay on purpose,
+				// since which one fires depends on the Node version.
 				res.on("error", reject);
 				res.on("aborted", () => reject(new Error(`endpoint response aborted for ${path}`)));
 				res.on("data", (c) => {
@@ -266,6 +268,10 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	let handler = null; // onMessage subscriber (the Renderer)
 	let attachTimeMs = 0;
 	let connectedOnce = false;
+	// Set by close(): a connect() still in discovery or handshake must never go
+	// on to attach, enable domains, or start a screencast on an abandoned browser.
+	let closed = false;
+	const abandoned = () => Object.assign(new Error("connection abandoned"), { code: "ABANDONED" });
 	let selection = 0;
 	let accessibilitySessionId = null;
 	let networkSessionId = null;
@@ -495,9 +501,15 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				session.close();
 				clearTarget("target_changing");
 			}
+			if (closed) throw abandoned();
 			endpoint = await discoverEndpoint(endpointInput, opts);
+			if (closed) throw abandoned();
 			session = makeCdpSession(endpoint.wsUrl, opts);
 			await session.opened;
+			if (closed) {
+				session.close();
+				throw abandoned();
+			}
 			session.onEvent(onCdpEvent);
 			session.onClose(() => emit({ type: "endpoint_gone" }));
 			await session.send("Target.setDiscoverTargets", { discover: true });
@@ -648,6 +660,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			return session.ping();
 		},
 		close() {
+			closed = true;
 			const s = session;
 			if (!s || s.dead) return;
 			// Attach-mode cleanup: stop OUR screencast, close OUR socket.

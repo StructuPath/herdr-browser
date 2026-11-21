@@ -697,3 +697,33 @@ test("adapter feed: auto-attached OOPIF sessions get their own feed enabled", as
 		"embedded frame failures must not be silent",
 	);
 });
+
+test("adapter close during discovery or handshake never attaches to the abandoned browser", async (t) => {
+	// Discovery held open by a slow /json/version, then close() before it answers.
+	let answer;
+	const server = http.createServer((req, res) => {
+		answer = () => res.end(JSON.stringify({ Browser: "Chrome/150", webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/x` }));
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => { server.closeAllConnections(); server.close(); });
+	let sockets = 0;
+	const slow = makeCdpBrowser(`http://127.0.0.1:${server.address().port}`, {
+		wsFactory: () => { sockets++; return makeFakeCdp().ws; },
+	});
+	const connecting = slow.connect().catch((err) => err);
+	while (!answer) await new Promise((resolve) => setImmediate(resolve));
+	slow.close();
+	answer();
+	assert.equal((await connecting)?.code, "ABANDONED");
+	assert.equal(sockets, 0, "no WebSocket opens after close()");
+
+	// Handshake held open, then close() before the socket opens.
+	const fake = makeFakeCdp();
+	const pending = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", { wsFactory: () => fake.ws });
+	const handshaking = pending.connect().catch((err) => err);
+	await new Promise((resolve) => setImmediate(resolve));
+	pending.close();
+	fake.ws.onopen?.();
+	assert.equal((await handshaking)?.code, "ABANDONED");
+	assert.deepEqual(fake.sent.map((m) => m.method), [], "no CDP command reaches the abandoned browser");
+});

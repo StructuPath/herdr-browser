@@ -140,8 +140,9 @@ function session(env, cwd, json) {
 				source: "pane",
 				backend: found.state.backend ?? null,
 				endpoint: found.state.endpoint ?? null,
+				endpointDiscoverable: found.state.endpointDiscoverable ?? null,
 			}
-		: { session: deriveSession(env, cwd), source: "derived", backend: null, endpoint: null };
+		: { session: deriveSession(env, cwd), source: "derived", backend: null, endpoint: null, endpointDiscoverable: null };
 	if (json) {
 		process.stdout.write(`${JSON.stringify(out)}\n`);
 		return EXIT.ok;
@@ -149,9 +150,14 @@ function session(env, cwd, json) {
 	const lines = [`session: ${clean(out.session)}`];
 	if (out.endpoint) {
 		lines.push(`endpoint: ${clean(out.endpoint)}`);
-		lines.push(
-			`drive it: agent-browser --session ${clean(out.session)} connect http://${clean(out.endpoint)}`,
-		);
+		// Only an http(s) endpoint answers discovery at host:port. A raw
+		// WebSocket endpoint needs the capability path the pane withholds.
+		if (out.endpointDiscoverable === false)
+			lines.push("the pane attached through a WebSocket URL that host:port alone cannot reach; ask for the full URL");
+		else
+			lines.push(
+				`drive it: agent-browser --session ${clean(out.session)} connect http://${clean(out.endpoint)}`,
+			);
 	}
 	process.stdout.write(`${lines.join("\n")}\n`);
 	return EXIT.ok;

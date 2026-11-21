@@ -33,6 +33,22 @@ export function endpointHostPort(url) {
 	return `${u.hostname}:${u.port || defaults[u.protocol]}`;
 }
 
+// Whether host:port alone answers CDP discovery. Chrome's own browser
+// endpoint (/devtools/browser/<id>: Puppeteer's wsEndpoint, DevToolsActivePort)
+// shares its port with HTTP discovery; other WebSocket fronts (Playwright
+// servers, hosted browsers, proxies) only work with the full URL.
+function discoverable(url) {
+	let u;
+	try {
+		u = new URL(String(url));
+	} catch {
+		return null;
+	}
+	if (u.protocol === "http:" || u.protocol === "https:") return true;
+	if (u.protocol !== "ws:" && u.protocol !== "wss:") return null;
+	return /^\/devtools\/browser\/[^/]+$/.test(u.pathname) && !u.search;
+}
+
 // URLs leave the pane the way QA reports them (bin/qa.mjs safeUrl): no
 // username, password, query, or fragment — those carry tokens. A data: URL
 // is all payload; a blob: URL wraps an origin URL that is stripped in turn.
@@ -57,23 +73,26 @@ function safeHref(value) {
 }
 
 // URLs inside free text (console, failed requests). A match runs to the next
-// whitespace: quotes, brackets, and ";" are legal inside a query, so stopping
-// at them would leave the rest of a token behind. Sentence punctuation is
-// given back only when the URL has no query or fragment to hide it in; with
-// one, everything to the next whitespace is dropped (over-redaction is the
-// safe side). "…" ends a match: truncate() appends it to long URLs.
+// whitespace, and nothing else ends it: quotes, brackets, "<", ">", ";", and
+// "…" can all sit inside a query or a data: payload, so stopping at any of
+// them would leave the rest of a token behind. Sentence punctuation is given
+// back only when the URL has no query or fragment to hide it in; with one,
+// everything to the next whitespace is dropped (over-redaction is the safe
+// side). A trailing "…" (truncate() marks a cut line with it) is kept.
 // blob:/data: need a non-word char before them so "metadata:" is left alone.
-const URL_IN_TEXT = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)[^\s<>…]+/gi;
+const URL_IN_TEXT = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)\S+/gi;
 export function redactUrls(text) {
 	return String(text).replace(URL_IN_TEXT, (m) => {
-		let url = m;
+		const cut = m.endsWith("…") ? "…" : "";
+		let url = cut ? m.slice(0, -1) : m;
 		let after = "";
-		if (!/[?#]/.test(m)) {
-			const tail = /[.,;:!)\]}'"]+$/.exec(m)?.[0] ?? "";
-			url = m.slice(0, m.length - tail.length);
+		// data: is withheld whole, so there is no tail to give back.
+		if (!/[?#]/.test(url) && !/^data:/i.test(url)) {
+			const tail = /[.,;:!)\]}>'"]+$/.exec(url)?.[0] ?? "";
+			url = url.slice(0, url.length - tail.length);
 			after = tail;
 		}
-		return safeHref(url) + after;
+		return safeHref(url) + after + cut;
 	});
 }
 
@@ -112,6 +131,10 @@ export function buildPaneState(input, sanitize) {
 		session: input.session == null ? null : text(input.session, sanitize),
 		endpoint:
 			backend === "agent-browser" ? null : clip(endpointHostPort(input.endpoint) ?? "", MAX_FIELD) || null,
+		// Whether host:port alone reaches the browser; the capability path a
+		// raw WebSocket front needs never leaves the pane.
+		endpointDiscoverable:
+			backend === "agent-browser" ? null : discoverable(input.endpoint),
 		attached: Boolean(input.attached),
 		url: clip(redactUrl(text(input.url, sanitize, Infinity)), MAX_FIELD),
 		title: text(input.title, sanitize),
@@ -175,6 +198,8 @@ const FIELD_CHECKS = {
 	backend: isStr,
 	session: (v) => v === null || isStr(v),
 	endpoint: (v) => v === null || isStr(v),
+	// Added within v1: files from an older writer simply lack it.
+	endpointDiscoverable: (v) => v === undefined || v === null || typeof v === "boolean",
 	attached: (v) => typeof v === "boolean",
 	url: isStr,
 	title: isStr,

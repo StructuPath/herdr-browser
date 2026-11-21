@@ -287,7 +287,7 @@ test("buildPaneState shapes, caps, and sanitizes every field", () => {
 		sanitizeText,
 	);
 	assert.deepEqual(Object.keys(s), [
-		"schemaVersion", "backend", "session", "endpoint", "attached", "url", "title",
+		"schemaVersion", "backend", "session", "endpoint", "endpointDiscoverable", "attached", "url", "title",
 		"observeOnly", "consoleTail", "failures", "updatedAt", "pid",
 	]);
 	assert.equal(s.schemaVersion, PANE_STATE_SCHEMA_VERSION);
@@ -410,6 +410,7 @@ test("hb session matches bash session_name across env/config/workspace/cwd", () 
 			source: "derived",
 			backend: null,
 			endpoint: null,
+			endpointDiscoverable: null,
 		});
 	}
 });
@@ -431,6 +432,7 @@ test("hb session reports the live pane's session and attach endpoint", () => {
 		source: "pane",
 		backend: "attach",
 		endpoint: "127.0.0.1:9222",
+		endpointDiscoverable: true, // Chrome's own /devtools/browser/ URL shares the discovery port
 	});
 	const text = runHb(["session"], env);
 	assert.match(text.stdout, /^session: pane-session\nendpoint: 127\.0\.0\.1:9222\n/);
@@ -585,7 +587,7 @@ test("hb without HERDR_WORKSPACE_ID accepts only a pane whose session is the cal
 	assert.equal(st.status, 3, st.stdout);
 	assert.deepEqual(JSON.parse(st.stdout), { status: "no-pane" });
 	const se = runHb(["session", "--json"], env, { cwd });
-	assert.deepEqual(JSON.parse(se.stdout), { session: mine, source: "derived", backend: null, endpoint: null });
+	assert.deepEqual(JSON.parse(se.stdout), { session: mine, source: "derived", backend: null, endpoint: null, endpointDiscoverable: null });
 	writePaneState(file, buildPaneState({ session: mine, pid: process.pid }, sanitizeText));
 	const ok = runHb(["status", "--json"], env, { cwd });
 	assert.equal(ok.status, 0, ok.stderr);
@@ -680,4 +682,50 @@ test("pane state: a file that vanishes is written again on the next idle step", 
 	fs.unlinkSync(file); // an older pane's cleanup raced this pane's write
 	await r.step(); // nothing observable changed
 	assert.ok(fs.existsSync(file), "the live pane restores its file without a state change");
+});
+
+test("redactUrls: <, >, and a literal … inside a URL never shield a secret", () => {
+	const cases = [
+		["load data:text/html,<b>SECRET</b> done", "load data:[redacted] done"],
+		["see https://h/?a…token=SECRET end", "see https://h/ end"],
+		["<https://u:p@x.test/p>", "<https://x.test/p>"],
+		["cut https://h/path…", "cut https://h/path…"], // truncate()'s own marker stays
+		["cut https://h/p?token=SEC…", "cut https://h/p…"],
+	];
+	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
+	for (const [input] of cases) assert.doesNotMatch(redactUrls(input), /SECRET|SEC|u:p@/);
+});
+
+test("pane state: endpointDiscoverable says whether host:port alone reaches the browser", () => {
+	const s = (endpoint, backend = "attach") => buildPaneState({ backend, endpoint, pid: 1 }, (x) => x);
+	assert.equal(s("http://127.0.0.1:9222").endpointDiscoverable, true);
+	assert.equal(s("ws://127.0.0.1:9222/devtools/browser/abc").endpointDiscoverable, true, "Chrome's own endpoint");
+	assert.equal(s("ws://127.0.0.1:3000/5f2c9a").endpointDiscoverable, false, "a Playwright server");
+	assert.equal(s("wss://cloud.test/?token=TOKEN").endpointDiscoverable, false, "a hosted browser");
+	assert.equal(s("ws://proxy.test:8080/cdp/browser/TOKEN").endpointDiscoverable, false, "a proxy");
+	assert.doesNotMatch(JSON.stringify(s("ws://proxy.test:8080/cdp/browser/TOKEN")), /TOKEN/);
+	assert.equal(s(null, "agent-browser").endpointDiscoverable, null);
+});
+
+test("hb session only suggests connect for an endpoint that answers discovery", () => {
+	const env = hbEnv({ HERDR_WORKSPACE_ID: "w1", HERDR_PLUGIN_STATE_DIR: tmpDir("hb-st-") });
+	const file = paneStateFile(env.HERDR_PLUGIN_STATE_DIR, "w1");
+	const write = (endpoint) => writePaneState(file, buildPaneState({ backend: "attach", session: "herdr-ws-w1", endpoint, pid: process.pid }, sanitizeText));
+	write("ws://proxy.test:8080/cdp/browser/TOKEN");
+	let out = runHb(["session"], env).stdout;
+	assert.doesNotMatch(out, /connect http:/);
+	assert.match(out, /ask for the full URL/);
+	assert.doesNotMatch(out, /TOKEN/);
+	write("http://127.0.0.1:9222");
+	out = runHb(["session"], env).stdout;
+	assert.match(out, /connect http:\/\/127\.0\.0\.1:9222/);
+	assert.equal(JSON.parse(runHb(["session", "--json"], env).stdout).endpointDiscoverable, true);
+});
+
+test("readPaneState accepts a v1 file from a writer that predates endpointDiscoverable", () => {
+	const file = path.join(tmpDir("hb-old-"), "pane-w1.json");
+	const state = buildPaneState({ backend: "attach", session: "s", endpoint: "http://127.0.0.1:9222", pid: process.pid }, sanitizeText);
+	delete state.endpointDiscoverable;
+	writePaneState(file, state);
+	assert.equal(readPaneState(file).endpoint, "127.0.0.1:9222");
 });

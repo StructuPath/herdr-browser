@@ -282,7 +282,8 @@ screenshot. A captured snapshot or diff is dropped, rather than shown stale,
 when the page navigates to a new URL underneath it — in polling, live-stream,
 and attach modes alike. In attach and launch mode it is also dropped on a
 reload or a tab switch that keeps the same URL; in agent-browser mode a
-same-URL reload is not detected, so press `s` again. The request table is a
+same-URL reload is not detected, so press `s` twice (once to close the old
+snapshot, once to take a new one). The request table is a
 session log and stays until dismissed.
 Switching to a different browser (`a` or `l`) also forgets the last snapshot,
 so `d` asks for a fresh `s` instead of diffing two unrelated browsers.
@@ -493,6 +494,7 @@ Schema version 1 (`hb status --json` prints exactly this object):
 | `backend` | string | `"agent-browser"` or `"attach"`. A Chromium launched with `l` is `"attach"`. |
 | `session` | string | The agent-browser session name the pane uses. |
 | `endpoint` | string \| null | CDP `host:port` in attach mode; `null` for agent-browser. Never a path or token. |
+| `endpointDiscoverable` | boolean \| null | `true` when `host:port` alone reaches the browser: an `http://` endpoint, a launched browser, or Chrome's own `ws://…/devtools/browser/<id>` URL. `false` for other WebSocket fronts (Playwright servers, hosted browsers, proxies), which need a path or token the pane does not publish; `hb session` then gives no `connect` hint. `null` for agent-browser. Files from an earlier writer may lack it. |
 | `attached` | boolean | The pane is connected to its session or endpoint now. |
 | `url` | string | Current page URL (sanitized, redacted, at most 2,000 characters). |
 | `title` | string | Current page title (sanitized, at most 2,000 characters). |
@@ -508,6 +510,7 @@ Schema version 1 (`hb status --json` prints exactly this object):
   "backend": "attach",
   "session": "herdr-ws-w1",
   "endpoint": "127.0.0.1:9222",
+  "endpointDiscoverable": true,
   "attached": true,
   "url": "http://localhost:3000/",
   "title": "My app",

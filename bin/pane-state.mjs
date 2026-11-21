@@ -85,9 +85,10 @@ function safeHref(value) {
 // Words split at ASCII whitespace only: sanitizeText keeps Unicode spaces
 // such as U+00A0, and a URL may contain one, so they must not end a word.
 // A scheme counts with "://" anywhere (even glued to a word), or with just
-// ":" at a word boundary (new URL() accepts "https:host/…" and
-// "wss:user@host"); the boundary keeps "metadata:" and "profile:" out.
-const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![A-Za-z0-9+.-])(?:https?|wss?|file|blob|data):)/i;
+// ":" when no letter or digit is glued before it (new URL() accepts
+// "https:host/…" and "wss:user@host", also after "." or "+"); a letter or
+// digit before it makes another word ("metadata:", "profile:").
+const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![A-Za-z0-9])(?:https?|wss?|file|blob|data):)/i;
 export function redactUrls(text) {
 	return String(text).replace(/[^ \t\n\r\f\v]+/g, (word) => {
 		const at = word.search(URL_START);

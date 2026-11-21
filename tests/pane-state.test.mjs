@@ -764,7 +764,7 @@ test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret",
 		// A letter or digit glued before a slashless scheme makes another scheme
 		// ("xhttps:"), which no parser reads as https; keep a boundary there.
 		const pre = junk();
-		const sep = !scheme.includes("//") && /[A-Za-z0-9+.-]$/.test(pre) ? "(" : "";
+		const sep = !scheme.includes("//") && /[A-Za-z0-9]$/.test(pre) ? "(" : "";
 		const word = `${pre}${sep}${scheme}${userinfo}${host}/${junk()}p${query}${frag}${junk()}`;
 		if (userinfo) withUserinfo++;
 		if (query) withQuery++;
@@ -784,6 +784,8 @@ test("pane state: Unicode spaces and slashless schemes never shield a URL secret
 		"x wss:u:SECRET@h.test/ y",
 		"x https:example.test/?token=SECRET y",
 		"x HTTP:u:SECRET@h.test/ y",
+		"x .https:example.test/?token=SECRET y",
+		"x +wss:u:SECRET@h.test/ y",
 	];
 	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
 	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);

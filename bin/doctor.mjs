@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { findChromium, truthyConfig } from "./renderer.mjs";
+import { chafaInstallHint, findChromium, truthyConfig } from "./renderer.mjs";
 
 export function diagnose(env = process.env, {
 	probe = (command) => spawnSync("/bin/sh", ["-c", 'command -v -- "$1"', "sh", command], {
@@ -16,6 +16,7 @@ export function diagnose(env = process.env, {
 	},
 	nodeVersion = process.versions.node,
 	webSocket = typeof WebSocket === "function",
+	platform = process.platform,
 } = {}) {
 	const checks = [];
 	const add = (status, name, detail) => checks.push({ status, name, detail });
@@ -36,7 +37,7 @@ export function diagnose(env = process.env, {
 		add(agent || (launchable && webSocket) ? "ok" : "error", "Browser engine", agent ? "agent-browser available; install its engine with agent-browser install" : launchable && webSocket ? "Chrome/Chromium available; press l or set HERDR_BROWSER_LAUNCH=1" : "install agent-browser and run agent-browser install, or configure Chrome/Chromium with Node 22+");
 	}
 	add(launchable ? "ok" : "warn", "Local Chromium", launchable ? "executable found; launch not attempted" : "not found; optional for shared agent sessions and external attach");
-	add(probe("chafa") ? "ok" : "warn", "Image rendering", "chafa enables ANSI images and Kitty JPEGs; macOS: brew install chafa");
+	add(probe("chafa") ? "ok" : "warn", "Image rendering", `chafa enables ANSI images and Kitty JPEGs; install: ${chafaInstallHint(platform)}`);
 	add(probe("carbonyl") ? "ok" : "warn", "Interactive Browse", "Carbonyl is optional and uses a separate browser session");
 	return checks;
 }

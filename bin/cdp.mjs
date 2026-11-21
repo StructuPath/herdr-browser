@@ -428,6 +428,12 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			});
 			return;
 		}
+		// A new main-frame document (navigation or reload, even to the same
+		// URL) invalidates anything captured from the old one.
+		if (m.method === "Page.frameNavigated" && pageSessionId && m.sessionId === pageSessionId && !m.params?.frame?.parentId) {
+			emit({ type: "document", url: m.params.frame.url ?? "" });
+			return;
+		}
 		if (m.method === "Target.targetInfoChanged") {
 			const t = m.params.targetInfo;
 			if (t.targetId === pinnedTargetId)

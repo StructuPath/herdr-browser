@@ -726,4 +726,13 @@ test("adapter close during discovery or handshake never attaches to the abandone
 	fake.ws.onopen?.();
 	assert.equal((await handshaking)?.code, "ABANDONED");
 	assert.deepEqual(fake.sent.map((m) => m.method), [], "no CDP command reaches the abandoned browser");
+
+test("adapter reports a new main-frame document, including a same-URL reload", async () => {
+	const fake = makeFakeCdp();
+	const { got } = await attachBrowser(fake);
+	const navigated = (frame, sessionId = "sess-T1") => fake.deliver({ method: "Page.frameNavigated", sessionId, params: { frame } });
+	navigated({ id: "F1", url: "https://x/" });
+	navigated({ id: "F2", parentId: "F1", url: "https://ad/" }); // iframe: not a new page
+	navigated({ id: "F1", url: "https://x/" }, "sess-other"); // another target's session
+	assert.deepEqual(got.filter((m) => m.type === "document").map((m) => m.url), ["https://x/"]);
 });

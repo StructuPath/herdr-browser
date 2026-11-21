@@ -20,7 +20,7 @@ test("doctor requires a usable engine and Herdr", () => {
 });
 
 test("doctor honors selected backend and never prints endpoint credentials", () => {
-	const env = { HERDR_BROWSER_CDP_URL: "wss://user:secret@example.com/devtools/browser/private-token", HERDR_BROWSER_LAUNCH: "1" };
+	const env = { HERDR_BROWSER_CDP_URL: "ws://user:secret@example.com/devtools/browser/private-token", HERDR_BROWSER_LAUNCH: "1" };
 	const checks = check(env, ["herdr"]);
 	assert.deepEqual(errors(checks), []);
 	assert.doesNotMatch(JSON.stringify(checks), /secret|private-token/);
@@ -40,4 +40,14 @@ test("doctor gives platform-appropriate chafa install advice", () => {
 	assert.match(detail("darwin"), /brew install chafa/);
 	assert.doesNotMatch(detail("linux"), /brew/);
 	assert.match(detail("linux"), /apt install chafa/);
+});
+
+test("doctor reports TLS endpoints as unsupported, as attach does", () => {
+	for (const url of ["https://example.com:9222", "wss://user:secret@example.com/devtools/browser/private-token"]) {
+		const checks = check({ HERDR_BROWSER_CDP_URL: url }, ["herdr"]);
+		const attach = checks.find((c) => c.name === "Selected backend: attach");
+		assert.equal(attach.status, "error", url);
+		assert.match(attach.detail, /TLS/);
+		assert.doesNotMatch(JSON.stringify(checks), /secret|private-token/);
+	}
 });

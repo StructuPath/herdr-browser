@@ -121,6 +121,10 @@ if pane_alive "$existing"; then
 fi
 
 if [ "$focused" -eq 0 ]; then
+	# A pane killed without cleanup (SIGKILL) leaves its runtime-backend marker.
+	# The fresh pane starts on the configured backend, so the old marker must
+	# not route clicks or block recording for it. Still under the open lock.
+	rm -f "$(backend_marker_file)"
 	out="$(with_timeout 15 "$HERDR" plugin pane open --plugin "$PLUGIN_ID" --entrypoint view \
 		--placement split --direction right --focus)" || {
 		echo "herdr-browser: failed to open pane" >&2

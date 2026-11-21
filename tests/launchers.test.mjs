@@ -697,6 +697,21 @@ test("a dead pane's stale backend marker is ignored", () => {
 	fs.rmSync(path.join(stateDir, "backend-w9"), { force: true });
 });
 
+test("a fresh pane clears the marker a killed attach pane left behind", () => {
+	fs.writeFileSync(path.join(stateDir, "pane-id-w9"), "w9:p3\n"); // the killed pane
+	fs.writeFileSync(path.join(stateDir, "backend-w9"), "attach\n"); // SIGKILL skipped its cleanup
+	let r = runScript("open.sh", ["http://localhost:5003/a"]); // p3 is dead: a fresh pane opens
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /plugin pane open/);
+	assert.ok(!fs.existsSync(path.join(stateDir, "backend-w9")), "stale marker removed");
+	// The fresh pane is alive on the configured backend: clicks drive agent-browser.
+	r = runScript("open.sh", ["http://localhost:5003/b"], freshEnv({ STUB_PANE_ALIVE: "0" }));
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /agent-browser --session herdr-ws-w9 open http:\/\/localhost:5003\/b/);
+	assert.ok(!fs.existsSync(path.join(stateDir, "navigate-w9")), "no handoff file for an agent-browser pane");
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+});
+
 test("whitespace-only HERDR_BROWSER_CDP_URL is not attach mode (renderer parity)", () => {
 	const r = runScript(
 		"open.sh",

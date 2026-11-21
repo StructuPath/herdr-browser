@@ -248,19 +248,34 @@ function cellWidth(s) {
 	return w;
 }
 
-// One lazy pass: segmenting stops as soon as the string is known not to fit,
-// so a huge input costs only what the output width needs.
+// Segment in bounded chunks and stop as soon as the string is known not to
+// fit, so a huge input costs only what the output width needs. Node 20's
+// Intl.Segmenter pays for the whole input on every step, so a lazy pass over
+// the full string is not enough. Each chunk starts on a known boundary and,
+// as in capLength, carries one code point of lookahead; only segments that
+// end inside the chunk are trusted. A cluster longer than the chunk doubles it.
 export function truncate(s, width) {
 	if (width <= 0) return "";
 	let out = "";
 	let cut = null; // the longest prefix that leaves room for "…"
 	let w = 0;
-	for (const { segment } of graphemeSegmenter.segment(s)) {
-		const cw = cellWidth(segment);
-		if (cut === null && w + cw > width - 1) cut = out;
-		w += cw;
-		if (w > width) return cut + "…";
-		out += segment;
+	let pos = 0;
+	let chunk = 256;
+	while (pos < s.length) {
+		const tail = pos + chunk >= s.length;
+		const part = tail ? s.slice(pos) : s.slice(pos, pos + chunk + 2);
+		let done = 0;
+		for (const { index, segment } of graphemeSegmenter.segment(part)) {
+			if (!tail && index + segment.length > chunk) break;
+			const cw = cellWidth(segment);
+			if (cut === null && w + cw > width - 1) cut = out;
+			w += cw;
+			if (w > width) return cut + "…";
+			out += segment;
+			done = index + segment.length;
+		}
+		if (done === 0) chunk *= 2;
+		else pos += done;
 	}
 	return s;
 }

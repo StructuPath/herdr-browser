@@ -3648,6 +3648,45 @@ test("truncate stops scanning once the output width is reached", () => {
 	assert.ok(best < 30, `truncate of a 2M-char string took ${best.toFixed(1)} ms`);
 });
 
+test("chunked truncate matches whole-string segmentation across chunk edges", () => {
+	// Reference: the same width rule over one pass of the whole string.
+	// Cell widths come from truncate itself on each single cluster.
+	const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	const cells = (c) => (truncate(c, 1) === c ? 1 : 2);
+	const reference = (s, width) => {
+		let out = "";
+		let cut = null;
+		let w = 0;
+		for (const { segment } of seg.segment(s)) {
+			const cw = cells(segment);
+			if (cut === null && w + cw > width - 1) cut = out;
+			w += cw;
+			if (w > width) return `${cut}\u2026`;
+			out += segment;
+		}
+		return s;
+	};
+	const tails = [
+		"\u{1f469}\u200d\u{1f4bb}", // ZWJ sequence
+		"\u{1f1fa}\u{1f1f8}", // regional-indicator pair
+		"e\u0301\u0302", // combining marks
+		"\u6f22", // wide CJK
+		"\u{1f44d}\u{1f3fd}", // skin-tone modifier
+	];
+	for (const pad of [250, 253, 254, 255, 256, 257]) {
+		for (const t of tails) {
+			const s = "x".repeat(pad) + t.repeat(20);
+			for (const width of [pad - 1, pad, pad + 1, pad + 3, pad + 10, 10_000]) {
+				assert.equal(truncate(s, width), reference(s, width), `pad ${pad}, ${JSON.stringify(t)}, width ${width}`);
+			}
+		}
+	}
+	// One cluster longer than any chunk still counts as one cell.
+	const huge = `a${"\u0301".repeat(5_000)}`;
+	assert.equal(truncate(huge, 1), huge);
+	assert.equal(truncate(`${huge}bc`, 2), `${huge}\u2026`);
+});
+
 // --- Review regressions: frame arrival vs paint, stale frames, retained drain ---
 
 const liveRenderer = (t) => {

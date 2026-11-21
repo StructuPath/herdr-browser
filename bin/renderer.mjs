@@ -11,6 +11,13 @@ import path from "node:path";
 import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
 import { formatRequests, parseAgentSnapshot, diffSnapshot } from "./page-text.mjs";
 import { chromiumSandboxArgs, agentBrowserSandboxEnv } from "./chromium-args.mjs";
+import {
+	PANE_STATE_TAIL,
+	buildPaneState,
+	paneStateFile,
+	paneStateKey,
+	writePaneState,
+} from "./pane-state.mjs";
 
 export { chromiumSandboxArgs } from "./chromium-args.mjs";
 
@@ -61,6 +68,18 @@ export function deriveSession(env, cwd) {
 	});
 	const sum = res.stdout ? res.stdout.toString().split(" ")[0].trim() : "";
 	return `herdr-cwd-${sum || "unknown"}`;
+}
+
+// HERDR_PLUGIN_STATE_DIR comes from the environment: expand a literal
+// leading '~' (nothing expands it inside a variable value) and refuse
+// relative paths — otherwise state silently lands in a per-cwd tree.
+// Must stay in lockstep with state_dir() in scripts/lib.sh.
+export function resolveStateDir(env) {
+	const fallback = path.join(env.HOME || ".", ".local/state/herdr-browser");
+	let dir = env.HERDR_PLUGIN_STATE_DIR || fallback;
+	if (dir === "~" || dir.startsWith("~/"))
+		dir = path.join(env.HOME || ".", dir.slice(1));
+	return path.isAbsolute(dir) ? dir : fallback;
 }
 
 // Console cursor reconciliation over agent-browser's 1000-entry ring buffer.
@@ -599,17 +618,7 @@ export class Renderer {
 	constructor(env = process.env) {
 		this.env = env;
 		this.session = deriveSession(env, process.cwd());
-		// HERDR_PLUGIN_STATE_DIR comes from the environment: expand a literal
-		// leading '~' (nothing expands it inside a variable value) and refuse
-		// relative paths — otherwise state silently lands in a per-cwd tree.
-		let dir =
-			env.HERDR_PLUGIN_STATE_DIR ||
-			path.join(env.HOME || ".", ".local/state/herdr-browser");
-		if (dir === "~" || dir.startsWith("~/"))
-			dir = path.join(env.HOME || ".", dir.slice(1));
-		if (!path.isAbsolute(dir))
-			dir = path.join(env.HOME || ".", ".local/state/herdr-browser");
-		this.stateDir = dir;
+		this.stateDir = resolveStateDir(env);
 		fs.mkdirSync(this.stateDir, { recursive: true });
 		fs.chmodSync(this.stateDir, 0o700);
 		this.shot = path.join(
@@ -735,6 +744,51 @@ export class Renderer {
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
 		this.lastImageDims = null;
 		this.lastViewportRequest = "";
+		// Pane state file for the agent beside the pane (see publishPaneState).
+		this.paneFile = paneStateFile(this.stateDir, safeWsId(env.HERDR_WORKSPACE_ID));
+		this.paneStateLastKey = null; // last written state, minus updatedAt
+		this.paneStateLastSig = null; // sig() at the last successful publish
+		this.paneStateWrites = 0;
+		this.failedRequests = []; // last PANE_STATE_TAIL failed-request lines
+	}
+
+	// Publish what the pane observes to pane-<ws>.json for the coding agent
+	// (bin/hb.mjs reads it). Called from step() when sig() moved and on the o
+	// key, but written only when the observable state changed — never per
+	// frame. Best-effort: a full disk must not take the pane down. Returns
+	// false only when a write failed, so the caller retries.
+	publishPaneState() {
+		const state = buildPaneState(
+			{
+				backend: this.backend,
+				session: this.session,
+				endpoint: this.cdpEndpoint,
+				attached: this.attached,
+				url: this.lastUrl,
+				title: this.lastTitle,
+				observeOnly: this.observeOnly,
+				consoleLines: this.consoleLines,
+				failures: this.failedRequests,
+				pid: process.pid,
+			},
+			sanitizeText,
+		);
+		const key = paneStateKey(state);
+		if (key === this.paneStateLastKey) return true;
+		try {
+			writePaneState(this.paneFile, state);
+		} catch {
+			return false;
+		}
+		this.paneStateLastKey = key;
+		this.paneStateWrites++;
+		return true;
+	}
+
+	noteFailedRequests(lines) {
+		this.failedRequests.push(...lines);
+		if (this.failedRequests.length > PANE_STATE_TAIL)
+			this.failedRequests = this.failedRequests.slice(-PANE_STATE_TAIL);
 	}
 
 	// Serialize all screen-writing work: ticks and resize redraws must never
@@ -826,6 +880,7 @@ export class Renderer {
 					text: `…and ${overflow} more failed requests`,
 					type: "error",
 				});
+			this.noteFailedRequests(lines.map((l) => l.text));
 			this.pushConsole(lines, false);
 			this.queueConsolePaint(hadConsole);
 			return true;
@@ -1280,6 +1335,7 @@ export class Renderer {
 			const last = this.networkState.recent.get(key);
 			this.networkState.recent.set(key, now);
 			if (last !== undefined && now - last <= 60_000) return;
+			this.noteFailedRequests([text]);
 		}
 		const hadConsole = this.consoleLines.length > 0;
 		this.pushConsole(
@@ -1976,6 +2032,7 @@ export class Renderer {
 		this.lastHeaderSig = null; // the observe marker lives in line 1
 		this.header();
 		this.renderBottom();
+		this.publishPaneState(); // not in sig(); the agent should see it now
 	}
 
 	noteObserveBlocked() {
@@ -2500,6 +2557,11 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
+		try {
+			fs.unlinkSync(this.paneFile); // a dead pane must not look live
+		} catch {
+			/* never written */
+		}
 		// The runtime-backend marker routes clicks only while this pane lives.
 		try {
 			fs.unlinkSync(
@@ -2604,13 +2666,24 @@ export class Renderer {
 		});
 
 		while (true) {
-			const before = this.sig();
-			await this.enqueue(() => this.tick());
-			this.idleTicks = this.sig() === before ? this.idleTicks + 1 : 0;
+			await this.step();
 			await new Promise((r) =>
 				setTimeout(r, pollDelay(this.intervalMs, this.idleTicks)),
 			);
 		}
+	}
+
+	// One run-loop iteration: tick, track idleness, publish on change. The
+	// publish gate compares against the last *published* sig, not the
+	// pre-tick one: attach-mode events and key handlers change state between
+	// ticks, and the tick that follows them sees no change of its own.
+	async step() {
+		const before = this.sig();
+		await this.enqueue(() => this.tick());
+		const sig = this.sig();
+		this.idleTicks = sig === before ? this.idleTicks + 1 : 0;
+		if (sig !== this.paneStateLastSig && this.publishPaneState())
+			this.paneStateLastSig = sig;
 	}
 }
 

@@ -33,20 +33,19 @@ export function endpointHostPort(url) {
 	return `${u.hostname}:${u.port || defaults[u.protocol]}`;
 }
 
-// Whether host:port alone answers CDP discovery. Chrome's own browser
-// endpoint (/devtools/browser/<id>: Puppeteer's wsEndpoint, DevToolsActivePort)
-// shares its port with HTTP discovery; other WebSocket fronts (Playwright
-// servers, hosted browsers, proxies) only work with the full URL.
+// Whether host:port alone answers CDP discovery. An http(s) endpoint does,
+// and a browser the pane launches publishes one. A WebSocket URL cannot be
+// told apart by its shape: a proxy may use Chrome's /devtools/browser/<id>
+// path too, so every ws(s) endpoint is reported as not discoverable.
 function discoverable(url) {
-	let u;
+	let protocol;
 	try {
-		u = new URL(String(url));
+		({ protocol } = new URL(String(url)));
 	} catch {
 		return null;
 	}
-	if (u.protocol === "http:" || u.protocol === "https:") return true;
-	if (u.protocol !== "ws:" && u.protocol !== "wss:") return null;
-	return /^\/devtools\/browser\/[^/]+$/.test(u.pathname) && !u.search;
+	if (protocol === "http:" || protocol === "https:") return true;
+	return protocol === "ws:" || protocol === "wss:" ? false : null;
 }
 
 // URLs leave the pane the way QA reports them (bin/qa.mjs safeUrl): no

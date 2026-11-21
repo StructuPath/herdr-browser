@@ -494,7 +494,7 @@ Schema version 1 (`hb status --json` prints exactly this object):
 | `backend` | string | `"agent-browser"` or `"attach"`. A Chromium launched with `l` is `"attach"`. |
 | `session` | string | The agent-browser session name the pane uses. |
 | `endpoint` | string \| null | CDP `host:port` in attach mode; `null` for agent-browser. Never a path or token. |
-| `endpointDiscoverable` | boolean \| null | `true` when `host:port` alone reaches the browser: an `http://` endpoint, a launched browser, or Chrome's own `ws://…/devtools/browser/<id>` URL. `false` for other WebSocket fronts (Playwright servers, hosted browsers, proxies), which need a path or token the pane does not publish; `hb session` then gives no `connect` hint. `null` for agent-browser. Files from an earlier writer may lack it. |
+| `endpointDiscoverable` | boolean \| null | `true` when `host:port` alone answers CDP discovery: an `http://` endpoint or a browser the pane launched. `false` for any `ws://` or `wss://` endpoint: its shape cannot show whether `host:port` reaches the browser (a proxy may use Chrome's `/devtools/browser/<id>` path too), and the pane never publishes the path or token; `hb session` then gives no `connect` hint. `null` for agent-browser. Files from an earlier writer may lack it. |
 | `attached` | boolean | The pane is connected to its session or endpoint now. |
 | `url` | string | Current page URL (sanitized, redacted, at most 2,000 characters). |
 | `title` | string | Current page title (sanitized, at most 2,000 characters). |

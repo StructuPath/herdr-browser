@@ -437,11 +437,13 @@ test("hb session reports the live pane's session and attach endpoint", () => {
 		source: "pane",
 		backend: "attach",
 		endpoint: "127.0.0.1:9222",
-		endpointDiscoverable: true, // Chrome's own /devtools/browser/ URL shares the discovery port
+		endpointDiscoverable: false, // a ws URL cannot show whether host:port reaches the browser
 	});
 	const text = runHb(["session"], env);
 	assert.match(text.stdout, /^session: pane-session\nendpoint: 127\.0\.0\.1:9222\n/);
-	assert.match(text.stdout, /agent-browser --session pane-session connect http:\/\/127\.0\.0\.1:9222/);
+	// A ws endpoint gets no connect hint: host:port may not reach the browser.
+	assert.doesNotMatch(text.stdout, /connect http:/);
+	assert.match(text.stdout, /ask for the full URL/);
 	assert.ok(!text.stdout.includes("/devtools/browser/"));
 });
 
@@ -719,7 +721,8 @@ test("redactUrls: <, >, and a literal … inside a URL never shield a secret", (
 test("pane state: endpointDiscoverable says whether host:port alone reaches the browser", () => {
 	const s = (endpoint, backend = "attach") => buildPaneState({ backend, endpoint, pid: 1 }, (x) => x);
 	assert.equal(s("http://127.0.0.1:9222").endpointDiscoverable, true);
-	assert.equal(s("ws://127.0.0.1:9222/devtools/browser/abc").endpointDiscoverable, true, "Chrome's own endpoint");
+	assert.equal(s("ws://127.0.0.1:9222/devtools/browser/abc").endpointDiscoverable, false, "same shape as a proxy");
+	assert.equal(s("ws://proxy.test:8080/devtools/browser/abc").endpointDiscoverable, false, "a proxy with Chrome's path");
 	assert.equal(s("ws://127.0.0.1:3000/5f2c9a").endpointDiscoverable, false, "a Playwright server");
 	assert.equal(s("wss://cloud.test/?token=TOKEN").endpointDiscoverable, false, "a hosted browser");
 	assert.equal(s("ws://proxy.test:8080/cdp/browser/TOKEN").endpointDiscoverable, false, "a proxy");

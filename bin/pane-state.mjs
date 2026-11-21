@@ -86,7 +86,17 @@ function safeHref(value) {
 // A scheme counts with "://" anywhere (even glued to a word), or with just
 // ":" when no letter or digit is glued before it (new URL() accepts
 // "https:host/…" and "wss:user@host"); "metadata:" and "profile:" stay text.
-const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![A-Za-z0-9])(?:https?|wss?|file|blob|data):)/gi;
+// new URL() deletes tabs and newlines anywhere, even inside the scheme
+// ("ht\ttps://"), and sanitizeText turns a tab into a space, so the scheme
+// and its ":" and "//" may have ASCII whitespace between their characters.
+const W = "[ \\t\\n\\r]*";
+const spaced = (letters) => [...letters].join(W);
+const SCHEME = `(?:${spaced("http")}(?:${W}s)?|${spaced("ws")}(?:${W}s)?|${spaced("file")})`;
+const URL_START = new RegExp(
+	`(?:${SCHEME}${W}:${W}\\/${W}\\/|(?<![A-Za-z0-9])(?:${SCHEME}|${spaced("blob")}|${spaced("data")})${W}:)`,
+	"gi",
+);
+const isData = (s) => /^data:/i.test(s.replace(/[ \t\n\r]/g, ""));
 export function redactUrls(text) {
 	const line = String(text);
 	const starts = [...line.matchAll(URL_START)];
@@ -96,8 +106,8 @@ export function redactUrls(text) {
 	let rest = line.slice(at);
 	const cut = rest.endsWith("…") ? "…" : "";
 	if (cut) rest = rest.slice(0, -1);
-	if (/^data:/i.test(rest)) return `${head}data:[redacted]${cut}`;
-	if (rest.includes("@") || starts.some((m) => /^data:/i.test(m[0]))) return `${head}[redacted URL]${cut}`;
+	if (isData(rest)) return `${head}data:[redacted]${cut}`;
+	if (rest.includes("@") || starts.some((m) => isData(m[0]))) return `${head}[redacted URL]${cut}`;
 	const query = rest.search(/[?#]/);
 	if (query < 0) return line;
 	// No "@" anywhere, so no userinfo: the first word up to the query is

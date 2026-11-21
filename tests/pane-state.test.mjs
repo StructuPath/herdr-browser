@@ -771,8 +771,10 @@ test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret",
 		if (userinfo) withUserinfo++;
 		if (query) withQuery++;
 		// Spaces may now sit inside the userinfo or the query as well.
-		const spaced = rnd(4) === 0 ? word.replace("SECRET", " SECRET") : word;
-		const out = redactUrls(`before ${spaced} after`);
+		let spaced = rnd(4) === 0 ? word.replace("SECRET", " SECRET") : word;
+		// new URL() deletes tabs anywhere, even inside the scheme.
+		if (rnd(4) === 0) spaced = spaced.replace(/^(.*?)(t)(t?ps?:|s:|s?:)/, "$1$2\t$3");
+		const out = redactUrls(sanitizeText(`before ${spaced} after`));
 		assert.doesNotMatch(out, /SECRET[UQF]/, `${spaced} -> ${out}`);
 		assert.ok(out.startsWith("before "), out);
 	}
@@ -815,4 +817,22 @@ test("pane state: a URL secret that spans words never survives (line rule)", () 
 	assert.equal(redactUrls("✖ 500 GET https://api.test/items?id=3&token=SEC"), "✖ 500 GET https://api.test/items");
 	// A line with nothing that can hide a URL secret is unchanged.
 	assert.equal(redactUrls("request <https://example.com>net::ERR_CONNECTION_REFUSED"), "request <https://example.com>net::ERR_CONNECTION_REFUSED");
+});
+
+test("pane state: a tab inside the scheme does not hide a URL (new URL() deletes it)", () => {
+	const lines = [
+		"x ht\ttps://u:SECRET@h.test/ y",
+		"x https:\t//u:SECRET@h.test/ y",
+		"x h\nttps://u:SECRET@h.test/ y",
+		"x w\ts:u:SECRET@h.test/ y",
+		"x d\tata:text/plain,SECRET y",
+		"x ht\ttps://h.test/p?token=SECRET y",
+	];
+	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
+	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
+	// Long runs of whitespace after a scheme name stay cheap.
+	const start = performance.now();
+	redactUrls(`http${" ".repeat(1_996)}`);
+	redactUrls(`http ${"s ".repeat(997)}`);
+	assert.ok(performance.now() - start < 1_000, "no catastrophic backtracking");
 });

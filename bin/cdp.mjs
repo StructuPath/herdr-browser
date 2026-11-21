@@ -39,6 +39,10 @@ function getJson(host, port, path, timeout = 5_000) {
 			(res) => {
 				let body = "";
 				res.setEncoding("utf8");
+				// Either listener settles a torn body alone; both stay on purpose,
+				// since which one fires depends on the Node version.
+				res.on("error", reject);
+				res.on("aborted", () => reject(new Error(`endpoint response aborted for ${path}`)));
 				res.on("data", (c) => {
 					body += c;
 					if (body.length > 4 * 1024 * 1024) req.destroy(new Error("oversized /json response"));
@@ -60,7 +64,7 @@ function getJson(host, port, path, timeout = 5_000) {
 	});
 }
 
-// Resolve a user-supplied endpoint — http(s)://host:port or a browser-level
+// Resolve a user-supplied endpoint — http://host:port or a browser-level
 // ws:// URL — to { wsUrl, host, port, browser (product string), pages }.
 // A pasted page-level URL (/devtools/page/<id>) is refused with a pointer at
 // the browser endpoint: Target.attachToTarget only works browser-level, and
@@ -76,11 +80,13 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 	} catch {
 		throw new Error("not an endpoint URL — use http://host:port or ws://…");
 	}
+	if (u.protocol === "https:" || u.protocol === "wss:")
+		throw new Error("TLS is not supported — use http://host:port or ws://…");
 	if (/\/devtools\/page\//.test(u.pathname))
 		throw new Error(
 			"that is a page-level DevTools URL — use the browser endpoint (http://host:port or /devtools/browser/…)",
 		);
-	if (u.protocol === "ws:" || u.protocol === "wss:") {
+	if (u.protocol === "ws:") {
 		// Raw ws endpoint: no HTTP discovery surface; identity fields best-effort.
 		return {
 			wsUrl: u.href,
@@ -92,7 +98,7 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 			rediscoverable: false,
 		};
 	}
-	if (u.protocol !== "http:" && u.protocol !== "https:")
+	if (u.protocol !== "http:")
 		throw new Error("not an endpoint URL — use http://host:port or ws://…");
 	let host = u.hostname.replace(/^\[|\]$/g, "");
 	if (!net.isIP(host)) {
@@ -240,7 +246,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 			return dead;
 		},
 		close() {
-			dead = true;
+			failAll("connection closed");
 			try {
 				ws.close();
 			} catch {
@@ -274,6 +280,10 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	let handler = null; // onMessage subscriber (the Renderer)
 	let attachTimeMs = 0;
 	let connectedOnce = false;
+	// Set by close(): a connect() still in discovery or handshake must never go
+	// on to attach, enable domains, or start a screencast on an abandoned browser.
+	let closed = false;
+	const abandoned = () => Object.assign(new Error("connection abandoned"), { code: "ABANDONED" });
 	let selection = 0;
 	let accessibilitySessionId = null;
 	let networkSessionId = null;
@@ -503,9 +513,15 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				session.close();
 				clearTarget("target_changing");
 			}
+			if (closed) throw abandoned();
 			endpoint = await discoverEndpoint(endpointInput, opts);
+			if (closed) throw abandoned();
 			session = makeCdpSession(endpoint.wsUrl, opts);
 			await session.opened;
+			if (closed) {
+				session.close();
+				throw abandoned();
+			}
 			session.onEvent(onCdpEvent);
 			session.onClose(() => emit({ type: "endpoint_gone" }));
 			await session.send("Target.setDiscoverTargets", { discover: true });
@@ -655,6 +671,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			return session.ping();
 		},
 		close() {
+			closed = true;
 			const s = session;
 			if (!s || s.dead) return;
 			// Attach-mode cleanup: stop OUR screencast, close OUR socket.

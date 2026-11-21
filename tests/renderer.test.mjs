@@ -33,6 +33,7 @@ import {
 	truthyConfig,
 } from "../bin/renderer.mjs";
 import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
+import { makeCdpBrowser } from "../bin/cdp.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -2460,6 +2461,28 @@ test("attach prompt refuses navigation-shaped input and keeps u for URLs", async
 	assert.equal(r.backend, "agent-browser", "bad input must not switch modes");
 });
 
+test("attach prompt rejects TLS endpoints without replacing the backend", async () => {
+	const r = quiet(mkRenderer());
+	r.tick = async () => {};
+	const browser = r.browser;
+	for (const scheme of ["https", "wss"]) {
+		await r.attachTo(`${scheme}://127.0.0.1:9222/devtools/browser/SECRET-TOKEN`);
+		assert.match(r.banner, /TLS is not supported/);
+		assert.ok(!r.banner.includes("SECRET-TOKEN"));
+		assert.equal(r.browser, browser);
+		assert.equal(r.backend, "agent-browser");
+	}
+});
+
+test("attach mode: configured TLS endpoints show a clear error", { skip: !canCdp }, async () => {
+	for (const scheme of ["https", "wss"]) {
+		const r = attachRenderer({ HERDR_BROWSER_CDP_URL: `${scheme}://127.0.0.1:1` });
+		assert.equal(r.backend, "attach", "configured endpoints still select attach mode");
+		assert.equal(await r.attachCdp(), false);
+		assert.match(r.banner, /TLS is not supported/);
+	}
+});
+
 test("attach switch resets reconciliation state and drops ownership", async () => {
 	const r = quiet(mkRenderer());
 	r.selfCreated = true;
@@ -2473,6 +2496,91 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	assert.deepEqual(r.consoleState, { count: 0, tail: [] });
 	assert.equal(r.lastHash, "");
 	assert.ok(r.consoleLines.some((l) => /switched to attach mode/.test(l)));
+});
+
+test("attach switch unsubscribes and closes the old CDP socket", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	const ws = {
+		closed: false,
+		send(raw) {
+			const m = JSON.parse(raw);
+			const result = m.method === "Target.getTargets"
+				? { targetInfos: [{ type: "page", targetId: "old", url: "https://old/" }] }
+				: m.method === "Target.attachToTarget" ? { sessionId: "session-old" } : {};
+			queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ id: m.id, result }) }));
+		},
+		close() { this.closed = true; this.onclose?.(); },
+	};
+	const old = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/old", {
+		wsFactory: () => { queueMicrotask(() => ws.onopen?.()); return ws; },
+	});
+	t.after(async () => { old.close(); await flush(); });
+	const onMessage = old.onMessage;
+	let unsubscribed = false;
+	old.onMessage = (fn) => { unsubscribed = fn === null; onMessage(fn); };
+	r.browser = old;
+	assert.equal(await r.attachCdp(), true);
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	ws.onmessage({ data: JSON.stringify({ method: "Target.targetDestroyed", params: { targetId: "old" } }) });
+	await flush();
+	assert.equal(unsubscribed, true);
+	assert.equal(ws.closed, true);
+	assert.equal(r.cdpTargetId, "new");
+});
+
+test("attach switch ignores queued events from the old adapter", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let late;
+	r.browser = fakeCdpBackend();
+	r.browser.onMessage = (fn) => { if (fn) late = fn; };
+	await r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	late({ type: "target_gone" });
+	late({ type: "endpoint_gone" });
+	assert.equal(r.cdpTargetId, "new");
+	assert.equal(r.attached, true);
+});
+
+test("attach switch ignores completion of an old connection", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let complete;
+	r.browser = fakeCdpBackend();
+	r.browser.connect = () => new Promise((resolve) => { complete = resolve; });
+	const connecting = r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	complete({ guid: "old", targetId: "old" });
+	assert.equal(await connecting, false);
+	assert.equal(r.cdpTargetId, "new");
+	assert.equal(r.attached, true);
+});
+
+test("attach switch ignores a late failure of an old connection", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let fail;
+	r.browser = fakeCdpBackend();
+	r.browser.connect = () => new Promise((_resolve, reject) => { fail = reject; });
+	const connecting = r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.banner = "";
+	fail(new Error("endpoint timed out"));
+	assert.equal(await connecting, false);
+	assert.equal(r.attached, true, "the new endpoint stays attached");
+	assert.equal(r.banner, "", "no banner from the abandoned endpoint");
 });
 
 test("attach mode: a Cmd+click handoff file navigates the attached target", { skip: !canCdp }, async () => {

@@ -69,6 +69,44 @@ test("discoverEndpoint sends an IP-literal Host for DNS-name input", async () =>
 	});
 });
 
+test("discoverEndpoint rejects HTTPS without sending plaintext HTTP", async () => {
+	await withStubEndpoint(async (port, seen) => {
+		const error = await discoverEndpoint(`https://127.0.0.1:${port}`).catch((err) => err);
+		assert.equal(seen.hosts.length, 0, "HTTPS must never contact a plaintext server");
+		assert.match(error?.message ?? "", /TLS is not supported/);
+	});
+});
+
+test("discoverEndpoint rejects TLS endpoints before DNS lookup", async () => {
+	for (const scheme of ["https", "wss"]) {
+		let lookups = 0;
+		await assert.rejects(discoverEndpoint(`${scheme}://devbox.local:9222/devtools/browser/secret`, {
+			lookup: async () => {
+				lookups++;
+				throw new Error("unexpected DNS lookup");
+			},
+		}), /TLS is not supported/);
+		assert.equal(lookups, 0);
+	}
+});
+
+test("discoverEndpoint rejects a partial JSON response after connection close", async (t) => {
+	const server = http.createServer((_req, res) => {
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.write('{"webSocketDebuggerUrl":');
+		setTimeout(() => res.destroy(), 20);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => { server.closeAllConnections(); server.close(); });
+	let timer;
+	t.after(() => clearTimeout(timer));
+	const state = await Promise.race([
+		discoverEndpoint(`http://127.0.0.1:${server.address().port}`).then(() => "resolved", () => "rejected"),
+		new Promise((resolve) => { timer = setTimeout(() => resolve("pending"), 5_500); }),
+	]);
+	assert.equal(state, "rejected", "response abort must settle discovery despite the lost request timeout");
+});
+
 test("discoverEndpoint refuses page-level URLs with a pointer to the browser endpoint", async () => {
 	await assert.rejects(
 		discoverEndpoint("ws://127.0.0.1:9222/devtools/page/DEADBEEF"),
@@ -160,6 +198,29 @@ test("close fails pending requests and fires onClose once", async () => {
 	const p = s.send("Browser.getVersion");
 	ws.close();
 	await assert.rejects(p, /connection closed/);
+	assert.equal(closes, 1);
+	assert.equal(s.dead, true);
+	await assert.rejects(s.send("Page.enable"), /connection closed/);
+});
+
+test("explicit close immediately rejects pending calls and fires onClose once", async () => {
+	const ws = makeFakeWs();
+	const s = makeCdpSession("ws://x/devtools/browser/1", { wsFactory: () => ws });
+	ws.open();
+	await s.opened;
+	let closes = 0;
+	s.onClose(() => closes++);
+	const pending = s.send("Page.enable", {}, undefined, 100).then(() => "resolved", (err) => err.message);
+	s.close();
+	s.close();
+	let timer;
+	const state = await Promise.race([
+		pending,
+		new Promise((resolve) => { timer = setTimeout(() => resolve("pending"), 25); }),
+	]);
+	clearTimeout(timer);
+	await pending;
+	assert.equal(state, "connection closed");
 	assert.equal(closes, 1);
 	assert.equal(s.dead, true);
 	await assert.rejects(s.send("Page.enable"), /connection closed/);
@@ -635,4 +696,34 @@ test("adapter feed: auto-attached OOPIF sessions get their own feed enabled", as
 		fake.calls("Log.enable").some((m) => m.sessionId === "sess-IFRAME"),
 		"embedded frame failures must not be silent",
 	);
+});
+
+test("adapter close during discovery or handshake never attaches to the abandoned browser", async (t) => {
+	// Discovery held open by a slow /json/version, then close() before it answers.
+	let answer;
+	const server = http.createServer((req, res) => {
+		answer = () => res.end(JSON.stringify({ Browser: "Chrome/150", webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/x` }));
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => { server.closeAllConnections(); server.close(); });
+	let sockets = 0;
+	const slow = makeCdpBrowser(`http://127.0.0.1:${server.address().port}`, {
+		wsFactory: () => { sockets++; return makeFakeCdp().ws; },
+	});
+	const connecting = slow.connect().catch((err) => err);
+	while (!answer) await new Promise((resolve) => setImmediate(resolve));
+	slow.close();
+	answer();
+	assert.equal((await connecting)?.code, "ABANDONED");
+	assert.equal(sockets, 0, "no WebSocket opens after close()");
+
+	// Handshake held open, then close() before the socket opens.
+	const fake = makeFakeCdp();
+	const pending = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", { wsFactory: () => fake.ws });
+	const handshaking = pending.connect().catch((err) => err);
+	await new Promise((resolve) => setImmediate(resolve));
+	pending.close();
+	fake.ws.onopen?.();
+	assert.equal((await handshaking)?.code, "ABANDONED");
+	assert.deepEqual(fake.sent.map((m) => m.method), [], "no CDP command reaches the abandoned browser");
 });

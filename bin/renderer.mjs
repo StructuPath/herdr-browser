@@ -874,11 +874,20 @@ export class Renderer {
 	 */
 	async attachTo(value, { note } = {}) {
 		const endpoint = String(value ?? "").trim();
+		if (/^(https|wss):\/\//i.test(endpoint)) {
+			this.banner = "TLS is not supported — use http://host:port or ws://…";
+			this.header();
+			return;
+		}
 		if (!/^(wss?|https?):\/\//i.test(endpoint)) {
 			this.banner =
 				"not an endpoint — use http://host:port or ws://… (u navigates, a attaches)";
 			this.header();
 			return;
+		}
+		if (this.backend === "attach") {
+			this.browser.onMessage(null);
+			this.browser.close?.();
 		}
 		if (this.backend === "agent-browser" && this.live) this.dropLive();
 		// Pointing the pane away from a browser it launched abandons it; kill
@@ -1091,9 +1100,13 @@ export class Renderer {
 			this.header();
 			return false;
 		}
+		const browser = this.browser;
 		try {
-			this.browser.onMessage((m) => this.onCdpMessage(m));
-			const id = await this.browser.connect();
+			browser.onMessage((m) => {
+				if (this.browser === browser) this.onCdpMessage(m);
+			});
+			const id = await browser.connect();
+			if (this.browser !== browser) return false;
 			// A reused port can front a different browser than last time; treat
 			// that as a discontinuity rather than silently continuing the feed.
 			if (this.cdpGuid && id.guid && id.guid !== this.cdpGuid) {
@@ -1130,6 +1143,7 @@ export class Renderer {
 			this.header();
 			return true;
 		} catch (err) {
+			if (this.browser !== browser) return false;
 			this.attached = false;
 			this.banner = `cannot attach to ${redactWsUrl(this.cdpEndpoint)}: ${sanitizeText(err?.message ?? "unknown error")}`;
 			this.header();

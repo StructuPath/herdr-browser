@@ -3109,3 +3109,46 @@ test("s while unattached banners instead of querying", async () => {
 	assert.match(r.banner, /no browser attached/);
 	assert.equal(r.textView, null);
 });
+
+// --- Launcher hardening: handoff completeness and one sandbox env path ---
+
+test("an empty or unterminated handoff file is left for its writer, then navigates once", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	r.attached = true;
+	const opened = [];
+	r.browser = { ...r.browser, open: async (u) => opened.push(u) };
+	r.startNavigateWatch();
+	const f = path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`);
+	fs.writeFileSync(f, "");
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, [], "an empty file is not a click");
+	assert.ok(fs.existsSync(f), "an empty file is not deleted");
+	fs.writeFileSync(f, "http://localhost:3000/pa");
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, [], "a line with no newline is still being written");
+	assert.ok(fs.existsSync(f), "a partial line is not deleted");
+	fs.writeFileSync(f, "http://localhost:3000/page\n");
+	r.consumeNavigateFile();
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, ["http://localhost:3000/page"], "the full line navigates once");
+	assert.ok(!fs.existsSync(f), "a consumed handoff is removed");
+	r.navigateWatcher?.close();
+});
+
+test("the handoff watcher ignores open.sh's temp file", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	r.attached = true;
+	const opened = [];
+	r.browser = { ...r.browser, open: async (u) => opened.push(u) };
+	r.startNavigateWatch();
+	const tmp = path.join(r.stateDir, `.navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}.abc123`);
+	fs.writeFileSync(tmp, "http://localhost:3000/tmp\n");
+	await new Promise((res) => setTimeout(res, 200));
+	await flush();
+	assert.deepEqual(opened, []);
+	assert.ok(fs.existsSync(tmp), "the watcher never touches the temp name");
+	r.navigateWatcher?.close();
+});

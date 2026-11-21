@@ -706,3 +706,25 @@ test("whitespace-only HERDR_BROWSER_CDP_URL is not attach mode (renderer parity)
 	assert.match(log(), /agent-browser --session herdr-ws-w9 open/);
 	assert.ok(!fs.existsSync(path.join(stateDir, "navigate-w9")));
 });
+
+// --- Atomic navigate handoff ---
+
+test("open replaces the handoff file atomically and leaves no temp file", () => {
+	const handoff = path.join(stateDir, "navigate-w9");
+	fs.writeFileSync(handoff, "http://localhost:3000/old\n");
+	const inodeBefore = fs.statSync(handoff).ino;
+	const r = runScript(
+		"open.sh",
+		["http://localhost:3000/new"],
+		freshEnv({ HERDR_BROWSER_LAUNCH: "1" }),
+	);
+	assert.equal(r.status, 0, r.stderr);
+	// A rename swaps in a new inode; an in-place truncate keeps the old one
+	// and exposes an empty file to the pane's watcher.
+	assert.notEqual(fs.statSync(handoff).ino, inodeBefore, "handoff is renamed into place");
+	assert.equal(fs.readFileSync(handoff, "utf8"), "http://localhost:3000/new\n");
+	assert.equal(fs.statSync(handoff).mode & 0o777, 0o600);
+	const leftovers = fs.readdirSync(stateDir).filter((n) => /navigate/.test(n) && n !== "navigate-w9");
+	assert.deepEqual(leftovers, [], "no temp file remains");
+	fs.rmSync(handoff, { force: true });
+});

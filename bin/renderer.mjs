@@ -1149,7 +1149,10 @@ export class Renderer {
 			let age = 0;
 			try {
 				age = Date.now() - fs.statSync(this.navigateFile).mtimeMs;
-				url = fs.readFileSync(this.navigateFile, "utf8").split("\n")[0].trim();
+				const text = fs.readFileSync(this.navigateFile, "utf8");
+				// Empty or unterminated: a writer is mid-write; leave it.
+				if (!text.includes("\n")) return;
+				url = text.split("\n")[0].trim();
 				fs.unlinkSync(this.navigateFile);
 			} catch {
 				return; // nothing pending

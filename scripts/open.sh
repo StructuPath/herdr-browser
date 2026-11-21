@@ -45,10 +45,21 @@ if [ -n "$url" ] && [ "$pane_owns_navigation" -eq 1 ]; then
 	fi
 	# Hand the URL to the pane, which navigates its attached or launched
 	# target. The renderer watches this file, so pickup does not wait for a
-	# backed-off poll tick.
-	handoff="$(state_dir)/navigate-$(ws_id)"
+	# backed-off poll tick. Write a private temp file in the same directory,
+	# then rename it into place: the watcher must never see a half-written
+	# (or empty) handoff. The dot-prefixed temp name never matches its filter.
+	sd="$(state_dir)"
+	handoff="$sd/navigate-$(ws_id)"
 	umask 077
-	printf '%s\n' "$url" > "$handoff"
+	if ! tmp="$(mktemp "$sd/.navigate-$(ws_id).XXXXXX")"; then
+		echo "herdr-browser: cannot create the navigate handoff in $sd" >&2
+		exit 3
+	fi
+	if ! { printf '%s\n' "$url" >"$tmp" && mv -f "$tmp" "$handoff"; }; then
+		rm -f "$tmp"
+		echo "herdr-browser: cannot write the navigate handoff $handoff" >&2
+		exit 3
+	fi
 elif [ -n "$url" ]; then
 	require_agent_browser
 	if ! validate_url "$url"; then

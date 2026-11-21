@@ -12,6 +12,8 @@ import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
 import { formatRequests, parseAgentSnapshot, diffSnapshot } from "./page-text.mjs";
 import { chromiumSandboxArgs, agentBrowserSandboxEnv } from "./chromium-args.mjs";
 
+/** @typedef {import("./backend.js").Backend} Backend */
+
 export { chromiumSandboxArgs } from "./chromium-args.mjs";
 
 const pExecFile = promisify(execFile);
@@ -435,6 +437,7 @@ export function formatNetworkFailure({ method, url, status }) {
 
 // --- agent-browser access ---
 
+/** @returns {Backend} */
 export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
 	// maxBuffer would throw on every tick and freeze the pane for good.
@@ -865,6 +868,10 @@ export class Renderer {
 	// Switch this pane to attach mode at runtime. Everything the old backend
 	// reconciled against is meaningless afterwards, so state resets and the
 	// console carries one discontinuity line.
+	/**
+	 * @param {string} value
+	 * @param {{note?: string}} [options]
+	 */
 	async attachTo(value, { note } = {}) {
 		const endpoint = String(value ?? "").trim();
 		if (!/^(wss?|https?):\/\//i.test(endpoint)) {

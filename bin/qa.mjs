@@ -107,7 +107,7 @@ export function loadScenario(file, override) {
 		if (length > MAX_CONFIG) throw new Error("scenario exceeds 64 KiB");
 		bytes = buffer.subarray(0, length);
 	} finally { fs.closeSync(fd); }
-	const parsed = JSON.parse(bytes);
+	const parsed = JSON.parse(bytes.toString("utf8"));
 	if (override !== undefined) parsed.baseUrl = override;
 	const scenario = validateScenario(parsed);
 	return { scenario, sha256: hash(JSON.stringify(scenario)) };
@@ -228,7 +228,7 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 		} },
 		git: { commit: before.commit, branch: before.branch, dirty: before.dirty, changedDuringRun: false },
 		engine: { name: "agent-browser", version: null },
-		runs: [], cleanup: { status: "passed" },
+		runs: [], cleanup: { status: "passed" }, summary: null,
 	};
 	const resultPath = path.join(outputDir, "result.json");
 	try {

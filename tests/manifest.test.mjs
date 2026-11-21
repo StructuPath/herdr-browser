@@ -46,7 +46,9 @@ test("Wave 0 drift contracts stay represented in source and hosted CI", () => {
 	assert.equal(renderer.includes(0), false);
 	assert.match(renderer.toString("utf8"), /stays passive until explicit pane input/);
 	assert.match(browsePane, /npm install -g carbonyl@next/);
-	assert.match(workflow, /run: shellcheck scripts\/\*\.sh/);
+	assert.match(workflow, /run: npm run validate/);
+	const { scripts } = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+	assert.match(scripts.validate, /shellcheck scripts\/\*\.sh/);
 });
 
 test("release version and existing action IDs remain stable", () => {

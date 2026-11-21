@@ -3355,3 +3355,124 @@ test("s while unattached banners instead of querying", async () => {
 	assert.match(r.banner, /no browser attached/);
 	assert.equal(r.textView, null);
 });
+
+// --- Review regressions: frame arrival vs paint, stale frames, retained drain ---
+
+const liveRenderer = (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const r = quiet(mkRenderer());
+	r.fitViewport = async () => false;
+	r.startNetworkTimer = () => {};
+	r.browser = { streamEnable: async () => {}, streamStatus: async () => ({ port: 9222 }) };
+	const saved = global.WebSocket;
+	let socket;
+	global.WebSocket = class {
+		constructor() { socket = this; queueMicrotask(() => this.onopen()); }
+		close() { this.closed = true; }
+	};
+	t.after(() => { r.dropLive(); global.WebSocket = saved; });
+	const send = (m) => socket.onmessage({ data: JSON.stringify(m) });
+	return { r, send };
+};
+
+test("live stream counts a frame on arrival even when the paint queue is busy", async (t) => {
+	const { r, send } = liveRenderer(t);
+	assert.equal(await r.goLive(), true);
+	r.enqueue(() => new Promise(() => {})); // a slow input ahead of the frame
+	send({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	t.mock.timers.tick(5_000);
+	assert.notEqual(r.live, null, "a frame arrived; the stream must stay live");
+});
+
+test("live stream counts a frame on arrival even while stdout is blocked", async (t) => {
+	const { r, send } = liveRenderer(t);
+	assert.equal(await r.goLive(), true);
+	r.stdoutBlocked = true;
+	send({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	await flush();
+	t.mock.timers.tick(5_000);
+	assert.notEqual(r.live, null, "a frame arrived; the stream must stay live");
+});
+
+test("dropLive discards a pending stream frame so the poll PNG stays authoritative", async (t) => {
+	const { r, send } = liveRenderer(t);
+	assert.equal(await r.goLive(), true);
+	let release;
+	r.enqueue(() => new Promise((resolve) => { release = resolve; }));
+	await flush();
+	send({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	r.dropLive("live stream dropped — polling");
+	const write = t.mock.method(fs, "writeFileSync");
+	release();
+	await r.paintQueue;
+	await flush();
+	assert.equal(write.mock.callCount(), 0, "stale stream frame never reaches disk");
+	assert.equal(r.shotFormat, "png");
+});
+
+test("attach mode: a target switch drops the pending frame but still acks it", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	let release;
+	const painted = [];
+	r.renderImage = async () => {
+		painted.push(imageDims(fs.readFileSync(r.shotJpg)).w);
+		if (painted.length === 1) await new Promise((resolve) => { release = resolve; });
+	};
+	const emit = (ackId, width) => r.browser.emit({ type: "frame", ackId, gen: 1, data: jpeg(width, 40).toString("base64") });
+	emit(1, 80);
+	await flush();
+	emit(2, 120); // pending behind the active paint
+	r.invalidateTarget();
+	r.cdpTargetId = "T2";
+	release();
+	await flush();
+	await r.paintQueue;
+	await flush();
+	assert.deepEqual(painted, [80], "the old tab's pending frame is not painted");
+	const acks = r.browser.calls.filter((c) => c.startsWith("ack:"));
+	assert.deepEqual(acks, ["ack:1:1", "ack:2:1"], "each frame acks exactly once");
+});
+
+test("attach mode: blocked stdout acks every frame, then paints only the latest after drain", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	const painted = [];
+	r.renderImage = async () => { painted.push(imageDims(fs.readFileSync(r.shotJpg)).w); };
+	r.stdoutBlocked = true;
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let id = 1; id <= 5; id++) r.browser.emit({ type: "frame", ackId: id, gen: 1, data: jpeg(80 + id, 40).toString("base64") });
+	await flush();
+	await r.paintQueue;
+	assert.equal(write.mock.callCount(), 0);
+	assert.equal(r.browser.calls.filter((c) => c.startsWith("ack:")).length, 5);
+	r.stdoutBlocked = false;
+	r.queueFrame(); // what the drain listener does
+	await flush();
+	await r.paintQueue;
+	await flush();
+	assert.deepEqual(painted, [85], "the retained latest frame paints after drain");
+	assert.equal(r.browser.calls.filter((c) => c.startsWith("ack:")).length, 5, "no duplicate acks");
+});
+
+test("a stream frame retained behind a blocked Kitty PNG paints when stdout drains", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	fakeChafa(t, r, "process.stdout.write('encoded-frame');");
+	fs.writeFileSync(r.shot, PNG_1PX);
+	out.block();
+	await r.renderImage(); // Kitty PNG path blocks stdout
+	assert.equal(r.stdoutBlocked, true);
+	const latest = jpeg(200, 100);
+	r.onStreamMessage({ type: "frame", data: latest.toString("base64") });
+	await flush();
+	await r.paintQueue;
+	out.drain();
+	await flush();
+	await r.paintQueue;
+	await flush();
+	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
+	assert.equal(out.chunks.at(-1), "encoded-frame");
+});

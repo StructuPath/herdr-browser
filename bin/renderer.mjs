@@ -686,6 +686,8 @@ export class Renderer {
 		this.paintQueue = Promise.resolve();
 		this.framePaint = false;
 		this.pendingFrame = null;
+		this.framesReceived = 0;
+		this.streamEpoch = 0; // dropLive bumps it; pending stream frames go stale
 		this.paintErrors = 0;
 		this.chafaFails = 0;
 		this.chafaCooldownUntil = 0;
@@ -757,9 +759,13 @@ export class Renderer {
 	// Schedule the next paint after queued input, never ahead of it.
 	queueFrame(message, ack) {
 		if (message) {
+			// Liveness and failure-poll cadence follow arrival, not paint: a
+			// blocked or busy queue must not read as a stream that sent nothing.
+			this.framesReceived++;
+			this.networkIdleTicks = 0;
 			this.pendingFrame ??= { acks: [] };
 			Object.assign(this.pendingFrame, {
-				message, browser: this.browser, revision: this.inputRevision,
+				message, browser: this.browser, revision: this.inputRevision, epoch: this.streamEpoch,
 			});
 			if (ack) this.pendingFrame.acks.push(ack);
 		}
@@ -770,7 +776,10 @@ export class Renderer {
 			const frame = this.pendingFrame;
 			this.pendingFrame = null;
 			try {
-				if (frame.browser !== this.browser || frame.revision !== this.inputRevision) return;
+				// A frame from a dropped stream must not repaint over the poll
+				// path's PNG (handshake frames precede this.live, so use an epoch).
+				if (frame.browser !== this.browser || frame.revision !== this.inputRevision ||
+					frame.epoch !== this.streamEpoch) return;
 				if (this.stdoutBlocked) {
 					// Retain the latest image for drain, but settle skipped CDP acks.
 					this.pendingFrame = { ...frame, acks: [] };
@@ -791,7 +800,6 @@ export class Renderer {
 				this.shotFormat = "jpg";
 				if (this.backend === "attach") this.lastFrameMeta = frame.message.metadata ?? null;
 				this.frameSeq++;
-				this.networkIdleTicks = 0;
 				await this.renderImage();
 				if (!this.textView) await this.fitViewport(dims.w, dims.h);
 			} finally {
@@ -2263,7 +2271,7 @@ export class Renderer {
 		const port = Number(status?.port);
 		if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
 		let ws;
-		const initialFrameSeq = this.frameSeq;
+		const initialFrames = this.framesReceived;
 		try {
 			ws = new WebSocket(`ws://127.0.0.1:${port}`);
 		} catch {
@@ -2306,7 +2314,7 @@ export class Renderer {
 		this.live = { ws };
 		const live = this.live;
 		live.firstFrameTimer = setTimeout(() => {
-			if (this.live === live && this.frameSeq === initialFrameSeq) {
+			if (this.live === live && this.framesReceived === initialFrames) {
 				this.dropLive("live stream sent no image — polling");
 			}
 		}, 5_000);
@@ -2324,6 +2332,7 @@ export class Renderer {
 		// First: a timer poll must not fire into the poll-mode transition and
 		// race tick's poll over the same diff state.
 		this.stopNetworkTimer();
+		this.streamEpoch++;
 		const wasLive = !!this.live;
 		if (this.live) {
 			clearTimeout(this.live.firstFrameTimer);

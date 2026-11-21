@@ -766,6 +766,7 @@ export class Renderer {
 		// while set; lastSnapshot backs the diff key.
 		this.textView = null;
 		this.lastSnapshot = null;
+		this.pageRevision = 0; // bumped by a reload, tab switch, or target reset
 		this.pasteState = null;
 		this.inputRevision = 0;
 		this.cdpTargetId = null;
@@ -1424,6 +1425,7 @@ export class Renderer {
 
 	invalidateTarget() {
 		this.inputRevision++;
+		this.pageRevision++;
 		this.cdpTargetId = null;
 		this.promptState = null;
 		this.lastFrameMeta = null;
@@ -2289,13 +2291,16 @@ export class Renderer {
 						: this.browser.networkRequests;
 				if (typeof fn !== "function")
 					throw new Error(`${mode} not supported in ${this.backendName}`);
+				const page = this.pageIdentity();
 				const res = await fn.call(this.browser);
 				if (!res || !Array.isArray(res.lines)) throw new Error("no data");
+				// The request table is a session log; a snapshot is one page's.
+				if (mode === "snapshot" && !this.samePage(page)) return this.pageChanged();
 				this.textView = {
 					mode,
 					title: res.title ?? "",
 					lines: res.lines,
-					url: this.lastUrl,
+					url: page.url,
 				};
 				if (mode === "snapshot") this.lastSnapshot = res.lines;
 				await this.redrawAll();
@@ -2306,11 +2311,28 @@ export class Renderer {
 		}, { pageInput: false });
 	}
 
+	// A snapshot or diff query answers for the page it was asked about. If the
+	// page navigated, reloaded, or changed tab (or the browser changed) while
+	// it ran, the answer describes a page that is no longer on screen.
+	pageIdentity() {
+		return { browser: this.browser, revision: this.pageRevision, url: this.lastUrl };
+	}
+
+	samePage(page) {
+		return page.browser === this.browser && page.revision === this.pageRevision && page.url === this.lastUrl;
+	}
+
+	pageChanged() {
+		this.banner = "page changed while reading it — press the key again";
+		this.header();
+	}
+
 	// A navigation invalidates a captured snapshot/diff (the request table is
 	// a session log and survives): drop it so a stale page is never shown as
 	// the current one. Every URL source calls this — poll, stream, and CDP.
 	// force: a reload or tab switch is new content even at an unchanged URL.
 	dropStaleTextView({ force = false } = {}) {
+		if (force) this.pageRevision++;
 		const tv = this.textView;
 		if (!tv || tv.mode === "network" || (!force && tv.url === this.lastUrl)) return;
 		this.textView = null;
@@ -2357,14 +2379,17 @@ export class Renderer {
 			try {
 				if (typeof this.browser.snapshotText !== "function")
 					throw new Error(`snapshot not supported in ${this.backendName}`);
+				const page = this.pageIdentity();
+				const baseline = this.lastSnapshot;
 				const res = await this.browser.snapshotText();
 				if (!res || !Array.isArray(res.lines)) throw new Error("no data");
-				const diff = diffSnapshot(this.lastSnapshot, res.lines);
+				if (!this.samePage(page) || this.lastSnapshot !== baseline) return this.pageChanged();
+				const diff = diffSnapshot(baseline, res.lines);
 				this.textView = {
 					mode: "diff",
 					title: diff.title ?? "",
 					lines: diff.lines,
-					url: this.lastUrl,
+					url: page.url,
 				};
 				await this.redrawAll();
 			} catch (err) {

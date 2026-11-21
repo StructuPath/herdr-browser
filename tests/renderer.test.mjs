@@ -4180,3 +4180,42 @@ exec sleep 30
 		else process.env.CI = savedCi;
 	}
 });
+
+test("text view: a snapshot or diff that finishes after a page change is discarded", async () => {
+	const pending = (r) => {
+		let answer;
+		r.browser = { snapshotText: () => new Promise((resolve) => { answer = resolve; }) };
+		return () => answer({ title: "old page", lines: ['@e1 [button] "Old"'] });
+	};
+	for (const [name, change] of [
+		["navigation", (r) => r.onCdpMessage({ type: "url", url: "https://b/" })],
+		["same-URL reload", (r) => r.onCdpMessage({ type: "document", url: "https://a/" })],
+		["tab switch", (r) => r.onCdpMessage({ type: "target_selected", targetId: "T2", url: "https://a/", title: "A" })],
+	]) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		r.lastUrl = "https://a/";
+		const finish = pending(r);
+		r.feed("s");
+		await flush();
+		change(r);
+		finish();
+		await flush();
+		assert.equal(r.textView, null, `${name}: the old page's snapshot is not shown`);
+		assert.equal(r.lastSnapshot, null, `${name}: nor kept as the diff baseline`);
+		assert.match(r.banner, /page changed/);
+	}
+	// A diff whose browser changed mid-query is discarded the same way.
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.lastUrl = "https://a/";
+	r.lastSnapshot = ['@e1 [button] "A"'];
+	const finish = pending(r);
+	r.feed("d");
+	await flush();
+	r.browser = { ...r.browser };
+	finish();
+	await flush();
+	assert.equal(r.textView, null);
+	assert.match(r.banner, /page changed/);
+});

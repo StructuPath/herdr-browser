@@ -280,10 +280,14 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	let handler = null; // onMessage subscriber (the Renderer)
 	let attachTimeMs = 0;
 	let connectedOnce = false;
-	// Set by close(): a connect() still in discovery or handshake must never go
-	// on to attach, enable domains, or start a screencast on an abandoned browser.
+	// Set by close(): a connect() still setting up must never go on to attach,
+	// enable domains, or start a screencast on an abandoned browser. Every
+	// awaited setup step is followed by stillOpen().
 	let closed = false;
 	const abandoned = () => Object.assign(new Error("connection abandoned"), { code: "ABANDONED" });
+	const stillOpen = () => {
+		if (closed) throw abandoned();
+	};
 	let selection = 0;
 	let accessibilitySessionId = null;
 	let networkSessionId = null;
@@ -336,6 +340,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	// and observing a run must not be able to change its outcome.
 	const enableFeed = async (sessionId) => {
 		await session.send("Log.enable", {}, sessionId);
+		stillOpen();
 		if (consoleTier !== "log-only")
 			await session.send("Runtime.enable", {}, sessionId);
 	};
@@ -348,13 +353,16 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			targetId,
 			flatten: true,
 		});
+		stillOpen();
 		if (version !== selection || pinnedTargetId !== targetId) {
 			await session.send("Target.detachFromTarget", { sessionId }).catch(() => {});
 			throw targetError();
 		}
 		pageSessionId = sessionId;
 		await session.send("Page.enable", {}, sessionId);
+		stillOpen();
 		await enableFeed(sessionId);
+		stillOpen();
 		// Events-only auto-attach: OOPIFs and workers deliver their console and
 		// network failures on their own sessions, and a broken embedded frame
 		// with a silent console is exactly the case this feature exists for.
@@ -368,6 +376,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		} catch {
 			/* older engines: page-level feed only */
 		}
+		stillOpen();
 		requireTarget(sessionId);
 		emit({ type: "target_selected", targetId, url: target.url, title: target.title });
 		try {
@@ -519,9 +528,9 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				session.close();
 				clearTarget("target_changing");
 			}
-			if (closed) throw abandoned();
+			stillOpen();
 			endpoint = await discoverEndpoint(endpointInput, opts);
-			if (closed) throw abandoned();
+			stillOpen();
 			session = makeCdpSession(endpoint.wsUrl, opts);
 			await session.opened;
 			if (closed) {
@@ -531,12 +540,15 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			session.onEvent(onCdpEvent);
 			session.onClose(() => emit({ type: "endpoint_gone" }));
 			await session.send("Target.setDiscoverTargets", { discover: true });
+			stillOpen();
 			const pages = await pageTargets();
+			stillOpen();
 			attachTimeMs = Date.now();
 			const target = !connectedOnce && pages.length === 1 ? pages[0]
 				: previousGuid && previousGuid === endpoint.guid ? pages.find((p) => p.targetId === previousTarget) : null;
 			connectedOnce = true;
 			if (target) await pinTarget(target);
+			stillOpen();
 			return {
 				host: endpoint.host,
 				port: endpoint.port,

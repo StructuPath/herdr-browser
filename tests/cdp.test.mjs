@@ -737,3 +737,24 @@ test("adapter reports a new main-frame document, including a same-URL reload", a
 	navigated({ id: "F1", url: "https://x/" }, "sess-other"); // another target's session
 	assert.deepEqual(got.filter((m) => m.type === "document").map((m) => m.url), ["https://x/"]);
 });
+
+test("adapter close during target setup stops before any further CDP command", async () => {
+	// Page.enable and the close-time stopScreencast both hang: setup must not
+	// carry on to the feed or the screencast once the adapter is closed.
+	const fake = makeFakeCdp({ results: { "Page.enable": null, "Page.stopScreencast": null } });
+	const b = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", {
+		wsFactory: () => {
+			queueMicrotask(() => fake.ws.onopen?.());
+			return fake.ws;
+		},
+	});
+	const connecting = b.connect().catch((err) => err);
+	while (!fake.calls("Page.enable").length) await new Promise((r) => setImmediate(r));
+	b.close();
+	const before = fake.sent.length;
+	fake.deliver({ id: fake.calls("Page.enable")[0].id, result: {} });
+	assert.equal((await connecting)?.code, "ABANDONED");
+	const after = fake.sent.slice(before).map((m) => m.method);
+	for (const method of ["Log.enable", "Runtime.enable", "Target.setAutoAttach", "Page.startScreencast"])
+		assert.ok(!after.includes(method), `${method} sent after close`);
+});

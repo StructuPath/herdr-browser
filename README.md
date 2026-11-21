@@ -65,10 +65,12 @@ npm install -g agent-browser
 agent-browser install
 ```
 
-For ANSI image rendering on macOS:
+For ANSI image rendering, install chafa (`npm run doctor` prints the command
+for your platform):
 
 ```sh
-brew install chafa
+brew install chafa        # macOS
+sudo apt install chafa    # Debian/Ubuntu (or: dnf install chafa, pacman -S chafa)
 ```
 
 ## Install

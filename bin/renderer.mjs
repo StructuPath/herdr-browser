@@ -107,6 +107,19 @@ export function truthyConfig(value) {
 	return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
 }
 
+// User-facing platform wording: the link-handoff modifier and how to get
+// chafa. Herdr opens links with Cmd+click on macOS and Ctrl+click elsewhere.
+export function linkClickLabel(platform = process.platform) {
+	return platform === "darwin" ? "Cmd+click" : "Ctrl+click";
+}
+
+export function chafaInstallHint(platform = process.platform) {
+	if (platform === "darwin") return "brew install chafa";
+	if (platform === "linux")
+		return "sudo apt install chafa (or: dnf install chafa, pacman -S chafa)";
+	return "see https://hpjansson.org/chafa/download/";
+}
+
 // Text rows a page text view shows between its title row and footer: the
 // footer row is only spent when the text does not fit.
 function textViewBodyRows(total, imageRows) {
@@ -1435,15 +1448,15 @@ export class Renderer {
 			);
 		} else {
 			// Every advertised key is handled in both backends (a and l work
-			// everywhere); t only moves targets on an attach backend. An open
-			// text view shows its paging keys.
+			// everywhere); t only moves targets on an attach backend, so it is
+			// advertised only there. An open text view shows its paging keys.
 			const tv = this.textView;
 			const help = tv
 				? ` ${tv.mode === "diff" ? "diff" : tv.mode === "network" ? "requests" : "snapshot"}  j/k:line  space/b PgUp/PgDn:page  g/G:top/end  ${{ snapshot: "s", network: "n", diff: "d" }[tv.mode]}/Esc:close  q:quit`
 				: this.observeOnly
-					? " observe-only  t:tabs  s:snap  n:reqs  d:diff  o:enable-input  q:quit"
+					? ` observe-only  ${this.backend === "attach" ? "t:tabs  " : ""}s:snap  n:reqs  d:diff  o:enable-input  q:quit`
 					: this.backend === "attach"
-						? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
+						? " t:tabs  i:type  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
 						: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  s:snap  n:reqs  d:diff  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
@@ -1705,15 +1718,7 @@ export class Renderer {
 				// A held banner names a real failure (launch mode); repainting
 				// generic waiting advice over it would erase the explanation.
 				if (Date.now() < this.bannerHoldUntil) return;
-				// A missing binary is not 'session not started yet' — the waiting
-				// advice below can never fix it, so say what's actually wrong.
-				// In a launch workspace the accurate advice is to retry the
-				// launch — a click also retries it (see startNavigateWatch).
-				this.banner = this.launchConfigured
-					? "Chromium launch failed — press l or Cmd+click a localhost link to retry"
-					: this.agentBrowser
-						? `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`
-						: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
+				this.banner = this.notAttachedBanner();
 				this.header();
 				return;
 			}
@@ -2001,13 +2006,38 @@ export class Renderer {
 		this.header();
 	}
 
+	// The one not-attached advice, shared by the waiting tick and by keys that
+	// need a browser (t, s, n, d), so both always say the same thing.
+	notAttachedBanner() {
+		// Attach mode: the banner already names the endpoint's state.
+		if (this.backend === "attach")
+			return this.banner || "no browser endpoint attached — press a to attach or l to launch";
+		// A missing binary is not 'session not started yet' — the waiting
+		// advice can never fix it, so say what's actually wrong. In a launch
+		// workspace the accurate advice is to retry the launch — a click also
+		// retries it (see startNavigateWatch).
+		const click = linkClickLabel();
+		return this.launchConfigured
+			? `Chromium launch failed — press l or ${click} a localhost link to retry`
+			: this.agentBrowser
+				? `waiting for session "${this.session}" — ${click} a localhost link or have your agent use --session ${this.session}`
+				: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
+	}
+
+	showNotAttached() {
+		// Same rule as the tick: a held failure or an in-flight launch owns
+		// the banner, and generic advice must not paint over it.
+		if (Date.now() >= this.bannerHoldUntil && !this.launchingChromium)
+			this.banner = this.notAttachedBanner();
+		this.header();
+	}
+
 	// s/n/d: on-demand page text views (snapshot tree, request table, snapshot
 	// diff). Read-only queries — they never drive the page, so they are allowed
 	// in observe-only mode and never claim page input.
 	textViewKey(ch) {
 		if (!this.attached) {
-			this.banner = "no browser attached — press l or open a localhost link";
-			this.header();
+			this.showNotAttached();
 			return;
 		}
 		const mode = ch === "d" ? "diff" : ch === "s" ? "snapshot" : "network";
@@ -2139,6 +2169,10 @@ export class Renderer {
 		// An open text view owns the paging keys (j/k, space/b, PgUp/PgDn,
 		// g/G, Esc) — they move the text, not the page behind it.
 		if (this.textView && this.textViewNav(ch)) return;
+		if (ch === "t" && !this.attached) {
+			this.showNotAttached();
+			return;
+		}
 		if (
 			this.observeOnly &&
 			["u", "i", "b", "f", "r", "j", "k", " "].includes(ch)
@@ -2644,7 +2678,7 @@ export class Renderer {
 			this.consoleLines.push(
 				this.chafa
 					? "text mode (set render config to kitty/symbols for screenshots)"
-					: "chafa not found — text-only mode. Install: brew install chafa",
+					: `chafa not found — text-only mode. Install: ${chafaInstallHint()}`,
 			);
 		}
 		await this.redrawAll();

@@ -19,6 +19,8 @@ import {
 	parseSgrMouse,
 	mapClickToPage,
 	sanitizeText,
+	linkClickLabel,
+	chafaInstallHint,
 	Renderer,
 	makeBrowser,
 	pollDelay,
@@ -3104,10 +3106,11 @@ test("d without a prior snapshot banners and leaves no stale view", async () => 
 
 test("s while unattached banners instead of querying", async () => {
 	const r = quiet(mkRenderer());
+	r.agentBrowser = true;
 	r.browser = { snapshotText: async () => ({ title: "t", lines: [] }) };
 	r.feed("s");
 	await flush();
-	assert.match(r.banner, /no browser attached/);
+	assert.match(r.banner, /waiting for session "hb-test"/);
 	assert.equal(r.textView, null);
 });
 
@@ -3306,4 +3309,44 @@ test("text view: the help line names the view keys", () => {
 	assert.match(out, /g\/G/);
 	assert.match(out, /s\/Esc:close/);
 	assert.doesNotMatch(out, /scroll/);
+});
+
+test("help: t:tabs only in attach mode, and i has one label", () => {
+	const help = (setup) => {
+		const r = quiet(mkRenderer());
+		setup(r);
+		return captureStdout(() => Renderer.prototype.renderBottom.call(r));
+	};
+	assert.doesNotMatch(help((r) => { r.observeOnly = true; }), /t:tabs/, "agent-browser observe-only");
+	assert.match(help((r) => { r.observeOnly = true; r.backend = "attach"; }), /t:tabs/);
+	const ab = help(() => {});
+	const attach = help((r) => { r.backend = "attach"; });
+	assert.doesNotMatch(ab + attach, /i:text/);
+	assert.match(ab, /i:type/);
+	assert.match(attach, /i:type/);
+});
+
+test("banners: t, s, n and d while unattached show the same waiting advice as the tick", async () => {
+	const r = quiet(mkRenderer());
+	r.agentBrowser = true;
+	r.browser = { sessionExists: async () => false, snapshotText: async () => ({ title: "t", lines: [] }) };
+	await r.tick();
+	const waiting = r.banner;
+	assert.match(waiting, /--session hb-test/, "the agent path is part of the advice");
+	assert.ok(waiting.includes(linkClickLabel()), "the click hint names this platform's modifier");
+	for (const key of ["t", "s", "n", "d"]) {
+		r.banner = "";
+		r.feed(key);
+		await flush();
+		assert.equal(r.banner, waiting, `${key} while unattached`);
+		assert.equal(r.textView, null);
+	}
+});
+
+test("platform hints: Cmd+click on macOS, Ctrl+click elsewhere; chafa install advice per platform", () => {
+	assert.equal(linkClickLabel("darwin"), "Cmd+click");
+	assert.equal(linkClickLabel("linux"), "Ctrl+click");
+	assert.match(chafaInstallHint("darwin"), /brew install chafa/);
+	assert.doesNotMatch(chafaInstallHint("linux"), /brew/);
+	assert.match(chafaInstallHint("linux"), /apt install chafa/);
 });

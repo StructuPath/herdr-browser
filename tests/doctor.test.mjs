@@ -34,3 +34,10 @@ test("doctor checks explicit Chromium executability and configuration files", ()
 		readConfig: (name) => ({ launch: "true", chromium: "/custom/chrome" })[name] || "",
 	})), []);
 });
+
+test("doctor gives platform-appropriate chafa install advice", () => {
+	const detail = (platform) => check({}, ["herdr", "agent-browser"], { platform }).find((c) => c.name === "Image rendering").detail;
+	assert.match(detail("darwin"), /brew install chafa/);
+	assert.doesNotMatch(detail("linux"), /brew/);
+	assert.match(detail("linux"), /apt install chafa/);
+});

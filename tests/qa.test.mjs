@@ -338,3 +338,22 @@ test("QA validation rejects non-string and prototype step types by index", () =>
 			/^steps\[1\] \(type "[^"]*"\): unknown step type/.test(error.message));
 	}
 });
+
+test("QA redaction matches a fill value whole even when it contains the marker", async (t) => {
+	const f = fixture(t, { steps: [{ type: "navigate", path: "/" },
+		{ type: "fill", selector: "#pw", value: "[redacted]hunter2" },
+		{ type: "fill", selector: "#short", value: "e" },
+		{ type: "assertText", selector: "h1", contains: "Welcome" }] });
+	const factory = fakeFactory([]);
+	const result = await runQa({ ...f, engineFactory: (options) => {
+		const engine = factory(options);
+		return async (args, opts) => {
+			// No "e" in the message: the short fill value "e" would redact it (accepted).
+			if (args[0] === "get") throw new Error("got [redacted]hunter2 and [redacted]");
+			return engine(args, opts);
+		};
+	} });
+	const json = JSON.stringify(result);
+	assert.doesNotMatch(json, /hunter2/);
+	assert.equal(result.runs[0].steps[3].error, "got [redacted] and [redacted]");
+});

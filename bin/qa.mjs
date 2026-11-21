@@ -226,7 +226,11 @@ export async function runQa({ config, repo, output, baseUrl: override, binary = 
 	const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	// One pass, longest value first; the marker itself is matched first and kept, so a
 	// second pass (after sanitizing) never redacts inside an earlier marker.
-	const pattern = fillValues.length ? new RegExp([escape(MARK), ...fillValues.filter(Boolean).map(escape)].join("|"), "g") : null;
+	// Longest alternative first, the marker included: a fill value that contains
+	// "[redacted]" must still match whole, and a shorter value such as "e" must
+	// not break up a marker that is already there.
+	const alternatives = [MARK, ...fillValues.filter(Boolean)].sort((a, b) => b.length - a.length);
+	const pattern = fillValues.length ? new RegExp(alternatives.map(escape).join("|"), "g") : null;
 	const redact = (value) => pattern ? String(value ?? "").replace(pattern, () => MARK) : String(value ?? "");
 	const text = (value) => clip(redact(value), 2000);
 	// Sanitizing can join fragments of a fill value; redact again afterward.

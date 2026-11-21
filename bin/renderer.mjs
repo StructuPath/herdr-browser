@@ -361,6 +361,12 @@ export function viewportForPane(frameWidth, { cols, imageRows }) {
 // Seen-set membership means "already reported OR resolved to a non-failure
 // status": an in-flight request must stay classifiable until its status
 // lands, or a 500 arriving one poll late would be swallowed forever.
+// Failure dedupe window, shared by the poll feed and attach-mode log entries.
+const NETWORK_DEDUPE_WINDOW_MS = 60_000;
+// Attach mode has no per-poll prune; a burst of unique failing URLs inside
+// one window must not grow the dedupe map without bound either.
+const NETWORK_DEDUPE_MAX_KEYS = 1_000;
+
 export function newNetworkState() {
 	return {
 		seen: new Set(), // requestIds reported or resolved 2xx/3xx
@@ -370,7 +376,7 @@ export function newNetworkState() {
 
 export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
 	const ageThresholdMs = opts.ageThresholdMs ?? 15_000;
-	const dedupeWindowMs = opts.dedupeWindowMs ?? 60_000;
+	const dedupeWindowMs = opts.dedupeWindowMs ?? NETWORK_DEDUPE_WINDOW_MS;
 	const maxPerPoll = opts.maxPerPoll ?? 5;
 	const currentIds = new Set();
 	const candidates = [];
@@ -1311,9 +1317,18 @@ export class Renderer {
 		if (entry.source === "network") {
 			const key = `log ${entry.url} ${entry.text}`;
 			const now = Date.now();
-			const last = this.networkState.recent.get(key);
-			this.networkState.recent.set(key, now);
-			if (last !== undefined && now - last <= 60_000) return;
+			const recent = this.networkState.recent;
+			const last = recent.get(key);
+			// Re-insert so Map order is last-touch order: expired and overflow
+			// keys are then always at the front.
+			recent.delete(key);
+			recent.set(key, now);
+			for (const [k, t] of recent) {
+				if (now - t <= NETWORK_DEDUPE_WINDOW_MS && recent.size <= NETWORK_DEDUPE_MAX_KEYS)
+					break;
+				recent.delete(k);
+			}
+			if (last !== undefined && now - last <= NETWORK_DEDUPE_WINDOW_MS) return;
 		}
 		const hadConsole = this.consoleLines.length > 0;
 		this.pushConsole(

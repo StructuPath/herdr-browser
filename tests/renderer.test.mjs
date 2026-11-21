@@ -3215,3 +3215,43 @@ test("closeOwnSession: a close that ignores SIGTERM cannot hold quit past its ti
 	}
 });
 
+test("attach network dedupe expires keys past the window and caps the map", (t) => {
+	t.mock.timers.enable({ apis: ["Date"], now: 0 });
+	const r = quiet(mkRenderer());
+	r.queueConsolePaint = () => {};
+	const failure = (n) => ({
+		source: "network",
+		level: "error",
+		text: "failed",
+		url: `http://localhost/request/${n}`,
+	});
+	// One unique failure per simulated second for 10,000 seconds: only the
+	// last 60-second window may stay in the map.
+	for (let n = 0; n < 10_000; n++) {
+		t.mock.timers.setTime(n * 1_000);
+		r.pushLogEntry(failure(n));
+	}
+	assert.ok(
+		r.networkState.recent.size <= 61,
+		`expired keys must go (size ${r.networkState.recent.size})`,
+	);
+	// A burst inside one instant cannot grow the map without bound either.
+	for (let n = 0; n < 5_000; n++) r.pushLogEntry(failure(`burst-${n}`));
+	assert.ok(
+		r.networkState.recent.size <= 1_000,
+		`map must be capped (size ${r.networkState.recent.size})`,
+	);
+	// Dedupe itself still works: a repeat inside the window is suppressed,
+	// a repeat after the window paints again.
+	r.networkState.recent.clear();
+	r.consoleLines = [];
+	t.mock.timers.setTime(20_000_000);
+	r.pushLogEntry(failure("again"));
+	t.mock.timers.setTime(20_030_000);
+	r.pushLogEntry(failure("again"));
+	assert.equal(r.consoleLines.length, 1, "repeat inside the window is suppressed");
+	t.mock.timers.setTime(20_200_000);
+	r.pushLogEntry(failure("again"));
+	assert.equal(r.consoleLines.length, 2, "repeat after the window paints again");
+});
+

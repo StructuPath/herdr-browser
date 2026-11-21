@@ -410,6 +410,104 @@ echo "my-agent-session" \
   > "$(herdr plugin config-dir structupath.browser)/session"
 ```
 
+## For agents: reading the pane
+
+The pane publishes what it observes to a private state file, and
+`bin/hb.mjs` reads it back. A coding agent in the same Herdr workspace can
+learn the page URL and title, the backend, the observe-only latch, the last
+console lines and failed requests, and which session or endpoint to drive.
+Run it from the agent's shell; `HERDR_WORKSPACE_ID` (set by Herdr in every
+pane) selects the workspace.
+
+```sh
+HB="/path/to/herdr-browser/bin/hb.mjs"   # the linked or installed plugin checkout
+
+node "$HB" status --json    # full pane state as one JSON object
+node "$HB" status           # the same, as aligned text
+node "$HB" session --json   # {"session","source","backend","endpoint"}
+node "$HB" session          # session name, plus host:port in attach mode
+node "$HB" help
+```
+
+`hb session` prints the agent-browser session name. When the pane is attached
+to a CDP endpoint (attach mode or a Chromium it launched), it also prints the
+endpoint as `host:port` and a ready command:
+
+```sh
+agent-browser --session herdr-ws-w1 connect http://127.0.0.1:9222
+```
+
+With a live pane, `hb session` reports the pane's own session (`"source":
+"pane"`). Without one, it derives the name exactly as the pane would
+(`"source": "derived"`, same precedence as [Session model](#session-model)).
+The agent's shell does not get `HERDR_PLUGIN_CONFIG_DIR`, so a derived name
+ignores a configured `session` file unless you export it first:
+
+```sh
+export HERDR_PLUGIN_CONFIG_DIR="$(herdr plugin config-dir structupath.browser)"
+```
+
+### Pane state file
+
+The renderer writes `pane-<workspace-id>.json` in the plugin state directory
+(`HERDR_PLUGIN_STATE_DIR`, mode `0700`). It writes atomically (temporary file,
+then rename) with mode `0600`, only when the observable state changes — never
+per frame — and deletes the file when the pane exits. When
+`HERDR_PLUGIN_STATE_DIR` is unset, `hb` looks in
+`$XDG_STATE_HOME/herdr/plugins/structupath.browser` (if set), then
+`~/.local/state/herdr/plugins/structupath.browser`, then
+`~/.local/state/herdr-browser`, and uses the first live pane.
+
+Schema version 1 (`hb status --json` prints exactly this object):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schemaVersion` | number | `1`. Bumped on any incompatible change. |
+| `backend` | string | `"agent-browser"` or `"attach"`. A Chromium launched with `l` is `"attach"`. |
+| `session` | string | The agent-browser session name the pane uses. |
+| `endpoint` | string \| null | CDP `host:port` in attach mode; `null` for agent-browser. Never a path or token. |
+| `attached` | boolean | The pane is connected to its session or endpoint now. |
+| `url` | string | Current page URL (sanitized). |
+| `title` | string | Current page title (sanitized). |
+| `observeOnly` | boolean | The `o` latch: pane input is not forwarded. |
+| `consoleTail` | string[] | Last 20 console lines as the pane shows them (sanitized). |
+| `failures` | string[] | Last 20 failed-request lines (sanitized). |
+| `updatedAt` | string | ISO 8601 time of the last write. |
+| `pid` | number | The renderer's process id. |
+
+```json
+{
+  "schemaVersion": 1,
+  "backend": "attach",
+  "session": "herdr-ws-w1",
+  "endpoint": "127.0.0.1:9222",
+  "attached": true,
+  "url": "http://localhost:3000/",
+  "title": "My app",
+  "observeOnly": false,
+  "consoleTail": ["✖ Uncaught TypeError: x is undefined"],
+  "failures": ["500 GET http://localhost:3000/api/items"],
+  "updatedAt": "2026-11-21T17:04:05.123Z",
+  "pid": 41234
+}
+```
+
+Page-controlled strings (URL, title, console, failures) pass through the same
+control-character sanitizer as the pane header, so printing them cannot inject
+terminal escapes. A file whose `pid` is no longer running counts as no pane.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | A pane file exists but cannot be read or parsed (`{"status":"error",...}` with `--json`). |
+| `2` | Usage error: unknown command or flag. |
+| `3` | `hb status` only: no live pane for this workspace (`{"status":"no-pane"}` with `--json`). |
+
+`hb session` never exits `3`: an agent can drive agent-browser before the
+pane opens.
+
 ## Recording
 
 Recording captures the workspace's **agent-browser session**. Attach and
@@ -488,6 +586,8 @@ Environment variables take precedence over config files.
 - Workspace identifiers are sanitized before they are used in state paths.
 - Polling frames are cached as PNG; streamed frames are cached as JPEG. Frame
   files are mode `0600` and removed when the pane exits.
+- The pane state file (`pane-<workspace-id>.json`) is mode `0600`, holds no
+  endpoint path or token (only `host:port`), and is removed when the pane exits.
 - Recording bundles use private directories (`0700`) and files (`0600`), and session names are metadata only—never path components.
 - WebM recordings are intentionally retained under the plugin state directory.
 - Browser sessions are a trusted local boundary: any local process that knows a

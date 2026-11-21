@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Publish the pane's observed state for the coding agent beside it: the
+  renderer writes `pane-<workspace-id>.json` (schema version 1, mode `0600`,
+  atomic, only on change, removed on exit) with backend, session, CDP
+  `host:port`, URL, title, observe-only, and the last 20 console and
+  failed-request lines. Add `bin/hb.mjs`: `hb status [--json]` reads it (exit 3
+  and `{"status":"no-pane"}` when no live pane), `hb session [--json]` names the
+  session and endpoint to drive. See README "For agents: reading the pane".
 - Add an on-demand page text view: press `s` for the accessibility-tree
   snapshot (interactive elements carry `@eN` refs), `n` for the full recent
   request table, and `d` for a ref-normalized diff against the last snapshot.

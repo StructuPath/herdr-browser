@@ -31,6 +31,8 @@ import {
 	findChromium,
 	chromiumSandboxArgs,
 	truthyConfig,
+	execFileBounded,
+	capLength,
 } from "../bin/renderer.mjs";
 import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
 import { makeCdpBrowser } from "../bin/cdp.mjs";
@@ -3216,4 +3218,182 @@ test("s while unattached banners instead of querying", async () => {
 	await flush();
 	assert.match(r.banner, /no browser attached/);
 	assert.equal(r.textView, null);
+});
+
+// --- Lifecycle and bounded memory ---
+
+// A child that ignores SIGTERM: `trap '' TERM` survives the exec, so the
+// sleep itself ignores SIGTERM and only SIGKILL ends it. It writes its pid
+// first so a test can check (and clean up) the exact process.
+const sigtermIgnoringScript = (seconds = 30) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-stubborn-"));
+	const bin = path.join(dir, "stubborn");
+	const pidFile = path.join(dir, "pid");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+trap '' TERM
+echo $$ > ${JSON.stringify(pidFile)}
+exec /bin/sleep ${seconds}
+`,
+		{ mode: 0o755 },
+	);
+	return { bin, pidFile };
+};
+const readPid = (file) => {
+	try {
+		return Number(fs.readFileSync(file, "utf8")) || null;
+	} catch {
+		return null;
+	}
+};
+const isAlive = (pid) => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+const killQuietly = (pid) => {
+	try {
+		if (pid) process.kill(pid, "SIGKILL");
+	} catch {
+		/* already gone */
+	}
+};
+
+test("launch mode: quitting before DevToolsActivePort exists kills the starting browser", { skip: !canCdp }, async () => {
+	// A Chromium that never writes its port file: the pane is still inside
+	// the startup wait when the quit arrives.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-slow-"));
+	const bin = path.join(dir, "slow-chromium");
+	const pidFile = path.join(dir, "pid");
+	fs.writeFileSync(bin, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\nexec /bin/sleep 30\n`, {
+		mode: 0o755,
+	});
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	let settled = false;
+	const launch = r.launchChromium().then(() => (settled = true));
+	let pid = null;
+	try {
+		assert.ok(await until(() => (pid = readPid(pidFile))), "fake Chromium started");
+		r.cleanup();
+		assert.ok(
+			await until(() => !isAlive(pid), 2_000),
+			"quit during startup must not orphan the launched browser",
+		);
+		assert.ok(await until(() => settled, 2_000), "quit cancels the startup wait");
+		assert.equal(r.launchedChild, null);
+		assert.doesNotMatch(r.banner, /did not expose a DevTools port/);
+	} finally {
+		killQuietly(pid);
+		await launch;
+	}
+});
+
+test("execFileBounded: a child that ignores SIGTERM is SIGKILLed after the grace", { timeout: 10_000 }, async () => {
+	const { bin, pidFile } = sigtermIgnoringScript();
+	try {
+		await assert.rejects(
+			execFileBounded(bin, [], { timeout: 300 }, 200),
+			(err) => err.signal === "SIGKILL",
+		);
+		assert.equal(isAlive(readPid(pidFile)), false);
+	} finally {
+		killQuietly(readPid(pidFile));
+	}
+});
+
+test("closeOwnSession: a close that ignores SIGTERM cannot hold quit past its timeout", () => {
+	// Self-exits after 6 s, so without SIGKILL the synchronous call returns
+	// at ~6 s instead of hanging the suite.
+	const { bin, pidFile } = sigtermIgnoringScript(6);
+	const r = quiet(mkRenderer());
+	r.bin = bin;
+	r.selfCreated = true;
+	r.ownershipEnabled = true;
+	const start = Date.now();
+	try {
+		r.closeOwnSession();
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 4_000, `close returned after ${elapsed} ms (timeout is 2 s)`);
+		assert.equal(isAlive(readPid(pidFile)), false);
+	} finally {
+		killQuietly(readPid(pidFile));
+	}
+});
+
+test("attach network dedupe expires keys past the window and caps the map", (t) => {
+	t.mock.timers.enable({ apis: ["Date"], now: 0 });
+	const r = quiet(mkRenderer());
+	r.queueConsolePaint = () => {};
+	const failure = (n) => ({
+		source: "network",
+		level: "error",
+		text: "failed",
+		url: `http://localhost/request/${n}`,
+	});
+	// One unique failure per simulated second for 10,000 seconds: only the
+	// last 60-second window may stay in the map.
+	for (let n = 0; n < 10_000; n++) {
+		t.mock.timers.setTime(n * 1_000);
+		r.pushLogEntry(failure(n));
+	}
+	assert.ok(
+		r.networkState.recent.size <= 61,
+		`expired keys must go (size ${r.networkState.recent.size})`,
+	);
+	// A burst inside one instant cannot grow the map without bound either.
+	for (let n = 0; n < 5_000; n++) r.pushLogEntry(failure(`burst-${n}`));
+	assert.ok(
+		r.networkState.recent.size <= 1_000,
+		`map must be capped (size ${r.networkState.recent.size})`,
+	);
+	// Dedupe itself still works: a repeat inside the window is suppressed,
+	// a repeat after the window paints again.
+	r.networkState.recent.clear();
+	r.consoleLines = [];
+	t.mock.timers.setTime(20_000_000);
+	r.pushLogEntry(failure("again"));
+	t.mock.timers.setTime(20_030_000);
+	r.pushLogEntry(failure("again"));
+	assert.equal(r.consoleLines.length, 1, "repeat inside the window is suppressed");
+	t.mock.timers.setTime(20_200_000);
+	r.pushLogEntry(failure("again"));
+	assert.equal(r.consoleLines.length, 2, "repeat after the window paints again");
+});
+
+test("pushConsole caps stored line length on a grapheme boundary", () => {
+	const r = quiet(mkRenderer());
+	r.pushConsole([{ text: "x".repeat(1_000_000), type: "log" }], false);
+	const stored = r.consoleLines.at(-1);
+	assert.ok(stored.length <= 2_100, `stored ${stored.length} chars for one line`);
+	assert.ok(stored.endsWith("…"), "a capped line says it was cut");
+	// "á̂" is 3 UTF-16 units (base + two marks that sanitize keeps), so the
+	// cut lands inside a cluster, which must be dropped whole.
+	const cluster = "a\u0301\u0302";
+	r.pushConsole([{ text: cluster.repeat(100_000), type: "log" }], false);
+	const body = r.consoleLines.at(-1).slice(2, -1);
+	assert.ok(body.length > 0);
+	assert.equal(body, cluster.repeat(body.length / 3));
+});
+
+test("capLength never splits a grapheme cluster", () => {
+	// "👩‍💻" is 5 UTF-16 units joined by a ZWJ.
+	assert.equal(capLength("👩‍💻".repeat(10), 12), "👩‍💻👩‍💻…");
+	assert.equal(capLength("👩‍💻".repeat(10), 10), "👩‍💻👩‍💻…");
+	assert.equal(capLength("🇺🇸🇺🇸", 6), "🇺🇸…");
+	assert.equal(capLength("short", 10), "short");
+});
+
+test("truncate stops scanning once the output width is reached", () => {
+	const big = "x".repeat(2_000_000);
+	let best = Infinity;
+	for (let i = 0; i < 3; i++) {
+		const start = performance.now();
+		assert.equal(truncate(big, 80), `${"x".repeat(79)}…`);
+		best = Math.min(best, performance.now() - start);
+	}
+	assert.ok(best < 30, `truncate of a 2M-char string took ${best.toFixed(1)} ms`);
 });

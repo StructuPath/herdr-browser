@@ -3,7 +3,6 @@
 // It stays passive until explicit pane input, never clears the console buffer,
 // and closes only sessions that its own successful navigation created.
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
@@ -16,7 +15,6 @@ import { chromiumSandboxArgs, agentBrowserSandboxEnv } from "./chromium-args.mjs
 
 export { chromiumSandboxArgs } from "./chromium-args.mjs";
 
-const pExecFile = promisify(execFile);
 const ESC = "\x1b";
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 // Fixed graphics id for the pane's screenshot frame: re-transmitting data
@@ -26,6 +24,8 @@ const KITTY_IMAGE_ID = 1;
 // chafa emits anonymous kitty placements (no id), and full repaints/cleanup
 // must clear everything — our id-addressed frames included.
 const KITTY_DELETE_ALL = `${ESC}_Ga=d,d=A${ESC}\\`;
+// Stored console line length. Far past any pane width; the overflow is noise.
+const CONSOLE_LINE_MAX_CHARS = 2_000;
 
 // --- pure helpers (unit-tested) ---
 
@@ -60,6 +60,7 @@ export function deriveSession(env, cwd) {
 	const res = spawnSync("sh", ["-c", "printf '%s\\n' \"$HB_CWD\" | cksum"], {
 		env: { ...process.env, HB_CWD: cwd },
 		timeout: 5000,
+		killSignal: "SIGKILL",
 	});
 	const sum = res.stdout ? res.stdout.toString().split(" ")[0].trim() : "";
 	return `herdr-cwd-${sum || "unknown"}`;
@@ -203,21 +204,35 @@ function cellWidth(s) {
 	return w;
 }
 
+// One lazy pass: segmenting stops as soon as the string is known not to fit,
+// so a huge input costs only what the output width needs.
 export function truncate(s, width) {
 	if (width <= 0) return "";
-	const clusters = Array.from(graphemeSegmenter.segment(s), ({ segment }) => ({
-		segment,
-		width: cellWidth(segment),
-	}));
-	if (clusters.reduce((sum, cluster) => sum + cluster.width, 0) <= width) return s;
 	let out = "";
+	let cut = null; // the longest prefix that leaves room for "…"
 	let w = 0;
-	for (const cluster of clusters) {
-		if (w + cluster.width > width - 1) break;
-		out += cluster.segment;
-		w += cluster.width;
+	for (const { segment } of graphemeSegmenter.segment(s)) {
+		const cw = cellWidth(segment);
+		if (cut === null && w + cw > width - 1) cut = out;
+		w += cw;
+		if (w > width) return cut + "…";
+		out += segment;
 	}
-	return out + "…";
+	return s;
+}
+
+// Cap a string at maxLen UTF-16 units without splitting a grapheme cluster.
+// A break depends on the text before it and only one code point after it,
+// so segmenting the first maxLen + 2 units (that code point kept whole)
+// finds the same boundaries up to maxLen as segmenting the full string.
+export function capLength(s, maxLen) {
+	if (s.length <= maxLen) return s;
+	let end = 0;
+	for (const { index, segment } of graphemeSegmenter.segment(s.slice(0, maxLen + 2))) {
+		if (index + segment.length > maxLen) break;
+		end = index + segment.length;
+	}
+	return s.slice(0, end) + "…";
 }
 
 // Poll backoff: each tick spawns 4 agent-browser subprocesses, so a quiet
@@ -364,6 +379,12 @@ export function viewportForPane(frameWidth, { cols, imageRows }) {
 // Seen-set membership means "already reported OR resolved to a non-failure
 // status": an in-flight request must stay classifiable until its status
 // lands, or a 500 arriving one poll late would be swallowed forever.
+// Failure dedupe window, shared by the poll feed and attach-mode log entries.
+const NETWORK_DEDUPE_WINDOW_MS = 60_000;
+// Attach mode has no per-poll prune; a burst of unique failing URLs inside
+// one window must not grow the dedupe map without bound either.
+const NETWORK_DEDUPE_MAX_KEYS = 1_000;
+
 export function newNetworkState() {
 	return {
 		seen: new Set(), // requestIds reported or resolved 2xx/3xx
@@ -373,7 +394,7 @@ export function newNetworkState() {
 
 export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
 	const ageThresholdMs = opts.ageThresholdMs ?? 15_000;
-	const dedupeWindowMs = opts.dedupeWindowMs ?? 60_000;
+	const dedupeWindowMs = opts.dedupeWindowMs ?? NETWORK_DEDUPE_WINDOW_MS;
 	const maxPerPoll = opts.maxPerPoll ?? 5;
 	const currentIds = new Set();
 	const candidates = [];
@@ -437,6 +458,31 @@ export function formatNetworkFailure({ method, url, status }) {
 
 // --- agent-browser access ---
 
+// promisify(execFile) with a hard bound: execFile's timeout only sends
+// SIGTERM, and a child that ignores it keeps the call pending forever. After
+// the grace, SIGKILL the child and drop its pipes (a grandchild holding them
+// open would also hold the call).
+export function execFileBounded(bin, args, opts, graceMs = 2_000) {
+	return new Promise((resolve, reject) => {
+		let killTimer = null;
+		const child = execFile(bin, args, opts, (err, stdout, stderr) => {
+			clearTimeout(timeoutTimer);
+			clearTimeout(killTimer);
+			if (err) reject(Object.assign(err, { stdout, stderr }));
+			else resolve({ stdout, stderr });
+		});
+		const timeoutTimer = opts?.timeout > 0
+			? setTimeout(() => {
+					killTimer = setTimeout(() => {
+						child.kill("SIGKILL");
+						child.stdout?.destroy();
+						child.stderr?.destroy();
+					}, graceMs);
+				}, opts.timeout)
+			: null;
+	});
+}
+
 /** @returns {Backend} */
 export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
@@ -461,7 +507,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// batch --json returns an array of {command, error, result, success};
 	// --bail shortens the array after the first failure.
 	const batch = async (cmds, timeout = 10_000) => {
-		const { stdout } = await pExecFile(
+		const { stdout } = await execFileBounded(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
 			{ timeout, maxBuffer, env: runEnv },
@@ -476,7 +522,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		return arr.map((r) => r.result);
 	};
 	const run = async (...args) => {
-		const { stdout } = await pExecFile(
+		const { stdout } = await execFileBounded(
 			bin,
 			["--session", session, ...args, "--json"],
 			{
@@ -578,7 +624,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		},
 		sessionExists: async () => {
 			try {
-				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
+				const { stdout } = await execFileBounded(bin, ["session", "list", "--json"], {
 					timeout: 10_000,
 					maxBuffer,
 					env: runEnv,
@@ -639,8 +685,10 @@ export class Renderer {
 		this.ownershipEnabled = this.backend !== "attach";
 		this.backendName = this.backend === "attach" ? "browser endpoint" : "agent-browser";
 		const onPath = (cmd) =>
-			spawnSync("sh", ["-c", `command -v ${cmd}`], { timeout: 5000 }).status ===
-			0;
+			spawnSync("sh", ["-c", `command -v ${cmd}`], {
+				timeout: 5000,
+				killSignal: "SIGKILL",
+			}).status === 0;
 		this.agentBrowser = onPath(this.bin);
 		this.chafa = onPath("chafa");
 		// Clamp both ends: tiny/negative values busy-loop; values past the
@@ -961,6 +1009,7 @@ export class Renderer {
 			const bin = findChromium(this.env, this.configValue("chromium"), (c) =>
 				spawnSync("sh", ["-c", 'command -v -- "$1"', "sh", c], {
 					timeout: 5000,
+					killSignal: "SIGKILL",
 					env: this.env,
 				}).status === 0,
 			);
@@ -1018,8 +1067,15 @@ export class Renderer {
 			child.once("error", (err) => {
 				spawnFailed.err = err;
 			});
+			// Own the child from spawn on, so a quit (or attach elsewhere)
+			// during the startup wait kills it instead of orphaning it. Taking
+			// ownership away also cancels the wait; the taker did the kill.
+			this.launchedChild = child;
+			this.launchedEndpoint = null;
 			const port = await this.waitForDevToolsPort(portFile, child, spawnFailed);
+			if (this.launchedChild !== child) return;
 			if (!port) {
+				this.launchedChild = null;
 				try {
 					child.kill();
 				} catch {
@@ -1032,7 +1088,6 @@ export class Renderer {
 				);
 				return;
 			}
-			this.launchedChild = child;
 			this.launchedEndpoint = `http://127.0.0.1:${port}`;
 			const ep = this.launchedEndpoint;
 			child.once("exit", () => {
@@ -1075,6 +1130,7 @@ export class Renderer {
 	async waitForDevToolsPort(portFile, child, spawnFailed = null, timeoutMs = 15_000) {
 		const until = Date.now() + timeoutMs;
 		while (Date.now() < until) {
+			if (this.launchedChild !== child) return null; // quit cancelled the launch
 			// Signal deaths leave exitCode null and set signalCode — check both.
 			if (child.exitCode !== null || child.signalCode !== null) return null;
 			if (spawnFailed?.err) return null; // binary missing/not executable
@@ -1298,9 +1354,18 @@ export class Renderer {
 		if (entry.source === "network") {
 			const key = `log ${entry.url} ${entry.text}`;
 			const now = Date.now();
-			const last = this.networkState.recent.get(key);
-			this.networkState.recent.set(key, now);
-			if (last !== undefined && now - last <= 60_000) return;
+			const recent = this.networkState.recent;
+			const last = recent.get(key);
+			// Re-insert so Map order is last-touch order: expired and overflow
+			// keys are then always at the front.
+			recent.delete(key);
+			recent.set(key, now);
+			for (const [k, t] of recent) {
+				if (now - t <= NETWORK_DEDUPE_WINDOW_MS && recent.size <= NETWORK_DEDUPE_MAX_KEYS)
+					break;
+				recent.delete(k);
+			}
+			if (last !== undefined && now - last <= NETWORK_DEDUPE_WINDOW_MS) return;
 		}
 		const hadConsole = this.consoleLines.length > 0;
 		this.pushConsole(
@@ -1495,7 +1560,7 @@ export class Renderer {
 		// 15s timeout on every changed frame, freezing the pane's image forever.
 		if (this.chafaFails >= 3 && Date.now() < this.chafaCooldownUntil) return;
 		try {
-			const { stdout } = await pExecFile(
+			const { stdout } = await execFileBounded(
 				"chafa",
 				[
 					"-f",
@@ -1644,7 +1709,10 @@ export class Renderer {
 						? "⚠ "
 						: "  ";
 			// Sanitize the display copy only — reconcile matching needs raw texts.
-			this.consoleLines.push(prefix + sanitizeText(e.text ?? ""));
+			// The line count is capped below; cap each line's length too, before
+			// sanitizing, so one huge log cannot pin megabytes in the store.
+			const text = capLength(String(e.text ?? ""), CONSOLE_LINE_MAX_CHARS);
+			this.consoleLines.push(prefix + sanitizeText(text));
 		}
 		if (this.consoleLines.length > 500) {
 			this.consoleLines = this.consoleLines.slice(-500);
@@ -1974,12 +2042,14 @@ export class Renderer {
 	// on switching backends alike — instead of idling as a leaked daemon
 	// until the 30-minute reaper. Sessions others created are never touched.
 	// Short timeout: a wedged daemon must not freeze the caller — its own
-	// idle reaper collects the session anyway.
+	// idle reaper collects the session anyway. SIGKILL: a synchronous call
+	// cannot escalate, and a close that ignores SIGTERM would hold quit.
 	closeOwnSession() {
 		if (!this.selfCreated || !this.ownershipEnabled) return;
 		try {
 			spawnSync(this.bin, ["--session", this.session, "close"], {
 				timeout: 2_000,
+				killSignal: "SIGKILL",
 				env: this.env,
 			});
 		} catch {

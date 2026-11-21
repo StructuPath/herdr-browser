@@ -524,13 +524,16 @@ Schema version 1 (`hb status --json` prints exactly this object):
 
 Page-controlled strings (URL, title, console, failures) pass through the same
 control-character sanitizer as the pane header, so printing them cannot inject
-terminal escapes. URLs are redacted the way QA reports them: the `url` field
-and every `http(s)://`, `ws(s)://`, `file://`, or `blob:` URL inside console and
-failure lines lose their username, password, query string, and fragment; a
-`data:` URL becomes `data:[redacted]`, and a page URL that does not parse is
-`[unavailable URL]`. In console and failure lines, a URL with a query or
-fragment is dropped up to the next whitespace, so text glued to its end goes
-with it. The whole file is at most
+terminal escapes. The `url` field is parsed as one URL and loses its username,
+password, query string, and fragment, the way QA reports URLs; a `data:` URL
+becomes `data:[redacted]`, and a page URL that does not parse is
+`[unavailable URL]`. Console and failure lines are free text, where the end
+of a URL cannot be found reliably, so the rule there does not try: for each
+word that contains an `http(s)://`, `ws(s)://`, `file://`, `blob:`, or
+`data:` URL, a word with an `@` after the scheme (possible userinfo) has the
+URL replaced by `[redacted URL]`; otherwise everything from the first `?` or
+`#` to the end of the word is dropped; a word with neither is kept as it is.
+This can remove more text than the URL itself, never less. The whole file is at most
 64 KiB: when it would be larger, the oldest console and failure lines are
 dropped first. A file whose `pid` is no longer running counts as no pane.
 

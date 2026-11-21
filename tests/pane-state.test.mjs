@@ -470,17 +470,18 @@ test("pane state: URL credentials, query, and fragment never reach the file", ()
 		assert.ok(!raw.includes(s), `${s} persisted`);
 	const s = JSON.parse(raw);
 	assert.equal(s.url, "https://example.test/private");
-	assert.deepEqual(s.failures, ["Failed https://example.test/private"]);
-	assert.ok(s.consoleTail.includes("  ws wss://h.test:1/x done"), JSON.stringify(s.consoleTail));
+	// Free text with userinfo loses the whole URL; the page URL field parses one.
+	assert.deepEqual(s.failures, ["Failed [redacted URL]"]);
+	assert.ok(s.consoleTail.includes("  ws [redacted URL] done"), JSON.stringify(s.consoleTail));
 });
 
 test("redactUrls strips userinfo, query, and hash from every URL in text", () => {
 	assert.equal(
 		redactUrls("a http://u:p@h/x?q=1#f b ws://h:9/d?t=2 c HTTPS://H/ok"),
-		"a http://h/x b ws://h:9/d c https://h/ok",
+		"a [redacted URL] b ws://h:9/d c HTTPS://H/ok",
 	);
 	assert.equal(redactUrls("no url here"), "no url here");
-	assert.equal(redactUrls("xhttps://u:p@h/?q"), "xhttps://h/", "a URL glued to a word");
+	assert.equal(redactUrls("xhttps://u:p@h/?q"), "x[redacted URL]", "a URL glued to a word");
 	assert.equal(redactUrls("trunc https://h/p?tok…"), "trunc https://h/p…");
 	assert.equal(redactUrl(SECRET_URL), "https://example.test/private");
 	assert.equal(redactUrl("about:blank"), "about:blank");
@@ -648,15 +649,14 @@ test("hb runs when invoked through a symlink", () => {
 test("redactUrls: quotes, brackets, and non-web schemes never keep a secret", () => {
 	const cases = [
 		["https://h/p?token='TOKEN'#FRAG", "https://h/p"],
-		["https://user:P'ASS@example.test/p?token=TOKEN", "https://example.test/p"],
-		["see (https://user:pw@x.test/p).", "see (https://x.test/p)."],
+		["https://user:P'ASS@example.test/p?token=TOKEN", "[redacted URL]"],
+		["see (https://user:pw@x.test/p).", "see ([redacted URL]"],
 		["file:///etc/x?secret=1#f", "file:///etc/x"],
 		["load data:text/plain,SECRET done", "load data:[redacted] done"],
-		["blob:https://user:PASS@example.test/id", "blob:https://example.test/id"],
+		["blob:https://user:PASS@example.test/id", "[redacted URL]"],
 		["http://[::1]:9222/json?t=1", "http://[::1]:9222/json"],
 		["metadata: ok", "metadata: ok"],
-		// A delimiter inside a query looks like the URL's end; everything to the
-		// next whitespace goes so no part of the token survives.
+		// From the first "?" to the end of the word goes, delimiters and all.
 		["failure(https://example.test/p?token=')SECRET);retry=false", "failure(https://example.test/p"],
 	];
 	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
@@ -688,19 +688,22 @@ test("redactUrls: <, >, and a literal … inside a URL never shield a secret", (
 	const cases = [
 		["load data:text/html,<b>SECRET</b> done", "load data:[redacted] done"],
 		["see https://h/?a…token=SECRET end", "see https://h/ end"],
-		["<https://u:p@x.test/p>", "<https://x.test/p>"],
+		["<https://u:p@x.test/p>", "<[redacted URL]"],
 		["cut https://h/path…", "cut https://h/path…"], // truncate()'s own marker stays
 		["cut https://h/p?token=SEC…", "cut https://h/p…"],
-		// No query: the text glued after ">" is kept, and redacted in its own right.
-		["request <https://example.com>net::ERR_CONNECTION_REFUSED", "request <https://example.com/>net::ERR_CONNECTION_REFUSED"],
-		["<https://a.test/x>https://u:p@b.test/y?t=SEC", "<https://a.test/x>https://b.test/y"],
-		// After "?", a "<" may hide the rest of a token: the whole run goes.
+		// No "@", "?", or "#": nothing to strip, so the glued text is kept as is.
+		["request <https://example.com>net::ERR_CONNECTION_REFUSED", "request <https://example.com>net::ERR_CONNECTION_REFUSED"],
+		["<https://a.test/x>https://u:p@b.test/y?t=SEC", "<[redacted URL]"],
 		["get https://h/?q=<b>SECRET done", "get https://h/ done"],
-		// "<", ">", or "…<" inside userinfo is part of the password, not an end.
-		["https://user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "https://example.test/p"],
-		["https://user:pw>SECRET@example.test/p?token=QUERY#FRAGMENT", "https://example.test/p"],
-		["https://user:pw…<SECRET@example.test/p", "https://example.test/p"],
-		["<https://user:pw>SECRET@example.test/p>", "<https://example.test/p>"],
+		// Userinfo needs an "@"; any "@" withholds the URL, however it is spelled.
+		["https://user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
+		["https://user:pw>SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
+		["https://user:pw…<SECRET@example.test/p", "[redacted URL]"],
+		["<https://user:pw>SECRET@example.test/p>", "<[redacted URL]"],
+		["https:///user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
+		["https:////user:pw@example.test/p", "[redacted URL]"],
+		["request <https://user:pw<SECRET@example.test>net::ERR", "request <[redacted URL]"],
+		["HTTPS://U:P@X.TEST/a?T=QUERY", "[redacted URL]"],
 	];
 	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
 	for (const [input] of cases) assert.doesNotMatch(redactUrls(input), /SECRET|SEC|u:p@|pw|QUERY|FRAGMENT/);
@@ -738,4 +741,33 @@ test("readPaneState accepts a v1 file from a writer that predates endpointDiscov
 	delete state.endpointDiscoverable;
 	writePaneState(file, state);
 	assert.equal(readPaneState(file).endpoint, "127.0.0.1:9222");
+});
+
+test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret", () => {
+	// Seeded, so a failure reproduces. Secrets sit only where a URL can carry
+	// them; everything around them is drawn from characters that confused the
+	// earlier boundary guessing.
+	let seed = 0x5eed;
+	// Math.imul keeps the LCG exact (a plain * overflows 2^53 and zeroes the
+	// low bits); the high bits are the well-mixed ones.
+	const rnd = (n) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 16) % n;
+	const pick = (xs) => xs[rnd(xs.length)];
+	const junk = () => Array.from({ length: rnd(4) }, () => pick(["<", ">", "…", "'", '"', ")", "(", ";", "/", "[", "]", ":", "x"])).join("");
+	let withUserinfo = 0;
+	let withQuery = 0;
+	for (let i = 0; i < 5_000; i++) {
+		const scheme = pick(["http://", "https://", "ws://", "wss://", "HTTPS://", "https:///", "https:////", "blob:https://", "file://"]);
+		const userinfo = rnd(2) ? `u${junk()}:pw${junk()}SECRETU${junk()}@` : "";
+		const host = pick(["example.test", "[::1]", "127.0.0.1:9222", "h"]);
+		const query = rnd(2) ? `?${junk()}t=${junk()}SECRETQ${junk()}` : "";
+		const frag = rnd(2) ? `#${junk()}SECRETF` : "";
+		const word = `${junk()}${scheme}${userinfo}${host}/${junk()}p${query}${frag}${junk()}`;
+		if (userinfo) withUserinfo++;
+		if (query) withQuery++;
+		const out = redactUrls(`before ${word} after`);
+		assert.doesNotMatch(out, /SECRET[UQF]/, `${word} -> ${out}`);
+		assert.ok(out.startsWith("before ") && out.endsWith(" after"), out);
+	}
+	// The generator really produced the shapes it claims to test.
+	assert.ok(withUserinfo > 2_000 && withQuery > 2_000, `${withUserinfo} userinfo, ${withQuery} query cases`);
 });

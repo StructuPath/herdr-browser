@@ -72,47 +72,31 @@ function safeHref(value) {
 	return u.href;
 }
 
-// URLs inside free text (console, failed requests). A match runs to the next
-// whitespace, and nothing else ends it: quotes, brackets, "<", ">", ";", and
-// "…" can all sit inside a query or a data: payload, so stopping at any of
-// them would leave the rest of a token behind. Sentence punctuation is given
-// back only when the URL has no query or fragment to hide it in; with one,
-// everything to the next whitespace is dropped (over-redaction is the safe
-// side). A trailing "…" (truncate() marks a cut line with it) is kept.
+// URLs inside free text (console, failed requests). Finding where a URL ends
+// inside arbitrary text is guesswork, so nothing here depends on it. A URL
+// can carry a secret in only two places: userinfo, which needs an "@", and
+// the query or fragment, which start at the first "?" or "#". Per
+// whitespace-delimited word, from the URL's scheme on:
+// - an "@" anywhere: the rest of the word is "[redacted URL]";
+// - else a "?" or "#": everything from it to the end of the word goes;
+// - else the word is kept as is (no userinfo, no query, nothing to strip).
+// data: payloads are withheld whole. A trailing "…" (truncate()'s cut
+// marker) is kept. Over-redaction is the accepted cost.
 // blob:/data: need a non-word char before them so "metadata:" is left alone.
-const URL_IN_TEXT = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)\S+/gi;
+const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)/i;
 export function redactUrls(text) {
-	return String(text).replace(URL_IN_TEXT, (m) => {
-		const cut = m.endsWith("…") ? "…" : "";
-		let url = cut ? m.slice(0, -1) : m;
-		if (/^data:/i.test(url)) return safeHref(url) + cut; // payload withheld whole
-		let after = "";
-		// A raw "<" or ">" is never part of a URL. Before any query or fragment
-		// it ends this one, and the rest is text, redacted on its own (it may
-		// hold another URL). After a "?" or "#" it may be hiding a token, so the
-		// whole run goes. Inside userinfo (an "@" follows it within the
-		// authority) it is part of a password: parse the run whole so the
-		// credentials are stripped, never split them off as text.
-		const query = url.search(/[?#]/);
-		const scheme = url.indexOf("://");
-		const authStart = scheme < 0 ? 0 : scheme + 3;
-		const authLen = url.slice(authStart).search(/[/?#]/);
-		const authEnd = authLen < 0 ? url.length : authStart + authLen;
-		let stop = url.search(/[<>]/);
-		if (stop >= 0 && stop < authEnd && url.slice(stop, authEnd).includes("@")) {
-			const next = url.slice(authEnd).search(/[<>]/); // past the userinfo
-			stop = next < 0 ? -1 : authEnd + next;
-		}
-		if (stop > 0 && (query < 0 || stop < query)) {
-			after = redactUrls(url.slice(stop));
-			url = url.slice(0, stop);
-		}
-		if (!/[?#]/.test(url)) {
-			const tail = /[.,;:!)\]}'"]+$/.exec(url)?.[0] ?? "";
-			url = url.slice(0, url.length - tail.length);
-			after = tail + after;
-		}
-		return safeHref(url) + after + cut;
+	return String(text).replace(/\S+/g, (word) => {
+		const at = word.search(URL_START);
+		if (at < 0) return word;
+		const head = word.slice(0, at);
+		let rest = word.slice(at);
+		const cut = rest.endsWith("…") ? "…" : "";
+		if (cut) rest = rest.slice(0, -1);
+		if (/^data:/i.test(rest)) return `${head}data:[redacted]${cut}`;
+		if (rest.includes("@")) return `${head}[redacted URL]${cut}`;
+		const query = rest.search(/[?#]/);
+		if (query < 0) return word;
+		return `${head}${safeHref(rest.slice(0, query))}${cut}`;
 	});
 }
 

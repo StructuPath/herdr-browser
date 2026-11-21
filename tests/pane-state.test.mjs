@@ -106,10 +106,15 @@ test("pane state: a run-loop step writes pane-w1.json, mode 0600, schema v1", as
 	);
 });
 
+// A constant shell command: the lib path travels in the environment, never
+// in the command string (CodeQL js/shell-command-injection-from-environment).
+const LIB_SH = path.join(repoRoot, "scripts", "lib.sh");
+const SESSION_NAME_SH = '. "$HB_LIB" && session_name';
+
 test("pane state: session matches bash session_name for the workspace", async () => {
 	const r = quiet(mkRenderer());
 	const env = { PATH: process.env.PATH, HERDR_WORKSPACE_ID: "w1" };
-	const sh = execFileSync("bash", ["-c", '. "$1/scripts/lib.sh" && session_name', "bash", repoRoot], { env })
+	const sh = execFileSync("bash", ["-c", SESSION_NAME_SH], { env: { ...env, HB_LIB: LIB_SH } })
 		.toString()
 		.trim();
 	assert.equal(r.session, sh);
@@ -397,7 +402,7 @@ test("hb session matches bash session_name across env/config/workspace/cwd", () 
 	];
 	for (const over of cases) {
 		const env = { PATH: process.env.PATH, HOME: tmpDir("hb-home-"), HERDR_PLUGIN_STATE_DIR: tmpDir("hb-st-"), ...over };
-		const sh = execFileSync("bash", ["-c", '. "$1/scripts/lib.sh" && session_name', "bash", repoRoot], { env, cwd })
+		const sh = execFileSync("bash", ["-c", SESSION_NAME_SH], { env: { ...env, HB_LIB: LIB_SH }, cwd })
 			.toString()
 			.trim();
 		const text = runHb(["session"], env, { cwd });

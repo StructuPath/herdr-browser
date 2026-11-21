@@ -35,8 +35,10 @@ export function chromiumSandboxArgs(env = process.env) {
 // same purpose. Every agent-browser call — the pane, QA, the launchers, and
 // recording — goes through this one helper. It APPENDS the fallback to the
 // caller's own args (a proxy, a window size) and returns {} when nothing has
-// to change. A newline-separated value keeps newlines, so a comma inside one
-// arg is never turned into a split point.
+// to change. The fallback joins with the separator the value already uses
+// (newline if it has one, else comma), so existing args split exactly as
+// before. agent-browser splits on both, so no separator protects a comma
+// inside one arg.
 export function agentBrowserSandboxEnv(env = process.env) {
 	const existing = env.AGENT_BROWSER_ARGS ?? "";
 	const have = new Set(existing.split(/[,\n]/).map((a) => a.trim()));

@@ -642,3 +642,42 @@ test("hb runs when invoked through a symlink", () => {
 	assert.equal(res.status, 0, res.stderr);
 	assert.match(res.stdout, /Exit codes/);
 });
+
+test("redactUrls: quotes, brackets, and non-web schemes never keep a secret", () => {
+	const cases = [
+		["https://h/p?token='TOKEN'#FRAG", "https://h/p"],
+		["https://user:P'ASS@example.test/p?token=TOKEN", "https://example.test/p"],
+		["see (https://user:pw@x.test/p).", "see (https://x.test/p)."],
+		["file:///etc/x?secret=1#f", "file:///etc/x"],
+		["load data:text/plain,SECRET done", "load data:[redacted] done"],
+		["blob:https://user:PASS@example.test/id", "blob:https://example.test/id"],
+		["http://[::1]:9222/json?t=1", "http://[::1]:9222/json"],
+		["metadata: ok", "metadata: ok"],
+		// A delimiter inside a query looks like the URL's end; everything to the
+		// next whitespace goes so no part of the token survives.
+		["failure(https://example.test/p?token=')SECRET);retry=false", "failure(https://example.test/p"],
+	];
+	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
+	for (const [, got] of cases.map(([i]) => [i, redactUrls(i)]))
+		assert.doesNotMatch(got, /TOKEN|FRAG|SECRET|PASS|P'ASS|user|secret=|pw@|t=1/);
+	assert.equal(redactUrl("blob:https://user:PASS@example.test/id"), "blob:https://example.test/id");
+	assert.equal(redactUrl("data:text/html,<b>SECRET</b>"), "data:[redacted]");
+	assert.equal(redactUrl("not a url"), "[unavailable URL]");
+});
+
+test("pane state: an oversized endpoint is capped with the other fields", () => {
+	const state = buildPaneState({ backend: "attach", endpoint: `http://${"a".repeat(70_000)}.test:9222`, pid: 1 }, (s) => s);
+	assert.ok(state.endpoint.length <= 2000);
+	assert.ok(Buffer.byteLength(JSON.stringify(state, null, 2)) <= PANE_STATE_MAX_BYTES);
+});
+
+test("pane state: a file that vanishes is written again on the next idle step", async () => {
+	const r = quiet(mkRenderer());
+	r.browser = stubBrowser({ url: "https://example.test/a", title: "A" });
+	await r.step();
+	const file = paneFileOf(r);
+	assert.ok(fs.existsSync(file));
+	fs.unlinkSync(file); // an older pane's cleanup raced this pane's write
+	await r.step(); // nothing observable changed
+	assert.ok(fs.existsSync(file), "the live pane restores its file without a state change");
+});

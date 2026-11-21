@@ -2681,6 +2681,12 @@ export class Renderer {
 		await this.enqueue(() => this.tick());
 		const sig = this.sig();
 		this.idleTicks = sig === before ? this.idleTicks + 1 : 0;
+		// A file that vanished (an older pane's cleanup raced this one's write)
+		// is restored on the next step, not only on the next visible change.
+		if (this.paneStateLastKey !== null && !fs.existsSync(this.paneFile)) {
+			this.paneStateLastKey = null;
+			this.paneStateLastSig = null;
+		}
 		if (sig !== this.paneStateLastSig && this.publishPaneState())
 			this.paneStateLastSig = sig;
 	}

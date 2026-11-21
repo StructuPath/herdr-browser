@@ -8,7 +8,10 @@ import path from "node:path";
 export const PANE_STATE_SCHEMA_VERSION = 1;
 export const PANE_STATE_TAIL = 20;
 export const PANE_STATE_MAX_BYTES = 64 * 1024;
-const MAX_FIELD = 2000; // url, title, session
+// url, title, session, endpoint. Four capped fields stay far under
+// PANE_STATE_MAX_BYTES (<= 3 UTF-8 bytes per UTF-16 unit), so dropping tail
+// lines always brings the file under the cap.
+const MAX_FIELD = 2000;
 const MAX_LINE = 500; // each console or failure line
 
 export function paneStateFile(stateDir, wsId) {
@@ -31,8 +34,21 @@ export function endpointHostPort(url) {
 }
 
 // URLs leave the pane the way QA reports them (bin/qa.mjs safeUrl): no
-// username, password, query, or fragment — those carry tokens.
-function stripUrl(u) {
+// username, password, query, or fragment — those carry tokens. A data: URL
+// is all payload; a blob: URL wraps an origin URL that is stripped in turn.
+// Anything that does not parse is withheld rather than guessed at.
+function safeHref(value) {
+	let u;
+	try {
+		u = new URL(value);
+	} catch {
+		return "[unavailable URL]";
+	}
+	if (u.protocol === "data:") return "data:[redacted]";
+	if (u.protocol === "blob:") {
+		const inner = safeHref(u.pathname);
+		return inner === "[unavailable URL]" ? "blob:[unavailable URL]" : `blob:${inner}`;
+	}
 	u.username = "";
 	u.password = "";
 	u.search = "";
@@ -40,26 +56,32 @@ function stripUrl(u) {
 	return u.href;
 }
 
-// Every http(s)/ws(s) URL inside free text (console, failed requests). "…"
-// ends a match: the pane's truncate() appends it to long URLs.
+// URLs inside free text (console, failed requests). A match runs to the next
+// whitespace: quotes, brackets, and ";" are legal inside a query, so stopping
+// at them would leave the rest of a token behind. Sentence punctuation is
+// given back only when the URL has no query or fragment to hide it in; with
+// one, everything to the next whitespace is dropped (over-redaction is the
+// safe side). "…" ends a match: truncate() appends it to long URLs.
+// blob:/data: need a non-word char before them so "metadata:" is left alone.
+const URL_IN_TEXT = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)[^\s<>…]+/gi;
 export function redactUrls(text) {
-	return String(text).replace(/(?:https?|wss?):\/\/[^\s"'<>…]+/gi, (m) => {
-		try {
-			return stripUrl(new URL(m));
-		} catch {
-			return "[unavailable URL]";
+	return String(text).replace(URL_IN_TEXT, (m) => {
+		let url = m;
+		let after = "";
+		if (!/[?#]/.test(m)) {
+			const tail = /[.,;:!)\]}'"]+$/.exec(m)?.[0] ?? "";
+			url = m.slice(0, m.length - tail.length);
+			after = tail;
 		}
+		return safeHref(url) + after;
 	});
 }
 
-// The page URL field: any scheme; text that is not one URL is redacted as text.
+// The page URL field: one URL of any scheme, "" before any page, or
+// "[unavailable URL]".
 export function redactUrl(value) {
 	const s = String(value ?? "");
-	try {
-		return stripUrl(new URL(s));
-	} catch {
-		return redactUrls(s);
-	}
+	return s === "" ? "" : safeHref(s);
 }
 
 // Cut at max UTF-16 units without splitting a surrogate pair.
@@ -89,7 +111,7 @@ export function buildPaneState(input, sanitize) {
 		backend,
 		session: input.session == null ? null : text(input.session, sanitize),
 		endpoint:
-			backend === "agent-browser" ? null : endpointHostPort(input.endpoint),
+			backend === "agent-browser" ? null : clip(endpointHostPort(input.endpoint) ?? "", MAX_FIELD) || null,
 		attached: Boolean(input.attached),
 		url: clip(redactUrl(text(input.url, sanitize, Infinity)), MAX_FIELD),
 		title: text(input.title, sanitize),
@@ -136,8 +158,8 @@ export function writePaneState(file, state) {
 
 // Exit cleanup: delete the file only while it is still this process's. A
 // newer pane for the same workspace may have replaced it. Not atomic; a
-// pane that replaces it between read and unlink republishes on its next
-// change.
+// pane whose file vanishes in that gap writes it again on its next step
+// (the renderer re-publishes when its file is missing).
 export function removePaneStateIfOwned(file, pid) {
 	try {
 		if (JSON.parse(fs.readFileSync(file, "utf8"))?.pid === pid) fs.unlinkSync(file);

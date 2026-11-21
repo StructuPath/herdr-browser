@@ -120,6 +120,10 @@ export function chafaInstallHint(platform = process.platform) {
 	return "see https://hpjansson.org/chafa/download/";
 }
 
+// Keys textViewNav owns; dropped (not sent to the page) when they follow a
+// view key in the same input read.
+const TEXT_VIEW_NAV_KEYS = new Set(["j", "k", " ", "b", "g", "G", "\x1b[5~", "\x1b[6~"]);
+
 // Text rows a page text view shows between its title row and footer: the
 // footer row is only spent when the text does not fit.
 function textViewBodyRows(total, imageRows) {
@@ -1252,8 +1256,13 @@ export class Renderer {
 			this.lastTitle = sanitizeText(m.title ?? "");
 			this.lastFrameAt = Date.now();
 			this.banner = "";
-			this.dropStaleTextView();
+			// A different tab is different content even at the same URL.
+			this.dropStaleTextView({ force: true });
 			this.header();
+			return;
+		}
+		if (m.type === "document") {
+			this.dropStaleTextView({ force: true });
 			return;
 		}
 		if (m.type === "frame") {
@@ -1884,6 +1893,9 @@ export class Renderer {
 	// escape tails and split everything into single events before dispatch.
 	feed(s) {
 		clearTimeout(this.inputTimer);
+		// Keys after s/n/d/Esc in one read target a view whose state has not
+		// settled yet (opening is async); they must not fall through to the page.
+		this.viewKeyInBatch = false;
 		s = this.inputBuf + s;
 		this.inputBuf = "";
 		while (s) {
@@ -2080,9 +2092,10 @@ export class Renderer {
 	// A navigation invalidates a captured snapshot/diff (the request table is
 	// a session log and survives): drop it so a stale page is never shown as
 	// the current one. Every URL source calls this — poll, stream, and CDP.
-	dropStaleTextView() {
+	// force: a reload or tab switch is new content even at an unchanged URL.
+	dropStaleTextView({ force = false } = {}) {
 		const tv = this.textView;
-		if (!tv || tv.mode === "network" || tv.url === this.lastUrl) return;
+		if (!tv || tv.mode === "network" || (!force && tv.url === this.lastUrl)) return;
 		this.textView = null;
 		this.enqueue(() => this.redrawAll());
 	}
@@ -2164,11 +2177,18 @@ export class Renderer {
 		// and they need no page target beyond what the backend already guards.
 		if (ch === "s" || ch === "n" || ch === "d") {
 			this.textViewKey(ch);
+			this.viewKeyInBatch = true;
 			return;
 		}
 		// An open text view owns the paging keys (j/k, space/b, PgUp/PgDn,
 		// g/G, Esc) — they move the text, not the page behind it.
-		if (this.textView && this.textViewNav(ch)) return;
+		if (this.textView) {
+			const closing = ch === ESC;
+			if (this.textViewNav(ch)) {
+				if (closing) this.viewKeyInBatch = true;
+				return;
+			}
+		} else if (this.viewKeyInBatch && TEXT_VIEW_NAV_KEYS.has(ch)) return;
 		if (ch === "t" && !this.attached) {
 			this.showNotAttached();
 			return;

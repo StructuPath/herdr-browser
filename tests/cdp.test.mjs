@@ -636,3 +636,13 @@ test("adapter feed: auto-attached OOPIF sessions get their own feed enabled", as
 		"embedded frame failures must not be silent",
 	);
 });
+
+test("adapter reports a new main-frame document, including a same-URL reload", async () => {
+	const fake = makeFakeCdp();
+	const { got } = await attachBrowser(fake);
+	const navigated = (frame, sessionId = "sess-T1") => fake.deliver({ method: "Page.frameNavigated", sessionId, params: { frame } });
+	navigated({ id: "F1", url: "https://x/" });
+	navigated({ id: "F2", parentId: "F1", url: "https://ad/" }); // iframe: not a new page
+	navigated({ id: "F1", url: "https://x/" }, "sess-other"); // another target's session
+	assert.deepEqual(got.filter((m) => m.type === "document").map((m) => m.url), ["https://x/"]);
+});

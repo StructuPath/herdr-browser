@@ -278,9 +278,12 @@ events are ignored while a view is open: the view covers the screenshot, so a
 click could otherwise land on a page element you cannot see.
 
 Any other page-driving action (navigate, reload, forward, type) returns to the
-screenshot. A captured snapshot or diff is dropped if the page navigates
-underneath it — in polling, live-stream, and attach modes alike — rather than
-shown stale; the request table is a session log and stays until dismissed.
+screenshot. A captured snapshot or diff is dropped, rather than shown stale,
+when the page navigates to a new URL underneath it — in polling, live-stream,
+and attach modes alike. In attach and launch mode it is also dropped on a
+reload or a tab switch that keeps the same URL; in agent-browser mode a
+same-URL reload is not detected, so press `s` again. The request table is a
+session log and stays until dismissed.
 Switching to a different browser (`a` or `l`) also forgets the last snapshot,
 so `d` asks for a fresh `s` instead of diffing two unrelated browsers.
 

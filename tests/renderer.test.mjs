@@ -3198,6 +3198,57 @@ test("text view: every push path drops a stale snapshot or diff on navigation", 
 	assert.equal(r.textView?.mode, "snapshot");
 });
 
+test("text view: a reload or tab switch drops a stale view even at the same URL", async () => {
+	for (const [name, push] of [
+		["cdp document", (r) => r.onCdpMessage({ type: "document", url: "https://a/" })],
+		["cdp target_selected", (r) => r.onCdpMessage({ type: "target_selected", targetId: "T2", url: "https://a/", title: "A" })],
+	]) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		r.lastUrl = "https://a/";
+		r.textView = { mode: "snapshot", title: "a", lines: ["x"], url: "https://a/" };
+		push(r);
+		await flush();
+		assert.equal(r.textView, null, `${name}: new content at the same URL is not the captured page`);
+	}
+	// A metadata-only update (title change) keeps the view.
+	const r = quiet(mkRenderer());
+	r.lastUrl = "https://a/";
+	r.textView = { mode: "snapshot", title: "a", lines: ["x"], url: "https://a/" };
+	r.onCdpMessage({ type: "url", url: "https://a/", title: "A (1)" });
+	assert.equal(r.textView?.mode, "snapshot");
+});
+
+test("text view: paging keys in the same read as a view key never reach the page", async () => {
+	for (const batch of ["sj", "s j", "sG", "s\x1b[6~"]) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		const calls = [];
+		r.browser = {
+			snapshotText: async () => ({ title: "page", lines: ["x"] }),
+			scroll: async (...a) => calls.push(["scroll", ...a]),
+			back: async () => calls.push(["back"]),
+		};
+		r.feed(batch);
+		await flush();
+		assert.deepEqual(calls, [], `${JSON.stringify(batch)}: nothing reaches the page`);
+	}
+	// Closing with the view's own key, then j in the same read: the page stays put.
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	const calls = [];
+	await openSnapshot(r, ["x"]);
+	r.browser = { ...r.browser, scroll: async (...a) => calls.push(["scroll", ...a]) };
+	r.feed("sj");
+	await flush();
+	assert.equal(r.textView, null);
+	assert.deepEqual(calls, []);
+	// A later, separate read drives the page as usual.
+	r.feed("j");
+	await flush();
+	assert.equal(calls.length, 1);
+});
+
 test("text view: a backend switch forgets the last snapshot and the open view", async () => {
 	const r = quiet(mkRenderer());
 	r.attached = true;

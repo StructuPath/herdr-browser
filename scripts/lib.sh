@@ -118,6 +118,13 @@ backend_marker_file() {
 	printf '%s/backend-%s\n' "$(state_dir)" "$(ws_id)"
 }
 
+# True when a live pane switched to attach/launch at runtime. Shared by
+# open.sh (route clicks to the pane) and record.sh (refuse Start).
+runtime_backend_live() {
+	[ -f "$(backend_marker_file)" ] || return 1
+	pane_alive "$(cat "$(pane_id_file)" 2>/dev/null || true)"
+}
+
 # Boolean knob files/envs: same accepted spellings as truthyConfig() in the
 # renderer. A set-but-non-truthy env wins over the config file (|| semantics).
 truthy_config() {

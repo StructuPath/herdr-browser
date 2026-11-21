@@ -23,11 +23,8 @@ if cdp_endpoint_configured || launch_configured; then
 fi
 # Runtime switches (the a/l keys) are invisible to static sources; the pane
 # leaves a marker while attached. Only a live pane's marker counts.
-if [ "$pane_owns_navigation" -eq 0 ] && [ -f "$(backend_marker_file)" ]; then
-	marker_pane="$(cat "$(pane_id_file)" 2>/dev/null || true)"
-	if pane_alive "$marker_pane"; then
-		pane_owns_navigation=1
-	fi
+if [ "$pane_owns_navigation" -eq 0 ] && runtime_backend_live; then
+	pane_owns_navigation=1
 fi
 
 # A workspace configured observe-only exists to watch a run untouched; a

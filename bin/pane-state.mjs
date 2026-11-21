@@ -90,9 +90,19 @@ export function redactUrls(text) {
 		// A raw "<" or ">" is never part of a URL. Before any query or fragment
 		// it ends this one, and the rest is text, redacted on its own (it may
 		// hold another URL). After a "?" or "#" it may be hiding a token, so the
-		// whole run goes.
-		const stop = url.search(/[<>]/);
+		// whole run goes. Inside userinfo (an "@" follows it within the
+		// authority) it is part of a password: parse the run whole so the
+		// credentials are stripped, never split them off as text.
 		const query = url.search(/[?#]/);
+		const scheme = url.indexOf("://");
+		const authStart = scheme < 0 ? 0 : scheme + 3;
+		const authLen = url.slice(authStart).search(/[/?#]/);
+		const authEnd = authLen < 0 ? url.length : authStart + authLen;
+		let stop = url.search(/[<>]/);
+		if (stop >= 0 && stop < authEnd && url.slice(stop, authEnd).includes("@")) {
+			const next = url.slice(authEnd).search(/[<>]/); // past the userinfo
+			stop = next < 0 ? -1 : authEnd + next;
+		}
 		if (stop > 0 && (query < 0 || stop < query)) {
 			after = redactUrls(url.slice(stop));
 			url = url.slice(0, stop);

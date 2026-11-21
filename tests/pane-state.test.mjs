@@ -696,9 +696,14 @@ test("redactUrls: <, >, and a literal … inside a URL never shield a secret", (
 		["<https://a.test/x>https://u:p@b.test/y?t=SEC", "<https://a.test/x>https://b.test/y"],
 		// After "?", a "<" may hide the rest of a token: the whole run goes.
 		["get https://h/?q=<b>SECRET done", "get https://h/ done"],
+		// "<", ">", or "…<" inside userinfo is part of the password, not an end.
+		["https://user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "https://example.test/p"],
+		["https://user:pw>SECRET@example.test/p?token=QUERY#FRAGMENT", "https://example.test/p"],
+		["https://user:pw…<SECRET@example.test/p", "https://example.test/p"],
+		["<https://user:pw>SECRET@example.test/p>", "<https://example.test/p>"],
 	];
 	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
-	for (const [input] of cases) assert.doesNotMatch(redactUrls(input), /SECRET|SEC|u:p@/);
+	for (const [input] of cases) assert.doesNotMatch(redactUrls(input), /SECRET|SEC|u:p@|pw|QUERY|FRAGMENT/);
 });
 
 test("pane state: endpointDiscoverable says whether host:port alone reaches the browser", () => {

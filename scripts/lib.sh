@@ -118,6 +118,13 @@ backend_marker_file() {
 	printf '%s/backend-%s\n' "$(state_dir)" "$(ws_id)"
 }
 
+# True when a live pane switched to attach/launch at runtime. Shared by
+# open.sh (route clicks to the pane) and record.sh (refuse Start).
+runtime_backend_live() {
+	[ -f "$(backend_marker_file)" ] || return 1
+	pane_alive "$(cat "$(pane_id_file)" 2>/dev/null || true)"
+}
+
 # Boolean knob files/envs: same accepted spellings as truthyConfig() in the
 # renderer. A set-but-non-truthy env wins over the config file (|| semantics).
 truthy_config() {
@@ -141,6 +148,28 @@ knob_configured() { # $1: env value (may be empty), $2: config file name
 
 launch_configured() { knob_configured "${HERDR_BROWSER_LAUNCH:-}" launch; }
 observe_configured() { knob_configured "${HERDR_BROWSER_OBSERVE:-}" observe; }
+
+# Append the CI/container Chromium sandbox fallback to AGENT_BROWSER_ARGS
+# before an agent-browser call. The merge lives in bin/chromium-args.mjs
+# (shared with the pane, QA and recording); its NUL-terminated output is read
+# without eval, so a user value that contains newlines arrives intact.
+export_agent_browser_args() {
+	local mode="" value=""
+	if ! command -v node >/dev/null 2>&1; then
+		echo "herdr-browser: warning: sandbox fallback for agent-browser skipped (node not found)" >&2
+		return 0
+	fi
+	{
+		IFS= read -r -d '' mode || mode=""
+		if [ "$mode" = set ] && ! IFS= read -r -d '' value; then mode=""; fi
+	} < <(node bin/chromium-args.mjs --agent-browser-args)
+	case "$mode" in
+	keep) ;;
+	set) export AGENT_BROWSER_ARGS="$value" ;;
+	*) echo "herdr-browser: warning: sandbox fallback for agent-browser skipped (bin/chromium-args.mjs failed)" >&2 ;;
+	esac
+	return 0
+}
 
 require_agent_browser() {
 	if ! command -v agent-browser >/dev/null 2>&1; then

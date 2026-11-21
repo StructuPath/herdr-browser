@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import {
 	deriveSession,
@@ -19,6 +20,8 @@ import {
 	parseSgrMouse,
 	mapClickToPage,
 	sanitizeText,
+	linkClickLabel,
+	chafaInstallHint,
 	Renderer,
 	makeBrowser,
 	pollDelay,
@@ -31,8 +34,11 @@ import {
 	findChromium,
 	chromiumSandboxArgs,
 	truthyConfig,
+	execFileBounded,
+	capLength,
 } from "../bin/renderer.mjs";
 import { agentBrowserSandboxEnv } from "../bin/chromium-args.mjs";
+import { makeCdpBrowser } from "../bin/cdp.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -79,6 +85,47 @@ const quiet = (r) => {
 };
 const flush = async () => {
 	for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+};
+
+const fakeOutput = (t) => {
+	const chunks = [];
+	const events = new EventEmitter();
+	let writable = true;
+	const once = process.stdout.once;
+	const write = process.stdout.write;
+	t.mock.method(process.stdout, "write", function (chunk, ...args) {
+		if (typeof chunk !== "string") return write.call(this, chunk, ...args);
+		chunks.push(String(chunk));
+		return writable;
+	});
+	t.mock.method(process.stdout, "once", function (event, fn) {
+		if (event !== "drain") return once.call(this, event, fn);
+		events.once(event, fn);
+		return this;
+	});
+	return {
+		chunks,
+		block: () => { writable = false; },
+		drain: () => { writable = true; events.emit("drain"); },
+	};
+};
+
+const imageRenderer = () => {
+	const r = quiet(mkRenderer());
+	delete r.renderImage;
+	r.mode = "kitty";
+	r.size = () => ({ cols: 80, imageRows: 20 });
+	r.fitViewport = async () => false;
+	return r;
+};
+
+const fakeChafa = (t, r, source) => {
+	const file = path.join(r.stateDir, "chafa");
+	fs.writeFileSync(file, `#!${process.execPath}\n${source}\n`, { mode: 0o700 });
+	const oldPath = process.env.PATH;
+	process.env.PATH = r.stateDir;
+	t.after(() => { process.env.PATH = oldPath; });
+	return file;
 };
 // attachCdp (and launchChromium) refuse on Node < 22 before touching the
 // backend, so attach-behavior tests only make sense where attach is possible.
@@ -1018,6 +1065,116 @@ test("enqueue counts paint failures instead of silently swallowing them", async 
 	assert.equal(r.paintErrors, 1);
 	await r.enqueue(() => {});
 	assert.equal(r.paintErrors, 1, "queue is not poisoned by a throw");
+});
+
+test("renderImage writes the original PNG in Kitty output and honors drain", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	// Complete RGBA PNG, including compressed pixel data and valid CRCs.
+	const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
+	fs.writeFileSync(r.shot, png);
+	out.block();
+	await r.renderImage();
+	assert.equal(out.chunks.join(""), `\x1b[3;1H${kittyImageSequence(png, 1, 1, 80, 20)}`);
+	assert.equal(r.stdoutBlocked, true);
+	await r.renderImage();
+	assert.equal(out.chunks.length, 1, "no second image before drain");
+	out.drain();
+	await r.renderImage();
+	assert.equal(r.stdoutBlocked, false);
+	assert.equal(out.chunks.length, 2, "drain permits the next image");
+});
+
+test("renderImage handles encoder failure and writes recovered chafa bytes", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	r.shotFormat = "jpg";
+	fs.writeFileSync(r.shotJpg, jpeg(80, 40));
+	const file = fakeChafa(t, r, "process.exit(1);");
+	await r.renderImage();
+	assert.equal(r.chafaFails, 1);
+	assert.deepEqual(out.chunks, [], "failed encoder emits no partial image");
+	fs.writeFileSync(file, `#!${process.execPath}\nprocess.stdout.write('encoded-kitty-frame');\n`);
+	await r.renderImage();
+	assert.equal(r.chafaFails, 0);
+	assert.equal(out.chunks.at(-1), "encoded-kitty-frame");
+});
+
+test("stream burst coalesces before decode and writes; input waits for one paint", async (t) => {
+	const r = quiet(mkRenderer());
+	r.tick = async () => {};
+	r.fitViewport = async () => false;
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const painted = [];
+	const order = [];
+	r.renderImage = async () => {
+		painted.push(fs.readFileSync(r.shotJpg));
+		order.push("paint");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	};
+	const decode = t.mock.method(Buffer, "from");
+	const write = t.mock.method(fs, "writeFileSync");
+	const frames = Array.from({ length: 61 }, (_, i) => jpeg(80 + i, 40).toString("base64"));
+	decode.mock.resetCalls();
+	r.onStreamMessage({ type: "frame", data: frames[0] });
+	await flush();
+	for (const data of frames.slice(1)) r.onStreamMessage({ type: "frame", data });
+	r.userAction(async () => { order.push("input"); });
+	assert.equal(write.mock.callCount(), 1, "pending frames cause no file writes");
+	assert.equal(decode.mock.calls.filter(({ arguments: args }) => args[1] === "base64").length, 1);
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(order, ["paint", "input", "paint"]);
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(painted, [jpeg(80, 40), jpeg(140, 40)], "only the latest pending frame survives");
+	assert.equal(write.mock.callCount(), 2);
+});
+
+test("stream frames queued behind a paint collapse to the latest before IO", async (t) => {
+	const r = quiet(mkRenderer());
+	r.fitViewport = async () => false;
+	let release;
+	r.enqueue(() => new Promise((resolve) => { release = resolve; }));
+	await flush();
+	const latest = jpeg(140, 40);
+	const data = latest.toString("base64");
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let i = 0; i < 1000; i++) r.onStreamMessage({ type: "frame", data });
+	assert.equal(write.mock.callCount(), 0);
+	release();
+	await r.paintQueue;
+	await flush();
+	assert.equal(write.mock.callCount(), 1);
+	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
+});
+
+test("slow stdout retains only the latest frame until drain without image IO", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	fakeChafa(t, r, "process.stdout.write('encoded-frame');");
+	out.block();
+	r.onStreamMessage({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	await r.paintQueue;
+	await flush();
+	assert.equal(r.stdoutBlocked, true);
+	const before = out.chunks.length;
+	const latest = jpeg(200, 100);
+	const data = latest.toString("base64");
+	const decode = t.mock.method(Buffer, "from");
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let i = 0; i < 1000; i++) r.onStreamMessage({ type: "frame", data });
+	await r.paintQueue;
+	assert.equal(write.mock.callCount(), 0, "blocked frames do not touch disk");
+	assert.equal(decode.mock.calls.filter(({ arguments: args }) => args[1] === "base64").length, 0);
+	assert.equal(out.chunks.length, before);
+	out.drain();
+	await flush();
+	await r.paintQueue;
+	assert.equal(write.mock.callCount(), 1);
+	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
+	assert.equal(out.chunks.at(-1), "encoded-frame");
+	assert.equal(out.chunks.filter((chunk) => chunk === "encoded-frame").length, 2);
 });
 
 test("reconcile edge matrix: empty tail, ring boundary, duplicate texts", () => {
@@ -2163,20 +2320,42 @@ test("live timer: fires the shared poll and paints while streaming", async () =>
 	assert.match(r.consoleLines[0], /^✖ 500 GET/);
 });
 
-test("live timer: painted polls hold base cadence, empty polls back off", async () => {
+test("live timer: painted polls hold base cadence, empty polls back off", async (t) => {
 	const r = quietPoll(mkRenderer());
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
 	r.attached = true;
 	r.live = { ws: { close: () => {} } };
 	r.browser = { network: async () => [] };
 	let painted = true;
-	r.pollNetwork = async () => painted;
-	r.startNetworkTimer(5);
-	await new Promise((res) => setTimeout(res, 40));
-	assert.equal(r.networkIdleTicks, 0, "painted failures reset the counter");
+	let polls = 0;
+	r.pollNetwork = async () => { polls++; return painted; };
+	r.startNetworkTimer(1000);
+	t.after(() => r.stopNetworkTimer());
+	for (let i = 0; i < 3; i++) {
+		t.mock.timers.tick(1000);
+		await flush();
+		assert.equal(polls, i + 1);
+		assert.equal(r.networkIdleTicks, 0, "painted failures reset the counter");
+	}
 	painted = false;
-	await new Promise((res) => setTimeout(res, 40));
-	r.stopNetworkTimer();
-	assert.ok(r.networkIdleTicks > 0, "quiet polls accumulate idle ticks");
+	const start = Date.now();
+	for (let tick = 1; tick <= 301; tick++) {
+		const delay = tick <= 10 ? 1000 : tick <= 30 ? 2000 : tick <= 60 ? 4000 : tick <= 300 ? 8000 : 30000;
+		t.mock.timers.tick(delay - 1);
+		await flush();
+		assert.equal(polls, tick + 2, `tick ${tick} must wait its full delay`);
+		t.mock.timers.tick(1);
+		await flush();
+		assert.equal(polls, tick + 3);
+		if (tick === 300) assert.equal(Date.now() - start, 2_090_000, "300 idle ticks take about 35 minutes at a 1s base");
+	}
+	painted = true;
+	t.mock.timers.tick(30_000);
+	await flush();
+	assert.equal(r.networkIdleTicks, 0);
+	t.mock.timers.tick(1000);
+	await flush();
+	assert.equal(polls, 306, "painted poll restores the base delay");
 });
 
 test("live timer: dropLive clears it first; no fire after drop", async () => {
@@ -2292,12 +2471,14 @@ test("attach mode: tick connects, then only watches liveness", { skip: !canCdp }
 	assert.deepEqual(r.browser.calls, ["connect"], "no polling while attached");
 });
 
-test("attach mode: frames paint and ack with the integer id after the paint settles", { skip: !canCdp }, async () => {
+test("attach mode: frames paint and ack with the integer id after the paint settles", { skip: !canCdp }, async (t) => {
 	const r = attachRenderer();
 	r.browser = fakeCdpBackend();
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	let renders = 0;
 	r.renderImage = async () => {
 		renders++;
+		await new Promise((resolve) => setTimeout(resolve, 10));
 	};
 	await r.tick();
 	r.browser.emit({
@@ -2309,7 +2490,77 @@ test("attach mode: frames paint and ack with the integer id after the paint sett
 	});
 	await flush();
 	assert.equal(renders, 1, "frame painted");
-	assert.ok(r.browser.calls.includes("ack:42:1"), "acked after paint");
+	assert.ok(!r.browser.calls.includes("ack:42:1"), "no ack during the paint");
+	t.mock.timers.tick(9);
+	await flush();
+	assert.ok(!r.browser.calls.includes("ack:42:1"), "no ack before the paint settles");
+	t.mock.timers.tick(1);
+	await flush();
+	assert.equal(r.browser.calls.filter((c) => c === "ack:42:1").length, 1, "acked once after paint");
+});
+
+test("attach mode: coalesced frames each ack after their paint; input uses painted geometry", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	let paints = 0;
+	r.renderImage = async () => {
+		paints++;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	};
+	const emit = (ackId, width) => r.browser.emit({
+		type: "frame", ackId, gen: 1,
+		data: jpeg(width, 40).toString("base64"),
+		metadata: { deviceWidth: width * 2, deviceHeight: 80 },
+	});
+	const acks = () => r.browser.calls.filter((c) => c.startsWith("ack:"));
+	let inputState;
+	emit(1, 80);
+	await flush();
+	for (let id = 2; id <= 60; id++) emit(id, 100 + id);
+	r.userAction(async () => {
+		inputState = {
+			paints, width: imageDims(fs.readFileSync(r.shotJpg)).w,
+			point: r.cdpPagePoint({ x: 20, y: 10 }, { w: 80, h: 40 }),
+		};
+	});
+	assert.deepEqual(acks(), []);
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(inputState, { paints: 1, width: 80, point: { x: 40, y: 20 } });
+	assert.equal(paints, 2);
+	assert.deepEqual(acks(), ["ack:1:1"], "pending frame acks wait for the second paint");
+	t.mock.timers.tick(10);
+	await flush();
+	assert.deepEqual(acks(), Array.from({ length: 60 }, (_, i) => `ack:${i + 1}:1`));
+	assert.equal(r.lastFrameMeta.deviceWidth, 320);
+});
+
+test("attach mode: skipped and failed paints ack every frame and keep the queue usable", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	const emit = (ackId, data = jpeg(80, 40).toString("base64")) => r.browser.emit({ type: "frame", ackId, gen: 1, data });
+	r.stdoutBlocked = true;
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let id = 1; id <= 100; id++) emit(id);
+	await flush();
+	assert.equal(write.mock.callCount(), 0);
+	assert.equal(r.browser.calls.filter((c) => c.startsWith("ack:")).length, 100);
+	r.stdoutBlocked = false;
+	emit(101, "invalid JPEG");
+	await flush();
+	r.renderImage = async () => { throw new Error("paint failed"); };
+	emit(102);
+	await flush();
+	assert.equal(r.paintErrors, 1);
+	assert.ok(r.browser.calls.includes("ack:101:1"));
+	assert.ok(r.browser.calls.includes("ack:102:1"));
+	r.renderImage = async () => {};
+	emit(103);
+	await flush();
+	assert.equal(r.browser.calls.filter((c) => c === "ack:103:1").length, 1);
 });
 
 test("attach mode: clicks scale from frame pixels to page pixels per frame", async () => {
@@ -2460,6 +2711,28 @@ test("attach prompt refuses navigation-shaped input and keeps u for URLs", async
 	assert.equal(r.backend, "agent-browser", "bad input must not switch modes");
 });
 
+test("attach prompt rejects TLS endpoints without replacing the backend", async () => {
+	const r = quiet(mkRenderer());
+	r.tick = async () => {};
+	const browser = r.browser;
+	for (const scheme of ["https", "wss"]) {
+		await r.attachTo(`${scheme}://127.0.0.1:9222/devtools/browser/SECRET-TOKEN`);
+		assert.match(r.banner, /TLS is not supported/);
+		assert.ok(!r.banner.includes("SECRET-TOKEN"));
+		assert.equal(r.browser, browser);
+		assert.equal(r.backend, "agent-browser");
+	}
+});
+
+test("attach mode: configured TLS endpoints show a clear error", { skip: !canCdp }, async () => {
+	for (const scheme of ["https", "wss"]) {
+		const r = attachRenderer({ HERDR_BROWSER_CDP_URL: `${scheme}://127.0.0.1:1` });
+		assert.equal(r.backend, "attach", "configured endpoints still select attach mode");
+		assert.equal(await r.attachCdp(), false);
+		assert.match(r.banner, /TLS is not supported/);
+	}
+});
+
 test("attach switch resets reconciliation state and drops ownership", async () => {
 	const r = quiet(mkRenderer());
 	r.selfCreated = true;
@@ -2473,6 +2746,91 @@ test("attach switch resets reconciliation state and drops ownership", async () =
 	assert.deepEqual(r.consoleState, { count: 0, tail: [] });
 	assert.equal(r.lastHash, "");
 	assert.ok(r.consoleLines.some((l) => /switched to attach mode/.test(l)));
+});
+
+test("attach switch unsubscribes and closes the old CDP socket", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	const ws = {
+		closed: false,
+		send(raw) {
+			const m = JSON.parse(raw);
+			const result = m.method === "Target.getTargets"
+				? { targetInfos: [{ type: "page", targetId: "old", url: "https://old/" }] }
+				: m.method === "Target.attachToTarget" ? { sessionId: "session-old" } : {};
+			queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify({ id: m.id, result }) }));
+		},
+		close() { this.closed = true; this.onclose?.(); },
+	};
+	const old = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/old", {
+		wsFactory: () => { queueMicrotask(() => ws.onopen?.()); return ws; },
+	});
+	t.after(async () => { old.close(); await flush(); });
+	const onMessage = old.onMessage;
+	let unsubscribed = false;
+	old.onMessage = (fn) => { unsubscribed = fn === null; onMessage(fn); };
+	r.browser = old;
+	assert.equal(await r.attachCdp(), true);
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	ws.onmessage({ data: JSON.stringify({ method: "Target.targetDestroyed", params: { targetId: "old" } }) });
+	await flush();
+	assert.equal(unsubscribed, true);
+	assert.equal(ws.closed, true);
+	assert.equal(r.cdpTargetId, "new");
+});
+
+test("attach switch ignores queued events from the old adapter", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let late;
+	r.browser = fakeCdpBackend();
+	r.browser.onMessage = (fn) => { if (fn) late = fn; };
+	await r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	late({ type: "target_gone" });
+	late({ type: "endpoint_gone" });
+	assert.equal(r.cdpTargetId, "new");
+	assert.equal(r.attached, true);
+});
+
+test("attach switch ignores completion of an old connection", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let complete;
+	r.browser = fakeCdpBackend();
+	r.browser.connect = () => new Promise((resolve) => { complete = resolve; });
+	const connecting = r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.cdpTargetId = "new";
+	complete({ guid: "old", targetId: "old" });
+	assert.equal(await connecting, false);
+	assert.equal(r.cdpTargetId, "new");
+	assert.equal(r.attached, true);
+});
+
+test("attach switch ignores a late failure of an old connection", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	t.after(() => r.cleanup());
+	r.tick = async () => {};
+	let fail;
+	r.browser = fakeCdpBackend();
+	r.browser.connect = () => new Promise((_resolve, reject) => { fail = reject; });
+	const connecting = r.attachCdp();
+	await r.attachTo("http://127.0.0.1:2");
+	r.attached = true;
+	r.banner = "";
+	fail(new Error("endpoint timed out"));
+	assert.equal(await connecting, false);
+	assert.equal(r.attached, true, "the new endpoint stays attached");
+	assert.equal(r.banner, "", "no banner from the abandoned endpoint");
 });
 
 test("attach mode: a Cmd+click handoff file navigates the attached target", { skip: !canCdp }, async () => {
@@ -3079,14 +3437,15 @@ test("n shows the network view; a page-driving key clears the text view", async 
 	r.attached = true;
 	r.browser = {
 		networkRequests: async () => ({ title: "requests (1)", lines: ["GET 200 document https://x/"] }),
-		scroll: async () => {},
+		reload: async () => {},
 	};
 	r.feed("n");
 	await flush();
 	assert.equal(r.textView?.mode, "network");
 
-	// Scrolling drives the page, so it invalidates the captured text view.
-	r.feed("j");
+	// Reloading drives the page, so it invalidates the captured text view.
+	// (j/k page the text view itself while it is open.)
+	r.feed("r");
 	await flush();
 	assert.equal(r.textView, null);
 });
@@ -3103,9 +3462,799 @@ test("d without a prior snapshot banners and leaves no stale view", async () => 
 
 test("s while unattached banners instead of querying", async () => {
 	const r = quiet(mkRenderer());
+	r.agentBrowser = true;
 	r.browser = { snapshotText: async () => ({ title: "t", lines: [] }) };
 	r.feed("s");
 	await flush();
-	assert.match(r.banner, /no browser attached/);
+	assert.match(r.banner, /waiting for session "hb-test"/);
 	assert.equal(r.textView, null);
+});
+
+// --- Lifecycle and bounded memory ---
+
+// A child that ignores SIGTERM: `trap '' TERM` survives the exec, so the
+// sleep itself ignores SIGTERM and only SIGKILL ends it. It writes its pid
+// first so a test can check (and clean up) the exact process.
+const sigtermIgnoringScript = (seconds = 30) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-stubborn-"));
+	const bin = path.join(dir, "stubborn");
+	const pidFile = path.join(dir, "pid");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+trap '' TERM
+echo $$ > ${JSON.stringify(pidFile)}
+exec /bin/sleep ${seconds}
+`,
+		{ mode: 0o755 },
+	);
+	return { bin, pidFile };
+};
+const readPid = (file) => {
+	try {
+		return Number(fs.readFileSync(file, "utf8")) || null;
+	} catch {
+		return null;
+	}
+};
+const isAlive = (pid) => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+const killQuietly = (pid) => {
+	try {
+		if (pid) process.kill(pid, "SIGKILL");
+	} catch {
+		/* already gone */
+	}
+};
+
+test("launch mode: quitting before DevToolsActivePort exists kills the starting browser", { skip: !canCdp }, async () => {
+	// A Chromium that never writes its port file: the pane is still inside
+	// the startup wait when the quit arrives.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-slow-"));
+	const bin = path.join(dir, "slow-chromium");
+	const pidFile = path.join(dir, "pid");
+	fs.writeFileSync(bin, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\nexec /bin/sleep 30\n`, {
+		mode: 0o755,
+	});
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	let settled = false;
+	const launch = r.launchChromium().then(() => (settled = true));
+	let pid = null;
+	try {
+		assert.ok(await until(() => (pid = readPid(pidFile))), "fake Chromium started");
+		r.cleanup();
+		assert.ok(
+			await until(() => !isAlive(pid), 2_000),
+			"quit during startup must not orphan the launched browser",
+		);
+		assert.ok(await until(() => settled, 2_000), "quit cancels the startup wait");
+		assert.equal(r.launchedChild, null);
+		assert.doesNotMatch(r.banner, /did not expose a DevTools port/);
+	} finally {
+		killQuietly(pid);
+		await launch;
+	}
+});
+
+test("execFileBounded: a child that ignores SIGTERM is SIGKILLed after the grace", { timeout: 10_000 }, async () => {
+	const { bin, pidFile } = sigtermIgnoringScript();
+	try {
+		await assert.rejects(
+			execFileBounded(bin, [], { timeout: 300 }, 200),
+			(err) => err.signal === "SIGKILL",
+		);
+		assert.equal(isAlive(readPid(pidFile)), false);
+	} finally {
+		killQuietly(readPid(pidFile));
+	}
+});
+
+test("closeOwnSession: a close that ignores SIGTERM cannot hold quit past its timeout", () => {
+	// Self-exits after 6 s, so without SIGKILL the synchronous call returns
+	// at ~6 s instead of hanging the suite.
+	const { bin, pidFile } = sigtermIgnoringScript(6);
+	const r = quiet(mkRenderer());
+	r.bin = bin;
+	r.selfCreated = true;
+	r.ownershipEnabled = true;
+	const start = Date.now();
+	try {
+		r.closeOwnSession();
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 4_000, `close returned after ${elapsed} ms (timeout is 2 s)`);
+		assert.equal(isAlive(readPid(pidFile)), false);
+	} finally {
+		killQuietly(readPid(pidFile));
+	}
+});
+
+test("attach network dedupe expires keys past the window and caps the map", (t) => {
+	t.mock.timers.enable({ apis: ["Date"], now: 0 });
+	const r = quiet(mkRenderer());
+	r.queueConsolePaint = () => {};
+	const failure = (n) => ({
+		source: "network",
+		level: "error",
+		text: "failed",
+		url: `http://localhost/request/${n}`,
+	});
+	// One unique failure per simulated second for 10,000 seconds: only the
+	// last 60-second window may stay in the map.
+	for (let n = 0; n < 10_000; n++) {
+		t.mock.timers.setTime(n * 1_000);
+		r.pushLogEntry(failure(n));
+	}
+	assert.ok(
+		r.networkState.recent.size <= 61,
+		`expired keys must go (size ${r.networkState.recent.size})`,
+	);
+	// A burst inside one instant cannot grow the map without bound either.
+	for (let n = 0; n < 5_000; n++) r.pushLogEntry(failure(`burst-${n}`));
+	assert.ok(
+		r.networkState.recent.size <= 1_000,
+		`map must be capped (size ${r.networkState.recent.size})`,
+	);
+	// Dedupe itself still works: a repeat inside the window is suppressed,
+	// a repeat after the window paints again.
+	r.networkState.recent.clear();
+	r.consoleLines = [];
+	t.mock.timers.setTime(20_000_000);
+	r.pushLogEntry(failure("again"));
+	t.mock.timers.setTime(20_030_000);
+	r.pushLogEntry(failure("again"));
+	assert.equal(r.consoleLines.length, 1, "repeat inside the window is suppressed");
+	t.mock.timers.setTime(20_200_000);
+	r.pushLogEntry(failure("again"));
+	assert.equal(r.consoleLines.length, 2, "repeat after the window paints again");
+});
+
+test("pushConsole caps stored line length on a grapheme boundary", () => {
+	const r = quiet(mkRenderer());
+	r.pushConsole([{ text: "x".repeat(1_000_000), type: "log" }], false);
+	const stored = r.consoleLines.at(-1);
+	assert.ok(stored.length <= 2_100, `stored ${stored.length} chars for one line`);
+	assert.ok(stored.endsWith("…"), "a capped line says it was cut");
+	// "á̂" is 3 UTF-16 units (base + two marks that sanitize keeps), so the
+	// cut lands inside a cluster, which must be dropped whole.
+	const cluster = "a\u0301\u0302";
+	r.pushConsole([{ text: cluster.repeat(100_000), type: "log" }], false);
+	const body = r.consoleLines.at(-1).slice(2, -1);
+	assert.ok(body.length > 0);
+	assert.equal(body, cluster.repeat(body.length / 3));
+});
+
+test("capLength never splits a grapheme cluster", () => {
+	// "👩‍💻" is 5 UTF-16 units joined by a ZWJ.
+	assert.equal(capLength("👩‍💻".repeat(10), 12), "👩‍💻👩‍💻…");
+	assert.equal(capLength("👩‍💻".repeat(10), 10), "👩‍💻👩‍💻…");
+	assert.equal(capLength("🇺🇸🇺🇸", 6), "🇺🇸…");
+	assert.equal(capLength("short", 10), "short");
+});
+
+test("truncate stops scanning once the output width is reached", () => {
+	const big = "x".repeat(2_000_000);
+	let best = Infinity;
+	for (let i = 0; i < 3; i++) {
+		const start = performance.now();
+		assert.equal(truncate(big, 80), `${"x".repeat(79)}…`);
+		best = Math.min(best, performance.now() - start);
+	}
+	assert.ok(best < 30, `truncate of a 2M-char string took ${best.toFixed(1)} ms`);
+});
+
+test("chunked truncate matches whole-string segmentation across chunk edges", () => {
+	// Reference: the same width rule over one pass of the whole string.
+	// Cell widths come from truncate itself on each single cluster.
+	const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	const cells = (c) => (truncate(c, 1) === c ? 1 : 2);
+	const reference = (s, width) => {
+		let out = "";
+		let cut = null;
+		let w = 0;
+		for (const { segment } of seg.segment(s)) {
+			const cw = cells(segment);
+			if (cut === null && w + cw > width - 1) cut = out;
+			w += cw;
+			if (w > width) return `${cut}\u2026`;
+			out += segment;
+		}
+		return s;
+	};
+	const tails = [
+		"\u{1f469}\u200d\u{1f4bb}", // ZWJ sequence
+		"\u{1f1fa}\u{1f1f8}", // regional-indicator pair
+		"e\u0301\u0302", // combining marks
+		"\u6f22", // wide CJK
+		"\u{1f44d}\u{1f3fd}", // skin-tone modifier
+	];
+	for (const pad of [250, 253, 254, 255, 256, 257]) {
+		for (const t of tails) {
+			const s = "x".repeat(pad) + t.repeat(20);
+			for (const width of [pad - 1, pad, pad + 1, pad + 3, pad + 10, 10_000]) {
+				assert.equal(truncate(s, width), reference(s, width), `pad ${pad}, ${JSON.stringify(t)}, width ${width}`);
+			}
+		}
+	}
+	// One cluster longer than any chunk still counts as one cell.
+	const huge = `a${"\u0301".repeat(5_000)}`;
+	assert.equal(truncate(huge, 1), huge);
+	assert.equal(truncate(`${huge}bc`, 2), `${huge}\u2026`);
+});
+
+// --- Review regressions: frame arrival vs paint, stale frames, retained drain ---
+
+const liveRenderer = (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const r = quiet(mkRenderer());
+	r.fitViewport = async () => false;
+	r.startNetworkTimer = () => {};
+	r.browser = { streamEnable: async () => {}, streamStatus: async () => ({ port: 9222 }) };
+	const saved = global.WebSocket;
+	let socket;
+	global.WebSocket = class {
+		constructor() { socket = this; queueMicrotask(() => this.onopen()); }
+		close() { this.closed = true; }
+	};
+	t.after(() => { r.dropLive(); global.WebSocket = saved; });
+	const send = (m) => socket.onmessage({ data: JSON.stringify(m) });
+	return { r, send };
+};
+
+test("live stream counts a frame on arrival even when the paint queue is busy", async (t) => {
+	const { r, send } = liveRenderer(t);
+	assert.equal(await r.goLive(), true);
+	r.enqueue(() => new Promise(() => {})); // a slow input ahead of the frame
+	send({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	t.mock.timers.tick(5_000);
+	assert.notEqual(r.live, null, "a frame arrived; the stream must stay live");
+});
+
+test("live stream counts a frame on arrival even while stdout is blocked", async (t) => {
+	const { r, send } = liveRenderer(t);
+	assert.equal(await r.goLive(), true);
+	r.stdoutBlocked = true;
+	send({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	await flush();
+	t.mock.timers.tick(5_000);
+	assert.notEqual(r.live, null, "a frame arrived; the stream must stay live");
+});
+
+test("dropLive discards a pending stream frame so the poll PNG stays authoritative", async (t) => {
+	const { r, send } = liveRenderer(t);
+	assert.equal(await r.goLive(), true);
+	let release;
+	r.enqueue(() => new Promise((resolve) => { release = resolve; }));
+	await flush();
+	send({ type: "frame", data: jpeg(80, 40).toString("base64") });
+	r.dropLive("live stream dropped — polling");
+	const write = t.mock.method(fs, "writeFileSync");
+	release();
+	await r.paintQueue;
+	await flush();
+	assert.equal(write.mock.callCount(), 0, "stale stream frame never reaches disk");
+	assert.equal(r.shotFormat, "png");
+});
+
+test("attach mode: a target switch drops the pending frame but still acks it", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	let release;
+	const painted = [];
+	r.renderImage = async () => {
+		painted.push(imageDims(fs.readFileSync(r.shotJpg)).w);
+		if (painted.length === 1) await new Promise((resolve) => { release = resolve; });
+	};
+	const emit = (ackId, width) => r.browser.emit({ type: "frame", ackId, gen: 1, data: jpeg(width, 40).toString("base64") });
+	emit(1, 80);
+	await flush();
+	emit(2, 120); // pending behind the active paint
+	r.invalidateTarget();
+	r.cdpTargetId = "T2";
+	release();
+	await flush();
+	await r.paintQueue;
+	await flush();
+	assert.deepEqual(painted, [80], "the old tab's pending frame is not painted");
+	const acks = r.browser.calls.filter((c) => c.startsWith("ack:"));
+	assert.deepEqual(acks, ["ack:1:1", "ack:2:1"], "each frame acks exactly once");
+});
+
+test("attach mode: blocked stdout acks every frame, then paints only the latest after drain", { skip: !canCdp }, async (t) => {
+	const r = attachRenderer();
+	r.browser = fakeCdpBackend();
+	await r.tick();
+	const painted = [];
+	r.renderImage = async () => { painted.push(imageDims(fs.readFileSync(r.shotJpg)).w); };
+	r.stdoutBlocked = true;
+	const write = t.mock.method(fs, "writeFileSync");
+	for (let id = 1; id <= 5; id++) r.browser.emit({ type: "frame", ackId: id, gen: 1, data: jpeg(80 + id, 40).toString("base64") });
+	await flush();
+	await r.paintQueue;
+	assert.equal(write.mock.callCount(), 0);
+	assert.equal(r.browser.calls.filter((c) => c.startsWith("ack:")).length, 5);
+	r.stdoutBlocked = false;
+	r.queueFrame(); // what the drain listener does
+	await flush();
+	await r.paintQueue;
+	await flush();
+	assert.deepEqual(painted, [85], "the retained latest frame paints after drain");
+	assert.equal(r.browser.calls.filter((c) => c.startsWith("ack:")).length, 5, "no duplicate acks");
+});
+
+test("a stream frame retained behind a blocked Kitty PNG paints when stdout drains", async (t) => {
+	const r = imageRenderer();
+	const out = fakeOutput(t);
+	fakeChafa(t, r, "process.stdout.write('encoded-frame');");
+	fs.writeFileSync(r.shot, PNG_1PX);
+	out.block();
+	await r.renderImage(); // Kitty PNG path blocks stdout
+	assert.equal(r.stdoutBlocked, true);
+	const latest = jpeg(200, 100);
+	r.onStreamMessage({ type: "frame", data: latest.toString("base64") });
+	await flush();
+	await r.paintQueue;
+	out.drain();
+	await flush();
+	await r.paintQueue;
+	await flush();
+	assert.deepEqual(fs.readFileSync(r.shotJpg), latest);
+	assert.equal(out.chunks.at(-1), "encoded-frame");
+});
+
+// --- page text view: input isolation, staleness, paging, help/banners ---
+
+const textViewSize = (r, imageRows = 10) => {
+	r.size = () => ({ cols: 80, rows: imageRows + 4, imageRows, consoleRows: 0, imageTopRow: 3, bottomRow: imageRows + 4 });
+};
+const openSnapshot = async (r, lines) => {
+	r.browser = { ...r.browser, snapshotText: async () => ({ title: "page", lines }) };
+	r.feed("s");
+	await flush();
+	assert.equal(r.textView?.mode, "snapshot");
+};
+const captureStdout = (fn) => {
+	const write = process.stdout.write;
+	const chunks = [];
+	process.stdout.write = (text) => { chunks.push(String(text)); return true; };
+	try { fn(); } finally { process.stdout.write = write; }
+	return chunks.join("");
+};
+
+test("text view: clicks and wheel never reach the page behind the text", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.mode = "symbols";
+	fs.writeFileSync(r.shot, PNG_1PX);
+	const calls = [];
+	r.browser = {
+		click: async (x, y) => calls.push(["click", x, y]),
+		scroll: async (dir) => calls.push(["scroll", dir]),
+	};
+	await openSnapshot(r, ['button "Delete account" @e1']);
+	r.feed("\x1b[<0;2;4M");
+	r.feed("\x1b[<65;2;4M");
+	await flush();
+	assert.deepEqual(calls, [], "the text view hides the screenshot: no click-through");
+	assert.equal(r.textView?.mode, "snapshot", "the view stays open");
+});
+
+test("text view: a click queued before the view opened is dropped when it runs", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.mode = "symbols";
+	fs.writeFileSync(r.shot, PNG_1PX);
+	const clicks = [];
+	let release;
+	r.browser = {
+		click: async (x, y) => clicks.push([x, y]),
+		snapshotText: () => new Promise((resolve) => { release = () => resolve({ title: "page", lines: ["x"] }); }),
+	};
+	r.feed("s");
+	await flush();
+	r.feed("\x1b[<0;2;4M"); // view not open yet: the click is queued behind s
+	release();
+	await flush();
+	assert.equal(r.textView?.mode, "snapshot");
+	assert.deepEqual(clicks, [], "the queued click re-checks the text view before it runs");
+});
+
+test("text view: every push path drops a stale snapshot or diff on navigation", async () => {
+	const pushes = [
+		["stream url", (r) => r.onStreamMessage({ type: "url", url: "https://b/" })],
+		["stream tabs", (r) => r.onStreamMessage({ type: "tabs", tabs: [{ active: true, url: "https://b/", title: "B" }] })],
+		["cdp url", (r) => r.onCdpMessage({ type: "url", url: "https://b/" })],
+		["cdp target_selected", (r) => r.onCdpMessage({ type: "target_selected", targetId: "T2", url: "https://b/", title: "B" })],
+	];
+	for (const [name, push] of pushes) {
+		for (const mode of ["snapshot", "diff", "network"]) {
+			const r = quiet(mkRenderer());
+			r.attached = true;
+			r.lastUrl = "https://a/";
+			r.textView = { mode, title: "a", lines: ["x"], url: "https://a/" };
+			push(r);
+			await flush();
+			if (mode === "network") assert.equal(r.textView?.mode, "network", `${name}: the request log survives navigation`);
+			else assert.equal(r.textView, null, `${name}: a ${mode} view of the old page is dropped`);
+		}
+	}
+	// A push for the same page keeps the view.
+	const r = quiet(mkRenderer());
+	r.lastUrl = "https://a/";
+	r.textView = { mode: "snapshot", title: "a", lines: ["x"], url: "https://a/" };
+	r.onStreamMessage({ type: "tabs", tabs: [{ active: true, url: "https://a/", title: "A" }] });
+	assert.equal(r.textView?.mode, "snapshot");
+});
+
+test("text view: a reload or tab switch drops a stale view even at the same URL", async () => {
+	for (const [name, push] of [
+		["cdp document", (r) => r.onCdpMessage({ type: "document", url: "https://a/" })],
+		["cdp target_selected", (r) => r.onCdpMessage({ type: "target_selected", targetId: "T2", url: "https://a/", title: "A" })],
+	]) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		r.lastUrl = "https://a/";
+		r.textView = { mode: "snapshot", title: "a", lines: ["x"], url: "https://a/" };
+		push(r);
+		await flush();
+		assert.equal(r.textView, null, `${name}: new content at the same URL is not the captured page`);
+	}
+	// A metadata-only update (title change) keeps the view.
+	const r = quiet(mkRenderer());
+	r.lastUrl = "https://a/";
+	r.textView = { mode: "snapshot", title: "a", lines: ["x"], url: "https://a/" };
+	r.onCdpMessage({ type: "url", url: "https://a/", title: "A (1)" });
+	assert.equal(r.textView?.mode, "snapshot");
+});
+
+test("text view: paging keys in the same read as a view key never reach the page", async () => {
+	for (const batch of ["sj", "s j", "sG", "s\x1b[6~"]) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		const calls = [];
+		r.browser = {
+			snapshotText: async () => ({ title: "page", lines: ["x"] }),
+			scroll: async (...a) => calls.push(["scroll", ...a]),
+			back: async () => calls.push(["back"]),
+		};
+		r.feed(batch);
+		await flush();
+		assert.deepEqual(calls, [], `${JSON.stringify(batch)}: nothing reaches the page`);
+	}
+	// Closing with the view's own key, then j in the same read: the page stays put.
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	const calls = [];
+	await openSnapshot(r, ["x"]);
+	r.browser = { ...r.browser, scroll: async (...a) => calls.push(["scroll", ...a]) };
+	r.feed("sj");
+	await flush();
+	assert.equal(r.textView, null);
+	assert.deepEqual(calls, []);
+	// A later, separate read drives the page as usual.
+	r.feed("j");
+	await flush();
+	assert.equal(calls.length, 1);
+});
+
+test("text view: a backend switch forgets the last snapshot and the open view", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	await openSnapshot(r, ['@e1 [button] "Save"']);
+	r.browser = { ...r.browser, sessionExists: async () => false };
+	await r.attachTo("http://127.0.0.1:9222");
+	await flush();
+	assert.equal(r.lastSnapshot, null);
+	assert.equal(r.textView, null);
+	r.attached = true;
+	r.browser = { snapshotText: async () => ({ title: "other", lines: ["y"] }) };
+	r.feed("d");
+	await flush();
+	assert.match(r.banner, /press s first/);
+	assert.equal(r.textView, null);
+});
+
+test("text view: j/k, space/b, PgDn/PgUp and g/G page the text without touching the page", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	textViewSize(r, 10); // 1 title row + 8 text rows + 1 footer row
+	r.renderTextView = () => {};
+	const scrolls = [];
+	r.browser = { scroll: async (dir) => scrolls.push(dir) };
+	await openSnapshot(r, Array.from({ length: 50 }, (_, i) => `line ${i}`));
+	const offset = () => r.textView.offset ?? 0;
+	r.feed("j"); assert.equal(offset(), 1);
+	r.feed("j"); assert.equal(offset(), 2);
+	r.feed("k"); assert.equal(offset(), 1);
+	r.feed("k"); r.feed("k"); assert.equal(offset(), 0, "k stops at the top");
+	r.feed(" "); assert.equal(offset(), 8);
+	r.feed("\x1b[6~"); assert.equal(offset(), 16);
+	r.feed("\x1b[5~"); assert.equal(offset(), 8);
+	r.feed("b"); assert.equal(offset(), 0);
+	r.feed("G"); assert.equal(offset(), 42, "G shows the last line");
+	r.feed("j"); assert.equal(offset(), 42, "j stops at the bottom");
+	r.feed("g"); assert.equal(offset(), 0);
+	await flush();
+	assert.deepEqual(scrolls, [], "paging never calls browser.scroll");
+	assert.equal(r.textView?.mode, "snapshot", "paging keeps the view open");
+});
+
+test("text view: paging works in observe-only mode", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	textViewSize(r, 10);
+	r.renderTextView = () => {};
+	r.browser = {};
+	await openSnapshot(r, Array.from({ length: 50 }, (_, i) => `line ${i}`));
+	r.feed("o");
+	assert.equal(r.observeOnly, true);
+	r.banner = "";
+	r.feed("j");
+	r.feed(" ");
+	assert.equal(r.textView.offset, 9);
+	assert.doesNotMatch(r.banner, /observe-only/, "paging is not page input");
+});
+
+test("text view: Esc or the view's own key closes it; other view keys switch", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.browser = {}; // a plain fake: the real agent-browser would slow every queued tick
+	await openSnapshot(r, ["a"]);
+	r.onKey("\x1b");
+	await flush();
+	assert.equal(r.textView, null, "Esc closes the snapshot");
+
+	r.browser.networkRequests = async () => ({ title: "requests (1)", lines: ["GET 200"] });
+	r.feed("n");
+	await flush();
+	assert.equal(r.textView?.mode, "network");
+	r.feed("n");
+	await flush();
+	assert.equal(r.textView, null, "n closes the request table");
+
+	r.feed("s");
+	await flush();
+	r.feed("d");
+	await flush();
+	assert.equal(r.textView?.mode, "diff");
+	r.feed("d");
+	await flush();
+	assert.equal(r.textView, null, "d closes the diff");
+});
+
+test("text view: the overflow footer is visible and tracks the scroll position", () => {
+	const r = quiet(mkRenderer());
+	textViewSize(r, 10);
+	r.textView = { mode: "snapshot", title: "page", lines: Array.from({ length: 50 }, (_, i) => `line ${i}`), url: "" };
+	let out = captureStdout(() => r.renderTextView());
+	assert.match(out, /line 7\b/);
+	assert.doesNotMatch(out, /line 8\b/);
+	assert.match(out, /… 42 more/, "the footer row is inside the image region");
+	r.feed("G");
+	out = captureStdout(() => r.renderTextView());
+	assert.match(out, /line 49\b/);
+	assert.doesNotMatch(out, /more/);
+	// The footer row is the last image row, never below it.
+	const rowsWritten = [...out.matchAll(/\x1b\[(\d+);1H/g)].map((m) => Number(m[1]));
+	assert.ok(Math.max(...rowsWritten) <= 3 + 10 - 1);
+});
+
+test("text view: the help line names the view keys", () => {
+	const r = quiet(mkRenderer());
+	r.textView = { mode: "snapshot", title: "page", lines: ["a"], url: "" };
+	const out = captureStdout(() => Renderer.prototype.renderBottom.call(r));
+	assert.match(out, /j\/k/);
+	assert.match(out, /PgUp\/PgDn/);
+	assert.match(out, /g\/G/);
+	assert.match(out, /s\/Esc:close/);
+	assert.doesNotMatch(out, /scroll/);
+});
+
+test("help: t:tabs only in attach mode, and i has one label", () => {
+	const help = (setup) => {
+		const r = quiet(mkRenderer());
+		setup(r);
+		return captureStdout(() => Renderer.prototype.renderBottom.call(r));
+	};
+	assert.doesNotMatch(help((r) => { r.observeOnly = true; }), /t:tabs/, "agent-browser observe-only");
+	assert.match(help((r) => { r.observeOnly = true; r.backend = "attach"; }), /t:tabs/);
+	const ab = help(() => {});
+	const attach = help((r) => { r.backend = "attach"; });
+	assert.doesNotMatch(ab + attach, /i:text/);
+	assert.match(ab, /i:type/);
+	assert.match(attach, /i:type/);
+});
+
+test("banners: t, s, n and d while unattached show the same waiting advice as the tick", async () => {
+	const r = quiet(mkRenderer());
+	r.agentBrowser = true;
+	r.browser = { sessionExists: async () => false, snapshotText: async () => ({ title: "t", lines: [] }) };
+	await r.tick();
+	const waiting = r.banner;
+	assert.match(waiting, /--session hb-test/, "the agent path is part of the advice");
+	assert.ok(waiting.includes(linkClickLabel()), "the click hint names this platform's modifier");
+	for (const key of ["t", "s", "n", "d"]) {
+		r.banner = "";
+		r.feed(key);
+		await flush();
+		assert.equal(r.banner, waiting, `${key} while unattached`);
+		assert.equal(r.textView, null);
+	}
+});
+
+test("platform hints: Cmd+click on macOS, Ctrl+click elsewhere; chafa install advice per platform", () => {
+	assert.equal(linkClickLabel("darwin"), "Cmd+click");
+	assert.equal(linkClickLabel("linux"), "Ctrl+click");
+	assert.match(chafaInstallHint("darwin"), /brew install chafa/);
+	assert.doesNotMatch(chafaInstallHint("linux"), /brew/);
+	assert.match(chafaInstallHint("linux"), /apt install chafa/);
+});
+
+// --- Launcher hardening: handoff completeness and one sandbox env path ---
+
+test("an empty or unterminated handoff file is left for its writer, then navigates once", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	r.attached = true;
+	const opened = [];
+	r.browser = { ...r.browser, open: async (u) => opened.push(u) };
+	r.startNavigateWatch();
+	const f = path.join(r.stateDir, `navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}`);
+	fs.writeFileSync(f, "");
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, [], "an empty file is not a click");
+	assert.ok(fs.existsSync(f), "an empty file is not deleted");
+	fs.writeFileSync(f, "http://localhost:3000/pa");
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, [], "a line with no newline is still being written");
+	assert.ok(fs.existsSync(f), "a partial line is not deleted");
+	fs.writeFileSync(f, "http://localhost:3000/page\n");
+	r.consumeNavigateFile();
+	r.consumeNavigateFile();
+	await flush();
+	assert.deepEqual(opened, ["http://localhost:3000/page"], "the full line navigates once");
+	assert.ok(!fs.existsSync(f), "a consumed handoff is removed");
+	r.navigateWatcher?.close();
+});
+
+test("the handoff watcher ignores open.sh's temp file", { skip: !canCdp }, async () => {
+	const r = quiet(mkRenderer({ HERDR_BROWSER_LAUNCH: "1" }));
+	r.attached = true;
+	const opened = [];
+	r.browser = { ...r.browser, open: async (u) => opened.push(u) };
+	r.startNavigateWatch();
+	const tmp = path.join(r.stateDir, `.navigate-${safeWsId(r.env.HERDR_WORKSPACE_ID)}.abc123`);
+	fs.writeFileSync(tmp, "http://localhost:3000/tmp\n");
+	await new Promise((res) => setTimeout(res, 200));
+	await flush();
+	assert.deepEqual(opened, []);
+	assert.ok(fs.existsSync(tmp), "the watcher never touches the temp name");
+	r.navigateWatcher?.close();
+});
+
+test("agentBrowserSandboxEnv appends to the user's AGENT_BROWSER_ARGS", () => {
+	assert.deepEqual(agentBrowserSandboxEnv({ AGENT_BROWSER_ARGS: "--proxy-server=x" }), {});
+	assert.deepEqual(agentBrowserSandboxEnv({ CI: "1", AGENT_BROWSER_ARGS: "--proxy-server=x" }), {
+		AGENT_BROWSER_ARGS: "--proxy-server=x,--no-sandbox,--disable-dev-shm-usage",
+	});
+	// A newline-separated value keeps its separator, so commas inside a
+	// value (--window-size=1280,720) are not reinterpreted.
+	assert.deepEqual(
+		agentBrowserSandboxEnv({ CI: "1", AGENT_BROWSER_ARGS: "--window-size=1280,720\n" }),
+		{ AGENT_BROWSER_ARGS: "--window-size=1280,720\n--no-sandbox\n--disable-dev-shm-usage" },
+	);
+	// Already present: nothing to add, nothing to change.
+	assert.deepEqual(
+		agentBrowserSandboxEnv({ CI: "1", AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage" }),
+		{},
+	);
+});
+
+test("chromium-args CLI emits a NUL-terminated record the shell reads without eval", () => {
+	const cli = path.join(repoRoot, "bin", "chromium-args.mjs");
+	const run = (env) =>
+		execFileSync(process.execPath, [cli, "--agent-browser-args"], { env, encoding: "utf8" });
+	assert.equal(
+		run({ CI: "1", AGENT_BROWSER_ARGS: "a\nb" }),
+		"set\0a\nb\n--no-sandbox\n--disable-dev-shm-usage\0",
+	);
+	if (chromiumSandboxArgs({}).length === 0) assert.equal(run({}), "keep\0");
+});
+
+test("makeBrowser keeps the caller's AGENT_BROWSER_ARGS when it adds the CI fallback", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-abenv-"));
+	const stub = path.join(dir, "ab-stub");
+	const out = path.join(dir, "env");
+	fs.writeFileSync(
+		stub,
+		`#!/usr/bin/env bash\nprintf '%s' "$AGENT_BROWSER_ARGS" > "${out}"\necho '{"success":true,"data":{"sessions":[]}}'\n`,
+	);
+	fs.chmodSync(stub, 0o755);
+	await makeBrowser("s", stub, {
+		PATH: process.env.PATH,
+		CI: "1",
+		AGENT_BROWSER_ARGS: "--proxy-server=x",
+	}).sessionExists();
+	const seen = fs.readFileSync(out, "utf8").split(",");
+	assert.ok(seen.includes("--proxy-server=x"), "the user's args survive");
+	assert.ok(seen.includes("--no-sandbox"), "the fallback is appended");
+});
+
+test("launch mode reads the sandbox fallback from the renderer's env, not process.env", { skip: !canCdp }, async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-args-"));
+	const bin = path.join(dir, "fake-chromium");
+	const argsOut = path.join(dir, "args");
+	fs.writeFileSync(
+		bin,
+		`#!/bin/sh
+printf '%s\\n' "$@" > "${argsOut}"
+d=""
+for a in "$@"; do case "$a" in --user-data-dir=*) d="\${a#--user-data-dir=}";; esac; done
+printf '9876\\n/devtools/browser/fake-guid\\n' > "$d/DevToolsActivePort"
+exec sleep 30
+`,
+		{ mode: 0o755 },
+	);
+	const savedCi = process.env.CI;
+	delete process.env.CI;
+	try {
+		const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin, CI: "1" }));
+		r.attachTo = async () => {};
+		await r.launchChromium();
+		await until(() => fs.existsSync(argsOut));
+		r.cleanup();
+		assert.ok(
+			fs.readFileSync(argsOut, "utf8").split("\n").includes("--no-sandbox"),
+			"CI in the injected env must reach the launch args",
+		);
+	} finally {
+		if (savedCi === undefined) delete process.env.CI;
+		else process.env.CI = savedCi;
+	}
+});
+
+test("text view: a snapshot or diff that finishes after a page change is discarded", async () => {
+	const pending = (r) => {
+		let answer;
+		r.browser = { snapshotText: () => new Promise((resolve) => { answer = resolve; }) };
+		return () => answer({ title: "old page", lines: ['@e1 [button] "Old"'] });
+	};
+	for (const [name, change] of [
+		["navigation", (r) => r.onCdpMessage({ type: "url", url: "https://b/" })],
+		["same-URL reload", (r) => r.onCdpMessage({ type: "document", url: "https://a/" })],
+		["tab switch", (r) => r.onCdpMessage({ type: "target_selected", targetId: "T2", url: "https://a/", title: "A" })],
+	]) {
+		const r = quiet(mkRenderer());
+		r.attached = true;
+		r.lastUrl = "https://a/";
+		const finish = pending(r);
+		r.feed("s");
+		await flush();
+		change(r);
+		finish();
+		await flush();
+		assert.equal(r.textView, null, `${name}: the old page's snapshot is not shown`);
+		assert.equal(r.lastSnapshot, null, `${name}: nor kept as the diff baseline`);
+		assert.match(r.banner, /page changed/);
+	}
+	// A diff whose browser changed mid-query is discarded the same way.
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.lastUrl = "https://a/";
+	r.lastSnapshot = ['@e1 [button] "A"'];
+	const finish = pending(r);
+	r.feed("d");
+	await flush();
+	r.browser = { ...r.browser };
+	finish();
+	await flush();
+	assert.equal(r.textView, null);
+	assert.match(r.banner, /page changed/);
 });

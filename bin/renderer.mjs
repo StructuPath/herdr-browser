@@ -3,7 +3,6 @@
 // It stays passive until explicit pane input, never clears the console buffer,
 // and closes only sessions that its own successful navigation created.
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
@@ -11,10 +10,19 @@ import path from "node:path";
 import { makeCdpBrowser, cdpSupported, redactWsUrl } from "./cdp.mjs";
 import { formatRequests, parseAgentSnapshot, diffSnapshot } from "./page-text.mjs";
 import { chromiumSandboxArgs, agentBrowserSandboxEnv } from "./chromium-args.mjs";
+import {
+	PANE_STATE_TAIL,
+	buildPaneState,
+	paneStateFile,
+	paneStateKey,
+	removePaneStateIfOwned,
+	writePaneState,
+} from "./pane-state.mjs";
+
+/** @typedef {import("./backend.js").Backend} Backend */
 
 export { chromiumSandboxArgs } from "./chromium-args.mjs";
 
-const pExecFile = promisify(execFile);
 const ESC = "\x1b";
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 // Fixed graphics id for the pane's screenshot frame: re-transmitting data
@@ -24,6 +32,8 @@ const KITTY_IMAGE_ID = 1;
 // chafa emits anonymous kitty placements (no id), and full repaints/cleanup
 // must clear everything — our id-addressed frames included.
 const KITTY_DELETE_ALL = `${ESC}_Ga=d,d=A${ESC}\\`;
+// Stored console line length. Far past any pane width; the overflow is noise.
+const CONSOLE_LINE_MAX_CHARS = 2_000;
 
 // --- pure helpers (unit-tested) ---
 
@@ -58,9 +68,22 @@ export function deriveSession(env, cwd) {
 	const res = spawnSync("sh", ["-c", "printf '%s\\n' \"$HB_CWD\" | cksum"], {
 		env: { ...process.env, HB_CWD: cwd },
 		timeout: 5000,
+		killSignal: "SIGKILL",
 	});
 	const sum = res.stdout ? res.stdout.toString().split(" ")[0].trim() : "";
 	return `herdr-cwd-${sum || "unknown"}`;
+}
+
+// HERDR_PLUGIN_STATE_DIR comes from the environment: expand a literal
+// leading '~' (nothing expands it inside a variable value) and refuse
+// relative paths — otherwise state silently lands in a per-cwd tree.
+// Must stay in lockstep with state_dir() in scripts/lib.sh.
+export function resolveStateDir(env) {
+	const fallback = path.join(env.HOME || ".", ".local/state/herdr-browser");
+	let dir = env.HERDR_PLUGIN_STATE_DIR || fallback;
+	if (dir === "~" || dir.startsWith("~/"))
+		dir = path.join(env.HOME || ".", dir.slice(1));
+	return path.isAbsolute(dir) ? dir : fallback;
 }
 
 // Console cursor reconciliation over agent-browser's 1000-entry ring buffer.
@@ -105,6 +128,30 @@ export function consoleTail(entries, n = 8) {
 // Boolean knobs accept the common spellings; anything else is off.
 export function truthyConfig(value) {
 	return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
+}
+
+// User-facing platform wording: the link-handoff modifier and how to get
+// chafa. Herdr opens links with Cmd+click on macOS and Ctrl+click elsewhere.
+export function linkClickLabel(platform = process.platform) {
+	return platform === "darwin" ? "Cmd+click" : "Ctrl+click";
+}
+
+export function chafaInstallHint(platform = process.platform) {
+	if (platform === "darwin") return "brew install chafa";
+	if (platform === "linux")
+		return "sudo apt install chafa (or: dnf install chafa, pacman -S chafa)";
+	return "see https://hpjansson.org/chafa/download/";
+}
+
+// Keys textViewNav owns; dropped (not sent to the page) when they follow a
+// view key in the same input read.
+const TEXT_VIEW_NAV_KEYS = new Set(["j", "k", " ", "b", "g", "G", "\x1b[5~", "\x1b[6~"]);
+
+// Text rows a page text view shows between its title row and footer: the
+// footer row is only spent when the text does not fit.
+function textViewBodyRows(total, imageRows) {
+	const all = Math.max(1, imageRows - 1);
+	return total <= all ? all : Math.max(1, imageRows - 2);
 }
 
 // Locate a launchable Chromium for launch mode (the l key). An explicit
@@ -201,27 +248,56 @@ function cellWidth(s) {
 	return w;
 }
 
+// Segment in bounded chunks and stop as soon as the string is known not to
+// fit, so a huge input costs only what the output width needs. Node 20's
+// Intl.Segmenter pays for the whole input on every step, so a lazy pass over
+// the full string is not enough. Each chunk starts on a known boundary and,
+// as in capLength, carries one code point of lookahead; only segments that
+// end inside the chunk are trusted. A cluster longer than the chunk doubles it.
 export function truncate(s, width) {
 	if (width <= 0) return "";
-	const clusters = Array.from(graphemeSegmenter.segment(s), ({ segment }) => ({
-		segment,
-		width: cellWidth(segment),
-	}));
-	if (clusters.reduce((sum, cluster) => sum + cluster.width, 0) <= width) return s;
 	let out = "";
+	let cut = null; // the longest prefix that leaves room for "…"
 	let w = 0;
-	for (const cluster of clusters) {
-		if (w + cluster.width > width - 1) break;
-		out += cluster.segment;
-		w += cluster.width;
+	let pos = 0;
+	let chunk = 256;
+	while (pos < s.length) {
+		const tail = pos + chunk >= s.length;
+		const part = tail ? s.slice(pos) : s.slice(pos, pos + chunk + 2);
+		let done = 0;
+		for (const { index, segment } of graphemeSegmenter.segment(part)) {
+			if (!tail && index + segment.length > chunk) break;
+			const cw = cellWidth(segment);
+			if (cut === null && w + cw > width - 1) cut = out;
+			w += cw;
+			if (w > width) return cut + "…";
+			out += segment;
+			done = index + segment.length;
+		}
+		if (done === 0) chunk *= 2;
+		else pos += done;
 	}
-	return out + "…";
+	return s;
+}
+
+// Cap a string at maxLen UTF-16 units without splitting a grapheme cluster.
+// A break depends on the text before it and only one code point after it,
+// so segmenting the first maxLen + 2 units (that code point kept whole)
+// finds the same boundaries up to maxLen as segmenting the full string.
+export function capLength(s, maxLen) {
+	if (s.length <= maxLen) return s;
+	let end = 0;
+	for (const { index, segment } of graphemeSegmenter.segment(s.slice(0, maxLen + 2))) {
+		if (index + segment.length > maxLen) break;
+		end = index + segment.length;
+	}
+	return s.slice(0, end) + "…";
 }
 
 // Poll backoff: each tick spawns 4 agent-browser subprocesses, so a quiet
 // page should not be polled at full rate forever. Any observed change (or
 // user input) resets idleTicks to 0 and restores the base cadence. After
-// ~5 quiet minutes the floor drops to 30x — an unwatched pane costs ~zero.
+// 300 quiet ticks (~35 minutes at a 1s base) the delay reaches 30x.
 export function pollDelay(baseMs, idleTicks) {
 	const mult =
 		idleTicks < 10
@@ -362,6 +438,12 @@ export function viewportForPane(frameWidth, { cols, imageRows }) {
 // Seen-set membership means "already reported OR resolved to a non-failure
 // status": an in-flight request must stay classifiable until its status
 // lands, or a 500 arriving one poll late would be swallowed forever.
+// Failure dedupe window, shared by the poll feed and attach-mode log entries.
+const NETWORK_DEDUPE_WINDOW_MS = 60_000;
+// Attach mode has no per-poll prune; a burst of unique failing URLs inside
+// one window must not grow the dedupe map without bound either.
+const NETWORK_DEDUPE_MAX_KEYS = 1_000;
+
 export function newNetworkState() {
 	return {
 		seen: new Set(), // requestIds reported or resolved 2xx/3xx
@@ -371,7 +453,7 @@ export function newNetworkState() {
 
 export function diffNetworkFailures(state, entries, nowMs, opts = {}) {
 	const ageThresholdMs = opts.ageThresholdMs ?? 15_000;
-	const dedupeWindowMs = opts.dedupeWindowMs ?? 60_000;
+	const dedupeWindowMs = opts.dedupeWindowMs ?? NETWORK_DEDUPE_WINDOW_MS;
 	const maxPerPoll = opts.maxPerPoll ?? 5;
 	const currentIds = new Set();
 	const candidates = [];
@@ -435,6 +517,32 @@ export function formatNetworkFailure({ method, url, status }) {
 
 // --- agent-browser access ---
 
+// promisify(execFile) with a hard bound: execFile's timeout only sends
+// SIGTERM, and a child that ignores it keeps the call pending forever. After
+// the grace, SIGKILL the child and drop its pipes (a grandchild holding them
+// open would also hold the call).
+export function execFileBounded(bin, args, opts, graceMs = 2_000) {
+	return new Promise((resolve, reject) => {
+		let killTimer = null;
+		const child = execFile(bin, args, opts, (err, stdout, stderr) => {
+			clearTimeout(timeoutTimer);
+			clearTimeout(killTimer);
+			if (err) reject(Object.assign(err, { stdout, stderr }));
+			else resolve({ stdout, stderr });
+		});
+		const timeoutTimer = opts?.timeout > 0
+			? setTimeout(() => {
+					killTimer = setTimeout(() => {
+						child.kill("SIGKILL");
+						child.stdout?.destroy();
+						child.stderr?.destroy();
+					}, graceMs);
+				}, opts.timeout)
+			: null;
+	});
+}
+
+/** @returns {Backend} */
 export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Console rings on noisy pages reach several MB — Node's 1 MiB default
 	// maxBuffer would throw on every tick and freeze the pane for good.
@@ -442,7 +550,8 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// Inherit the caller's configuration unchanged. Injecting an idle timeout
 	// makes agent-browser restart an existing daemon and lose its browser.
 	// On CI/container boxes agent-browser needs AGENT_BROWSER_ARGS to fall back
-	// to --no-sandbox, or its Chrome dies before any command returns.
+	// to --no-sandbox, or its Chrome dies before any command returns. The
+	// fallback is appended; the caller's own AGENT_BROWSER_ARGS are kept.
 	const runEnv = { ...env, ...agentBrowserSandboxEnv(env) };
 	const parse = (stdout, what) => {
 		let parsed;
@@ -458,7 +567,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 	// batch --json returns an array of {command, error, result, success};
 	// --bail shortens the array after the first failure.
 	const batch = async (cmds, timeout = 10_000) => {
-		const { stdout } = await pExecFile(
+		const { stdout } = await execFileBounded(
 			bin,
 			["--session", session, "batch", "--bail", "--json", ...cmds],
 			{ timeout, maxBuffer, env: runEnv },
@@ -473,7 +582,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		return arr.map((r) => r.result);
 	};
 	const run = async (...args) => {
-		const { stdout } = await pExecFile(
+		const { stdout } = await execFileBounded(
 			bin,
 			["--session", session, ...args, "--json"],
 			{
@@ -575,7 +684,7 @@ export function makeBrowser(session, bin = "agent-browser", env = process.env) {
 		},
 		sessionExists: async () => {
 			try {
-				const { stdout } = await pExecFile(bin, ["session", "list", "--json"], {
+				const { stdout } = await execFileBounded(bin, ["session", "list", "--json"], {
 					timeout: 10_000,
 					maxBuffer,
 					env: runEnv,
@@ -599,17 +708,7 @@ export class Renderer {
 	constructor(env = process.env) {
 		this.env = env;
 		this.session = deriveSession(env, process.cwd());
-		// HERDR_PLUGIN_STATE_DIR comes from the environment: expand a literal
-		// leading '~' (nothing expands it inside a variable value) and refuse
-		// relative paths — otherwise state silently lands in a per-cwd tree.
-		let dir =
-			env.HERDR_PLUGIN_STATE_DIR ||
-			path.join(env.HOME || ".", ".local/state/herdr-browser");
-		if (dir === "~" || dir.startsWith("~/"))
-			dir = path.join(env.HOME || ".", dir.slice(1));
-		if (!path.isAbsolute(dir))
-			dir = path.join(env.HOME || ".", ".local/state/herdr-browser");
-		this.stateDir = dir;
+		this.stateDir = resolveStateDir(env);
 		fs.mkdirSync(this.stateDir, { recursive: true });
 		fs.chmodSync(this.stateDir, 0o700);
 		this.shot = path.join(
@@ -636,8 +735,10 @@ export class Renderer {
 		this.ownershipEnabled = this.backend !== "attach";
 		this.backendName = this.backend === "attach" ? "browser endpoint" : "agent-browser";
 		const onPath = (cmd) =>
-			spawnSync("sh", ["-c", `command -v ${cmd}`], { timeout: 5000 }).status ===
-			0;
+			spawnSync("sh", ["-c", `command -v ${cmd}`], {
+				timeout: 5000,
+				killSignal: "SIGKILL",
+			}).status === 0;
 		this.agentBrowser = onPath(this.bin);
 		this.chafa = onPath("chafa");
 		// Clamp both ends: tiny/negative values busy-loop; values past the
@@ -680,10 +781,15 @@ export class Renderer {
 		// while set; lastSnapshot backs the diff key.
 		this.textView = null;
 		this.lastSnapshot = null;
+		this.pageRevision = 0; // bumped by a reload, tab switch, or target reset
 		this.pasteState = null;
 		this.inputRevision = 0;
 		this.cdpTargetId = null;
 		this.paintQueue = Promise.resolve();
+		this.framePaint = false;
+		this.pendingFrame = null;
+		this.framesReceived = 0;
+		this.streamEpoch = 0; // dropLive bumps it; pending stream frames go stale
 		this.paintErrors = 0;
 		this.chafaFails = 0;
 		this.chafaCooldownUntil = 0;
@@ -735,6 +841,51 @@ export class Renderer {
 		this.kittyAnon = false; // chafa emitted anonymous kitty placements
 		this.lastImageDims = null;
 		this.lastViewportRequest = "";
+		// Pane state file for the agent beside the pane (see publishPaneState).
+		this.paneFile = paneStateFile(this.stateDir, safeWsId(env.HERDR_WORKSPACE_ID));
+		this.paneStateLastKey = null; // last written state, minus updatedAt
+		this.paneStateLastSig = null; // sig() at the last successful publish
+		this.paneStateWrites = 0;
+		this.failedRequests = []; // last PANE_STATE_TAIL failed-request lines
+	}
+
+	// Publish what the pane observes to pane-<ws>.json for the coding agent
+	// (bin/hb.mjs reads it). Called from step() when sig() moved and on the o
+	// key, but written only when the observable state changed — never per
+	// frame. Best-effort: a full disk must not take the pane down. Returns
+	// false only when a write failed, so the caller retries.
+	publishPaneState() {
+		const state = buildPaneState(
+			{
+				backend: this.backend,
+				session: this.session,
+				endpoint: this.cdpEndpoint,
+				attached: this.attached,
+				url: this.lastUrl,
+				title: this.lastTitle,
+				observeOnly: this.observeOnly,
+				consoleLines: this.consoleLines,
+				failures: this.failedRequests,
+				pid: process.pid,
+			},
+			sanitizeText,
+		);
+		const key = paneStateKey(state);
+		if (key === this.paneStateLastKey) return true;
+		try {
+			writePaneState(this.paneFile, state);
+		} catch {
+			return false;
+		}
+		this.paneStateLastKey = key;
+		this.paneStateWrites++;
+		return true;
+	}
+
+	noteFailedRequests(lines) {
+		this.failedRequests.push(...lines);
+		if (this.failedRequests.length > PANE_STATE_TAIL)
+			this.failedRequests = this.failedRequests.slice(-PANE_STATE_TAIL);
 	}
 
 	// Serialize all screen-writing work: ticks and resize redraws must never
@@ -749,6 +900,64 @@ export class Renderer {
 			}
 		});
 		return this.paintQueue;
+	}
+
+	// Keep raw data until its turn: one paint plus one latest pending frame.
+	// Schedule the next paint after queued input, never ahead of it.
+	queueFrame(message, ack) {
+		if (message) {
+			// Liveness and failure-poll cadence follow arrival, not paint: a
+			// blocked or busy queue must not read as a stream that sent nothing.
+			this.framesReceived++;
+			this.networkIdleTicks = 0;
+			this.pendingFrame ??= { acks: [] };
+			Object.assign(this.pendingFrame, {
+				message, browser: this.browser, revision: this.inputRevision, epoch: this.streamEpoch,
+			});
+			if (ack) this.pendingFrame.acks.push(ack);
+		}
+		if (this.framePaint || !this.pendingFrame ||
+			(this.stdoutBlocked && !this.pendingFrame.acks.length)) return;
+		this.framePaint = true;
+		this.enqueue(async () => {
+			const frame = this.pendingFrame;
+			this.pendingFrame = null;
+			try {
+				// A frame from a dropped stream must not repaint over the poll
+				// path's PNG (handshake frames precede this.live, so use an epoch).
+				if (frame.browser !== this.browser || frame.revision !== this.inputRevision ||
+					frame.epoch !== this.streamEpoch) return;
+				if (this.stdoutBlocked) {
+					// Retain the latest image for drain, but settle skipped CDP acks.
+					this.pendingFrame = { ...frame, acks: [] };
+					return;
+				}
+				if (typeof frame.message.data !== "string") return;
+				const buf = Buffer.from(frame.message.data, "base64");
+				const dims = jpegDims(buf);
+				if (!dims) return;
+				const tmp = `${this.shotJpg}.${process.pid}.tmp`;
+				try {
+					fs.writeFileSync(tmp, buf);
+					fs.renameSync(tmp, this.shotJpg);
+					fs.chmodSync(this.shotJpg, 0o600);
+				} catch {
+					return;
+				}
+				this.shotFormat = "jpg";
+				if (this.backend === "attach") this.lastFrameMeta = frame.message.metadata ?? null;
+				this.frameSeq++;
+				await this.renderImage();
+				if (!this.textView) await this.fitViewport(dims.w, dims.h);
+			} finally {
+				for (const ack of frame.acks) {
+					try { Promise.resolve(ack()).catch(() => {}); } catch { /* disconnected */ }
+				}
+			}
+		}).then(() => {
+			this.framePaint = false;
+			this.queueFrame();
+		});
 	}
 
 	size() {
@@ -826,6 +1035,7 @@ export class Renderer {
 					text: `…and ${overflow} more failed requests`,
 					type: "error",
 				});
+			this.noteFailedRequests(lines.map((l) => l.text));
 			this.pushConsole(lines, false);
 			this.queueConsolePaint(hadConsole);
 			return true;
@@ -865,13 +1075,26 @@ export class Renderer {
 	// Switch this pane to attach mode at runtime. Everything the old backend
 	// reconciled against is meaningless afterwards, so state resets and the
 	// console carries one discontinuity line.
+	/**
+	 * @param {string} value
+	 * @param {{note?: string}} [options]
+	 */
 	async attachTo(value, { note } = {}) {
 		const endpoint = String(value ?? "").trim();
+		if (/^(https|wss):\/\//i.test(endpoint)) {
+			this.banner = "TLS is not supported — use http://host:port or ws://…";
+			this.header();
+			return;
+		}
 		if (!/^(wss?|https?):\/\//i.test(endpoint)) {
 			this.banner =
 				"not an endpoint — use http://host:port or ws://… (u navigates, a attaches)";
 			this.header();
 			return;
+		}
+		if (this.backend === "attach") {
+			this.browser.onMessage(null);
+			this.browser.close?.();
 		}
 		if (this.backend === "agent-browser" && this.live) this.dropLive();
 		// Pointing the pane away from a browser it launched abandons it; kill
@@ -945,6 +1168,7 @@ export class Renderer {
 			const bin = findChromium(this.env, this.configValue("chromium"), (c) =>
 				spawnSync("sh", ["-c", 'command -v -- "$1"', "sh", c], {
 					timeout: 5000,
+					killSignal: "SIGKILL",
 					env: this.env,
 				}).status === 0,
 			);
@@ -981,7 +1205,7 @@ export class Renderer {
 				// newer Chromes and would eventually break launches.
 				...(headed ? [] : ["--headless"]),
 				// Sandbox fallback for root/CI/containers (see chromiumSandboxArgs).
-				...chromiumSandboxArgs(process.env),
+				...chromiumSandboxArgs(this.env),
 				"about:blank",
 			];
 			this.banner = "launching Chromium…";
@@ -1002,8 +1226,15 @@ export class Renderer {
 			child.once("error", (err) => {
 				spawnFailed.err = err;
 			});
+			// Own the child from spawn on, so a quit (or attach elsewhere)
+			// during the startup wait kills it instead of orphaning it. Taking
+			// ownership away also cancels the wait; the taker did the kill.
+			this.launchedChild = child;
+			this.launchedEndpoint = null;
 			const port = await this.waitForDevToolsPort(portFile, child, spawnFailed);
+			if (this.launchedChild !== child) return;
 			if (!port) {
+				this.launchedChild = null;
 				try {
 					child.kill();
 				} catch {
@@ -1016,7 +1247,6 @@ export class Renderer {
 				);
 				return;
 			}
-			this.launchedChild = child;
 			this.launchedEndpoint = `http://127.0.0.1:${port}`;
 			const ep = this.launchedEndpoint;
 			child.once("exit", () => {
@@ -1059,6 +1289,7 @@ export class Renderer {
 	async waitForDevToolsPort(portFile, child, spawnFailed = null, timeoutMs = 15_000) {
 		const until = Date.now() + timeoutMs;
 		while (Date.now() < until) {
+			if (this.launchedChild !== child) return null; // quit cancelled the launch
 			// Signal deaths leave exitCode null and set signalCode — check both.
 			if (child.exitCode !== null || child.signalCode !== null) return null;
 			if (spawnFailed?.err) return null; // binary missing/not executable
@@ -1084,9 +1315,13 @@ export class Renderer {
 			this.header();
 			return false;
 		}
+		const browser = this.browser;
 		try {
-			this.browser.onMessage((m) => this.onCdpMessage(m));
-			const id = await this.browser.connect();
+			browser.onMessage((m) => {
+				if (this.browser === browser) this.onCdpMessage(m);
+			});
+			const id = await browser.connect();
+			if (this.browser !== browser) return false;
 			// A reused port can front a different browser than last time; treat
 			// that as a discontinuity rather than silently continuing the feed.
 			if (this.cdpGuid && id.guid && id.guid !== this.cdpGuid) {
@@ -1123,6 +1358,7 @@ export class Renderer {
 			this.header();
 			return true;
 		} catch (err) {
+			if (this.browser !== browser) return false;
 			this.attached = false;
 			this.banner = `cannot attach to ${redactWsUrl(this.cdpEndpoint)}: ${sanitizeText(err?.message ?? "unknown error")}`;
 			this.header();
@@ -1149,7 +1385,10 @@ export class Renderer {
 			let age = 0;
 			try {
 				age = Date.now() - fs.statSync(this.navigateFile).mtimeMs;
-				url = fs.readFileSync(this.navigateFile, "utf8").split("\n")[0].trim();
+				const text = fs.readFileSync(this.navigateFile, "utf8");
+				// Empty or unterminated: a writer is mid-write; leave it.
+				if (!text.includes("\n")) return;
+				url = text.split("\n")[0].trim();
 				fs.unlinkSync(this.navigateFile);
 			} catch {
 				return; // nothing pending
@@ -1193,10 +1432,15 @@ export class Renderer {
 		this.networkState = newNetworkState();
 		this.lastHash = "";
 		this.shotFormat = "png";
+		// A different browser: neither the open view nor the diff baseline
+		// describes it.
+		this.textView = null;
+		this.lastSnapshot = null;
 	}
 
 	invalidateTarget() {
 		this.inputRevision++;
+		this.pageRevision++;
 		this.cdpTargetId = null;
 		this.promptState = null;
 		this.lastFrameMeta = null;
@@ -1228,23 +1472,28 @@ export class Renderer {
 			this.lastTitle = sanitizeText(m.title ?? "");
 			this.lastFrameAt = Date.now();
 			this.banner = "";
+			// A different tab is different content even at the same URL.
+			this.dropStaleTextView({ force: true });
 			this.header();
+			return;
+		}
+		if (m.type === "document") {
+			this.dropStaleTextView({ force: true });
 			return;
 		}
 		if (m.type === "frame") {
 			if (!this.cdpTargetId) return;
 			this.lastFrameAt = Date.now();
-			this.lastFrameMeta = m.metadata ?? null;
-			this.onStreamMessage({ type: "frame", data: m.data });
-			// Ack after the paint queue drains. A skipped paint (blocked stdout,
-			// chafa cooldown) still acks — a frozen stream is worse than a
-			// dropped frame, and quality/max-dimension knobs bound the cost.
-			this.enqueue(() => {}).then(() => this.browser.ackFrame?.(m.ackId, m.gen));
+			const browser = this.browser;
+			const { ackId, gen } = m;
+			// Every frame acks after its coalesced paint (or skip) settles.
+			this.queueFrame(m, () => browser.ackFrame?.(ackId, gen));
 			return;
 		}
 		if (m.type === "url") {
 			this.lastUrl = sanitizeText(m.url ?? "");
 			if (m.title !== undefined) this.lastTitle = sanitizeText(m.title);
+			this.dropStaleTextView();
 			this.enqueue(() => {
 				this.header();
 			});
@@ -1277,9 +1526,19 @@ export class Renderer {
 		if (entry.source === "network") {
 			const key = `log ${entry.url} ${entry.text}`;
 			const now = Date.now();
-			const last = this.networkState.recent.get(key);
-			this.networkState.recent.set(key, now);
-			if (last !== undefined && now - last <= 60_000) return;
+			const recent = this.networkState.recent;
+			const last = recent.get(key);
+			// Re-insert so Map order is last-touch order: expired and overflow
+			// keys are then always at the front.
+			recent.delete(key);
+			recent.set(key, now);
+			for (const [k, t] of recent) {
+				if (now - t <= NETWORK_DEDUPE_WINDOW_MS && recent.size <= NETWORK_DEDUPE_MAX_KEYS)
+					break;
+				recent.delete(k);
+			}
+			if (last !== undefined && now - last <= NETWORK_DEDUPE_WINDOW_MS) return;
+			this.noteFailedRequests([text]);
 		}
 		const hadConsole = this.consoleLines.length > 0;
 		this.pushConsole(
@@ -1422,12 +1681,16 @@ export class Renderer {
 			);
 		} else {
 			// Every advertised key is handled in both backends (a and l work
-			// everywhere); t only moves targets on an attach backend.
-			const help = this.observeOnly
-				? " observe-only  t:tabs  s:snap  n:reqs  d:diff  o:enable-input  q:quit"
-				: this.backend === "attach"
-					? " t:tabs  i:text  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
-					: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  s:snap  n:reqs  d:diff  o:observe  q:quit";
+			// everywhere); t only moves targets on an attach backend, so it is
+			// advertised only there. An open text view shows its paging keys.
+			const tv = this.textView;
+			const help = tv
+				? ` ${tv.mode === "diff" ? "diff" : tv.mode === "network" ? "requests" : "snapshot"}  j/k:line  space/b PgUp/PgDn:page  g/G:top/end  ${{ snapshot: "s", network: "n", diff: "d" }[tv.mode]}/Esc:close  q:quit`
+				: this.observeOnly
+					? ` observe-only  ${this.backend === "attach" ? "t:tabs  " : ""}s:snap  n:reqs  d:diff  o:enable-input  q:quit`
+					: this.backend === "attach"
+						? " t:tabs  i:type  u:url  a:attach  l:launch  o:observe  s:snap  n:reqs  d:diff  b/f:hist  r:reload  j/k:scroll  q:quit"
+						: " u:url  a:attach  l:launch  i:type  b/f:hist  r:reload  j/k:scroll  s:snap  n:reqs  d:diff  o:observe  q:quit";
 			process.stdout.write(
 				`${ESC}[${bottomRow};1H${ESC}[2m${truncate(help, cols)}${ESC}[K${ESC}[0m`,
 			);
@@ -1461,6 +1724,7 @@ export class Renderer {
 					this.stdoutBlocked = true;
 					process.stdout.once("drain", () => {
 						this.stdoutBlocked = false;
+						this.queueFrame();
 					});
 				}
 			} catch {
@@ -1474,7 +1738,7 @@ export class Renderer {
 		// 15s timeout on every changed frame, freezing the pane's image forever.
 		if (this.chafaFails >= 3 && Date.now() < this.chafaCooldownUntil) return;
 		try {
-			const { stdout } = await pExecFile(
+			const { stdout } = await execFileBounded(
 				"chafa",
 				[
 					"-f",
@@ -1512,6 +1776,7 @@ export class Renderer {
 				this.stdoutBlocked = true;
 				process.stdout.once("drain", () => {
 					this.stdoutBlocked = false;
+					this.queueFrame();
 				});
 			}
 		} catch {
@@ -1550,11 +1815,17 @@ export class Renderer {
 		if (imageRows < 3) return;
 		const modeLabel =
 			tv.mode === "diff" ? "diff" : tv.mode === "network" ? "requests" : "snapshot";
-		const head = [` ${modeLabel} — ${sanitizeText(tv.title)}`];
-		const shown = tv.lines.slice(0, Math.max(0, imageRows - head.length));
-		const overflow = tv.lines.length - shown.length;
-		const lines = head.concat(shown);
-		if (overflow > 0) lines.push(` … ${overflow} more`);
+		const total = tv.lines.length;
+		const body = textViewBodyRows(total, imageRows);
+		// Clamp at paint time too: a resize can shrink the page under it.
+		const offset = Math.min(tv.offset ?? 0, Math.max(0, total - body));
+		const shown = tv.lines.slice(offset, offset + body);
+		const lines = [` ${modeLabel} — ${sanitizeText(tv.title)}`, ...shown];
+		// The footer owns the last image row, so it is always on screen.
+		if (total > body) {
+			const below = total - offset - shown.length;
+			lines[imageRows - 1] = ` ${offset + 1}–${offset + shown.length} of ${total}${below > 0 ? `  … ${below} more` : "  (end)"}`;
+		}
 		for (let i = 0; i < imageRows; i++) {
 			process.stdout.write(
 				`${ESC}[${imageTopRow + i};1H${truncate(lines[i] ?? "", cols)}${ESC}[K`,
@@ -1623,7 +1894,10 @@ export class Renderer {
 						? "⚠ "
 						: "  ";
 			// Sanitize the display copy only — reconcile matching needs raw texts.
-			this.consoleLines.push(prefix + sanitizeText(e.text ?? ""));
+			// The line count is capped below; cap each line's length too, before
+			// sanitizing, so one huge log cannot pin megabytes in the store.
+			const text = capLength(String(e.text ?? ""), CONSOLE_LINE_MAX_CHARS);
+			this.consoleLines.push(prefix + sanitizeText(text));
 		}
 		if (this.consoleLines.length > 500) {
 			this.consoleLines = this.consoleLines.slice(-500);
@@ -1682,15 +1956,7 @@ export class Renderer {
 				// A held banner names a real failure (launch mode); repainting
 				// generic waiting advice over it would erase the explanation.
 				if (Date.now() < this.bannerHoldUntil) return;
-				// A missing binary is not 'session not started yet' — the waiting
-				// advice below can never fix it, so say what's actually wrong.
-				// In a launch workspace the accurate advice is to retry the
-				// launch — a click also retries it (see startNavigateWatch).
-				this.banner = this.launchConfigured
-					? "Chromium launch failed — press l or Cmd+click a localhost link to retry"
-					: this.agentBrowser
-						? `waiting for session "${this.session}" — Cmd+click a localhost link or have your agent use --session ${this.session}`
-						: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
+				this.banner = this.notAttachedBanner();
 				this.header();
 				return;
 			}
@@ -1736,16 +2002,7 @@ export class Renderer {
 			const snap = await this.browser.snapshot(tmp);
 			this.lastUrl = sanitizeText(snap.url);
 			this.lastTitle = sanitizeText(snap.title);
-			// A navigation invalidates a captured snapshot/diff (the network
-			// list is a session log and survives); drop it so a stale page is
-			// never shown as the current one.
-			if (
-				this.textView &&
-				this.textView.mode !== "network" &&
-				this.textView.url !== this.lastUrl
-			) {
-				this.textView = null;
-			}
+			this.dropStaleTextView();
 			const { newEntries, marker } = reconcileConsole(
 				this.consoleState,
 				snap.entries,
@@ -1865,6 +2122,9 @@ export class Renderer {
 	// escape tails and split everything into single events before dispatch.
 	feed(s) {
 		clearTimeout(this.inputTimer);
+		// Keys after s/n/d/Esc in one read target a view whose state has not
+		// settled yet (opening is async); they must not fall through to the page.
+		this.viewKeyInBatch = false;
 		s = this.inputBuf + s;
 		this.inputBuf = "";
 		while (s) {
@@ -1923,6 +2183,9 @@ export class Renderer {
 	onMouse(mouse) {
 		if (this.promptState || this.targetPicker || (this.backend === "attach" && !this.cdpTargetId)) return;
 		if (!mouse || mouse.release) return;
+		// A text view covers the screenshot: a click on its text must not
+		// land on whatever the hidden page has at those coordinates.
+		if (this.textView) return;
 		if (this.observeOnly && this.attached) {
 			this.noteObserveBlocked();
 			return;
@@ -1932,12 +2195,12 @@ export class Renderer {
 			if (this.attached) {
 				this.userAction(() =>
 					this.browser.scroll(mouse.button === 64 ? "up" : "down", 300),
-				);
+				{ pointer: true });
 			}
 			return;
 		}
 		if (mouse.button !== 0 || !this.attached) return;
-		this.userAction(() => this.clickAt(mouse.col, mouse.row));
+		this.userAction(() => this.clickAt(mouse.col, mouse.row), { pointer: true });
 	}
 
 	// A banner that names a real failure must outlive the next poll tick, or
@@ -1953,12 +2216,14 @@ export class Renderer {
 	// on switching backends alike — instead of idling as a leaked daemon
 	// until the 30-minute reaper. Sessions others created are never touched.
 	// Short timeout: a wedged daemon must not freeze the caller — its own
-	// idle reaper collects the session anyway.
+	// idle reaper collects the session anyway. SIGKILL: a synchronous call
+	// cannot escalate, and a close that ignores SIGTERM would hold quit.
 	closeOwnSession() {
 		if (!this.selfCreated || !this.ownershipEnabled) return;
 		try {
 			spawnSync(this.bin, ["--session", this.session, "close"], {
 				timeout: 2_000,
+				killSignal: "SIGKILL",
 				env: this.env,
 			});
 		} catch {
@@ -1976,6 +2241,9 @@ export class Renderer {
 		this.lastHeaderSig = null; // the observe marker lives in line 1
 		this.header();
 		this.renderBottom();
+		// Not in sig(), so the agent should see it now. On a failed write, clear
+		// the step gate: an idle pane would otherwise never retry.
+		if (!this.publishPaneState()) this.paneStateLastSig = null;
 	}
 
 	noteObserveBlocked() {
@@ -1984,26 +2252,52 @@ export class Renderer {
 		this.header();
 	}
 
+	// The one not-attached advice, shared by the waiting tick and by keys that
+	// need a browser (t, s, n, d), so both always say the same thing.
+	notAttachedBanner() {
+		// Attach mode: the banner already names the endpoint's state.
+		if (this.backend === "attach")
+			return this.banner || "no browser endpoint attached — press a to attach or l to launch";
+		// A missing binary is not 'session not started yet' — the waiting
+		// advice can never fix it, so say what's actually wrong. In a launch
+		// workspace the accurate advice is to retry the launch — a click also
+		// retries it (see startNavigateWatch).
+		const click = linkClickLabel();
+		return this.launchConfigured
+			? `Chromium launch failed — press l or ${click} a localhost link to retry`
+			: this.agentBrowser
+				? `waiting for session "${this.session}" — ${click} a localhost link or have your agent use --session ${this.session}`
+				: "agent-browser is not installed — press l to launch a local Chromium, or: npm install -g agent-browser";
+	}
+
+	showNotAttached() {
+		// Same rule as the tick: a held failure or an in-flight launch owns
+		// the banner, and generic advice must not paint over it.
+		if (Date.now() >= this.bannerHoldUntil && !this.launchingChromium)
+			this.banner = this.notAttachedBanner();
+		this.header();
+	}
+
 	// s/n/d: on-demand page text views (snapshot tree, request table, snapshot
 	// diff). Read-only queries — they never drive the page, so they are allowed
 	// in observe-only mode and never claim page input.
 	textViewKey(ch) {
 		if (!this.attached) {
-			this.banner = "no browser attached — press l or open a localhost link";
-			this.header();
+			this.showNotAttached();
 			return;
 		}
-		if (ch === "d") this.showSnapshotDiff();
-		else this.toggleTextView(ch === "s" ? "snapshot" : "network");
-	}
-
-	toggleTextView(mode) {
+		const mode = ch === "d" ? "diff" : ch === "s" ? "snapshot" : "network";
 		// Re-pressing the active key dismisses the view back to the screenshot.
 		if (this.textView?.mode === mode) {
 			this.textView = null;
 			this.enqueue(() => this.redrawAll());
 			return;
 		}
+		if (mode === "diff") this.showSnapshotDiff();
+		else this.toggleTextView(mode);
+	}
+
+	toggleTextView(mode) {
 		this.userAction(async () => {
 			try {
 				const fn =
@@ -2012,13 +2306,16 @@ export class Renderer {
 						: this.browser.networkRequests;
 				if (typeof fn !== "function")
 					throw new Error(`${mode} not supported in ${this.backendName}`);
+				const page = this.pageIdentity();
 				const res = await fn.call(this.browser);
 				if (!res || !Array.isArray(res.lines)) throw new Error("no data");
+				// The request table is a session log; a snapshot is one page's.
+				if (mode === "snapshot" && !this.samePage(page)) return this.pageChanged();
 				this.textView = {
 					mode,
 					title: res.title ?? "",
 					lines: res.lines,
-					url: this.lastUrl,
+					url: page.url,
 				};
 				if (mode === "snapshot") this.lastSnapshot = res.lines;
 				await this.redrawAll();
@@ -2027,6 +2324,64 @@ export class Renderer {
 				this.header();
 			}
 		}, { pageInput: false });
+	}
+
+	// A snapshot or diff query answers for the page it was asked about. If the
+	// page navigated, reloaded, or changed tab (or the browser changed) while
+	// it ran, the answer describes a page that is no longer on screen.
+	pageIdentity() {
+		return { browser: this.browser, revision: this.pageRevision, url: this.lastUrl };
+	}
+
+	samePage(page) {
+		return page.browser === this.browser && page.revision === this.pageRevision && page.url === this.lastUrl;
+	}
+
+	pageChanged() {
+		this.banner = "page changed while reading it — press the key again";
+		this.header();
+	}
+
+	// A navigation invalidates a captured snapshot/diff (the request table is
+	// a session log and survives): drop it so a stale page is never shown as
+	// the current one. Every URL source calls this — poll, stream, and CDP.
+	// force: a reload or tab switch is new content even at an unchanged URL.
+	dropStaleTextView({ force = false } = {}) {
+		if (force) this.pageRevision++;
+		const tv = this.textView;
+		if (!tv || tv.mode === "network" || (!force && tv.url === this.lastUrl)) return;
+		this.textView = null;
+		this.enqueue(() => this.redrawAll());
+	}
+
+	// Paging keys while a text view is open. Pure pane-side scrolling of the
+	// captured text: never a browser call, so it works in observe-only mode
+	// and while unattached. Returns false for keys it does not own.
+	textViewNav(ch) {
+		const tv = this.textView;
+		if (ch === ESC) {
+			this.textView = null;
+			this.enqueue(() => this.redrawAll());
+			return true;
+		}
+		const body = textViewBodyRows(tv.lines.length, this.size().imageRows);
+		const max = Math.max(0, tv.lines.length - body);
+		const cur = Math.min(tv.offset ?? 0, max);
+		let next;
+		switch (ch) {
+			case "j": next = cur + 1; break;
+			case "k": next = cur - 1; break;
+			case " ":
+			case `${ESC}[6~`: next = cur + body; break;
+			case "b":
+			case `${ESC}[5~`: next = cur - body; break;
+			case "g": next = 0; break;
+			case "G": next = max; break;
+			default: return false;
+		}
+		tv.offset = Math.max(0, Math.min(max, next));
+		this.enqueue(() => this.renderTextView());
+		return true;
 	}
 
 	showSnapshotDiff() {
@@ -2039,14 +2394,17 @@ export class Renderer {
 			try {
 				if (typeof this.browser.snapshotText !== "function")
 					throw new Error(`snapshot not supported in ${this.backendName}`);
+				const page = this.pageIdentity();
+				const baseline = this.lastSnapshot;
 				const res = await this.browser.snapshotText();
 				if (!res || !Array.isArray(res.lines)) throw new Error("no data");
-				const diff = diffSnapshot(this.lastSnapshot, res.lines);
+				if (!this.samePage(page) || this.lastSnapshot !== baseline) return this.pageChanged();
+				const diff = diffSnapshot(baseline, res.lines);
 				this.textView = {
 					mode: "diff",
 					title: diff.title ?? "",
 					lines: diff.lines,
-					url: this.lastUrl,
+					url: page.url,
 				};
 				await this.redrawAll();
 			} catch (err) {
@@ -2076,6 +2434,20 @@ export class Renderer {
 		// and they need no page target beyond what the backend already guards.
 		if (ch === "s" || ch === "n" || ch === "d") {
 			this.textViewKey(ch);
+			this.viewKeyInBatch = true;
+			return;
+		}
+		// An open text view owns the paging keys (j/k, space/b, PgUp/PgDn,
+		// g/G, Esc) — they move the text, not the page behind it.
+		if (this.textView) {
+			const closing = ch === ESC;
+			if (this.textViewNav(ch)) {
+				if (closing) this.viewKeyInBatch = true;
+				return;
+			}
+		} else if (this.viewKeyInBatch && TEXT_VIEW_NAV_KEYS.has(ch)) return;
+		if (ch === "t" && !this.attached) {
+			this.showNotAttached();
 			return;
 		}
 		if (
@@ -2209,7 +2581,7 @@ export class Renderer {
 		const port = Number(status?.port);
 		if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
 		let ws;
-		const initialFrameSeq = this.frameSeq;
+		const initialFrames = this.framesReceived;
 		try {
 			ws = new WebSocket(`ws://127.0.0.1:${port}`);
 		} catch {
@@ -2252,7 +2624,7 @@ export class Renderer {
 		this.live = { ws };
 		const live = this.live;
 		live.firstFrameTimer = setTimeout(() => {
-			if (this.live === live && this.frameSeq === initialFrameSeq) {
+			if (this.live === live && this.framesReceived === initialFrames) {
 				this.dropLive("live stream sent no image — polling");
 			}
 		}, 5_000);
@@ -2270,6 +2642,7 @@ export class Renderer {
 		// First: a timer poll must not fire into the poll-mode transition and
 		// race tick's poll over the same diff state.
 		this.stopNetworkTimer();
+		this.streamEpoch++;
 		const wasLive = !!this.live;
 		if (this.live) {
 			clearTimeout(this.live.firstFrameTimer);
@@ -2299,25 +2672,7 @@ export class Renderer {
 	onStreamMessage(m) {
 		switch (m.type) {
 			case "frame": {
-				if (typeof m.data !== "string") return;
-				const buf = Buffer.from(m.data, "base64");
-				const dims = jpegDims(buf);
-				if (!dims) return;
-				const tmp = `${this.shotJpg}.${process.pid}.tmp`;
-				try {
-					fs.writeFileSync(tmp, buf);
-					fs.renameSync(tmp, this.shotJpg);
-					fs.chmodSync(this.shotJpg, 0o600);
-				} catch {
-					return;
-				}
-				this.shotFormat = "jpg";
-				this.frameSeq++;
-				this.networkIdleTicks = 0; // page activity: keep failure polls prompt
-				this.enqueue(async () => {
-					await this.renderImage();
-					if (!this.textView) await this.fitViewport(dims.w, dims.h);
-				});
+				this.queueFrame(m);
 				break;
 			}
 			case "console": {
@@ -2350,6 +2705,7 @@ export class Renderer {
 				if (active) {
 					this.lastUrl = sanitizeText(active.url ?? "");
 					this.lastTitle = sanitizeText(active.title ?? "");
+					this.dropStaleTextView();
 					this.enqueue(() => {
 						this.header();
 					});
@@ -2358,6 +2714,7 @@ export class Renderer {
 			}
 			case "url":
 				this.lastUrl = sanitizeText(m.url ?? "");
+				this.dropStaleTextView();
 				this.enqueue(() => {
 					this.header();
 				});
@@ -2368,12 +2725,15 @@ export class Renderer {
 
 	// User-initiated drive of the shared session: run the action, then refresh
 	// immediately instead of waiting for the next poll tick.
-	userAction(fn, { pageInput = true } = {}) {
+	userAction(fn, { pageInput = true, pointer = false } = {}) {
 		const browser = this.browser;
 		const revision = this.inputRevision;
 		this.idleTicks = 0; // interaction restores the base poll cadence
 		this.enqueue(async () => {
 			if (browser !== this.browser) return;
+			// A click/wheel queued behind s/n/d aims at the screenshot, which
+			// the text view now covers: drop it rather than click blind.
+			if (pointer && this.textView) return;
 			if (pageInput) {
 				if (revision !== this.inputRevision) return;
 				if (this.observeOnly) return this.noteObserveBlocked();
@@ -2500,6 +2860,7 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
+		removePaneStateIfOwned(this.paneFile, process.pid); // a dead pane must not look live
 		// The runtime-backend marker routes clicks only while this pane lives.
 		try {
 			fs.unlinkSync(
@@ -2578,7 +2939,7 @@ export class Renderer {
 			this.consoleLines.push(
 				this.chafa
 					? "text mode (set render config to kitty/symbols for screenshots)"
-					: "chafa not found — text-only mode. Install: brew install chafa",
+					: `chafa not found — text-only mode. Install: ${chafaInstallHint()}`,
 			);
 		}
 		await this.redrawAll();
@@ -2604,13 +2965,30 @@ export class Renderer {
 		});
 
 		while (true) {
-			const before = this.sig();
-			await this.enqueue(() => this.tick());
-			this.idleTicks = this.sig() === before ? this.idleTicks + 1 : 0;
+			await this.step();
 			await new Promise((r) =>
 				setTimeout(r, pollDelay(this.intervalMs, this.idleTicks)),
 			);
 		}
+	}
+
+	// One run-loop iteration: tick, track idleness, publish on change. The
+	// publish gate compares against the last *published* sig, not the
+	// pre-tick one: attach-mode events and key handlers change state between
+	// ticks, and the tick that follows them sees no change of its own.
+	async step() {
+		const before = this.sig();
+		await this.enqueue(() => this.tick());
+		const sig = this.sig();
+		this.idleTicks = sig === before ? this.idleTicks + 1 : 0;
+		// A file that vanished (an older pane's cleanup raced this one's write)
+		// is restored on the next step, not only on the next visible change.
+		if (this.paneStateLastKey !== null && !fs.existsSync(this.paneFile)) {
+			this.paneStateLastKey = null;
+			this.paneStateLastSig = null;
+		}
+		if (sig !== this.paneStateLastSig && this.publishPaneState())
+			this.paneStateLastSig = sig;
 	}
 }
 

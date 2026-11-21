@@ -23,6 +23,12 @@ const skip =
 			? "no Chromium installed"
 			: false;
 
+// The pane takes its Chromium sandbox fallback from its own env, not
+// process.env, so the CI signal has to reach the curated env below; without
+// it, the launched Chrome on a CI runner keeps its sandbox and dies before it
+// writes DevToolsActivePort.
+const ciEnv = process.env.CI ? { CI: process.env.CI } : {};
+
 const until = async (cond, ms) => {
 	const end = Date.now() + ms;
 	while (Date.now() < end) {
@@ -43,6 +49,7 @@ test("launch mode drives a real Chromium end to end", {
 		HERDR_BROWSER_CHROMIUM: chromium,
 		HOME: os.homedir(),
 		PATH: process.env.PATH,
+		...ciEnv,
 	});
 	r.header = () => {};
 	r.renderConsole = () => {};
@@ -115,7 +122,7 @@ test("tab selection, target loss and verbatim paste work end to end in Chromium"
 	const r = new Renderer({
 		HERDR_BROWSER_SESSION: "hb-input-int",
 		HERDR_PLUGIN_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "hb-input-int-")),
-		HERDR_BROWSER_CHROMIUM: chromium, HOME: os.homedir(), PATH: process.env.PATH,
+		HERDR_BROWSER_CHROMIUM: chromium, HOME: os.homedir(), PATH: process.env.PATH, ...ciEnv,
 	});
 	r.header = r.renderConsole = r.renderBottom = () => {};
 	r.renderImage = async () => {};

@@ -65,10 +65,12 @@ npm install -g agent-browser
 agent-browser install
 ```
 
-For ANSI image rendering on macOS:
+For ANSI image rendering, install chafa (`npm run doctor` prints the command
+for your platform):
 
 ```sh
-brew install chafa
+brew install chafa        # macOS
+sudo apt install chafa    # Debian/Ubuntu (or: dnf install chafa, pacman -S chafa)
 ```
 
 ## Install
@@ -166,8 +168,8 @@ Use these controls to drive the shared session directly:
 | Mouse wheel | Scroll the page |
 | `s` | Toggle the accessibility-tree snapshot (interactive elements carry `@eN` refs) |
 | `n` | Toggle the recent request table |
-| `d` | Diff the current page against the last snapshot (press `s` first) |
-| `Esc` | Cancel the active prompt |
+| `d` | Toggle a diff of the current page against the last snapshot (press `s` first) |
+| `Esc` | Cancel the active prompt, or close the open text view |
 | `q` | Close the viewer pane |
 
 Clicks are mapped through the rendered-frame geometry to page pixels, so they
@@ -261,11 +263,29 @@ while an agent is mid-flow. They are also the only page view in a `text`-mode
 | `n` | **Requests** — recent network traffic as `METHOD STATUS TYPE URL`, with query strings, fragments, and credentials redacted and the list bounded. |
 | `d` | **Diff** — the current page against the last `s` snapshot, showing added (`+`) and removed (`-`) elements. Refs are ignored, so the diff reflects real page changes, not re-snapshot churn. |
 
-Any page-driving action (navigate, reload, back/forward, scroll, click, type)
-returns to the screenshot; re-pressing `s` or `n` while its own view is up
-dismisses it too. A captured snapshot or diff is dropped if the page navigates
-underneath it rather than shown stale; the request table is a session log and
-stays until dismissed.
+While a text view is open, the paging keys move the text, not the page:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | One line down / up |
+| Space / `b`, PgDn / PgUp | One page down / up |
+| `g` / `G` | Top / bottom |
+| `Esc`, or the view's own key (`s`, `n`, `d`) | Close the view and return to the screenshot |
+
+Paging never calls the browser, so it also works in observe-only mode. The
+last row shows the position (`1–8 of 50  … 42 more`). Mouse clicks and wheel
+events are ignored while a view is open: the view covers the screenshot, so a
+click could otherwise land on a page element you cannot see.
+
+Any other page-driving action (navigate, reload, forward, type) returns to the
+screenshot. A captured snapshot or diff is dropped, rather than shown stale,
+when the page navigates to a new URL underneath it — in polling, live-stream,
+and attach modes alike. In attach and launch mode it is also dropped on a
+reload or a tab switch that keeps the same URL; in agent-browser mode a
+same-URL reload is not detected, so press `s` again. The request table is a
+session log and stays until dismissed.
+Switching to a different browser (`a` or `l`) also forgets the last snapshot,
+so `d` asks for a fresh `s` instead of diffing two unrelated browsers.
 
 ## Attach to any CDP browser
 
@@ -410,12 +430,128 @@ echo "my-agent-session" \
   > "$(herdr plugin config-dir structupath.browser)/session"
 ```
 
+## For agents: reading the pane
+
+The pane publishes what it observes to a private state file, and
+`bin/hb.mjs` reads it back. A coding agent in the same Herdr workspace can
+learn the page URL and title, the backend, the observe-only latch, the last
+console lines and failed requests, and which session or endpoint to drive.
+Run it from the agent's shell; `HERDR_WORKSPACE_ID` (set by Herdr in every
+pane) selects the workspace. Without `HERDR_WORKSPACE_ID`, every directory
+shares one `pane-default.json`, so `hb` accepts a pane only when its `session`
+equals the session `hb` derives for the caller (same rules as
+[Session model](#session-model)); otherwise it reports no pane.
+
+```sh
+HB="/path/to/herdr-browser/bin/hb.mjs"   # the linked or installed plugin checkout
+
+node "$HB" status --json    # full pane state as one JSON object
+node "$HB" status           # the same, as aligned text
+node "$HB" session --json   # {"session","source","backend","endpoint"}
+node "$HB" session          # session name, plus host:port in attach mode
+node "$HB" help
+```
+
+`hb session` prints the agent-browser session name. When the pane is attached
+to a CDP endpoint (attach mode or a Chromium it launched), it also prints the
+endpoint as `host:port` and a ready command:
+
+```sh
+agent-browser --session herdr-ws-w1 connect http://127.0.0.1:9222
+```
+
+With a live pane, `hb session` reports the pane's own session (`"source":
+"pane"`). Without one, it derives the name exactly as the pane would
+(`"source": "derived"`, same precedence as [Session model](#session-model)).
+The agent's shell does not get `HERDR_PLUGIN_CONFIG_DIR`, so a derived name
+ignores a configured `session` file unless you export it first:
+
+```sh
+export HERDR_PLUGIN_CONFIG_DIR="$(herdr plugin config-dir structupath.browser)"
+```
+
+### Pane state file
+
+The renderer writes `pane-<workspace-id>.json` in the plugin state directory
+(`HERDR_PLUGIN_STATE_DIR`, mode `0700`). It writes atomically (a temporary
+file with an unpredictable name, created exclusively at mode `0600` and never
+through a symlink, then renamed), only when the observable state changes —
+never per frame. On exit the pane deletes the file only if it still holds the
+pane's own `pid`, so a newer pane for the same workspace keeps its file. When
+`HERDR_PLUGIN_STATE_DIR` is unset, `hb` looks in
+`$XDG_STATE_HOME/herdr/plugins/structupath.browser` (if set), then
+`~/.local/state/herdr/plugins/structupath.browser`, then
+`~/.local/state/herdr-browser`. When more than one holds a live pane, `hb`
+takes the one whose `session` matches the caller's derived session; with no
+match it takes the first and names all of them on stderr.
+
+Schema version 1 (`hb status --json` prints exactly this object):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schemaVersion` | number | `1`. Bumped on any incompatible change. |
+| `backend` | string | `"agent-browser"` or `"attach"`. A Chromium launched with `l` is `"attach"`. |
+| `session` | string | The agent-browser session name the pane uses. |
+| `endpoint` | string \| null | CDP `host:port` in attach mode; `null` for agent-browser. Never a path or token. |
+| `attached` | boolean | The pane is connected to its session or endpoint now. |
+| `url` | string | Current page URL (sanitized, redacted, at most 2,000 characters). |
+| `title` | string | Current page title (sanitized, at most 2,000 characters). |
+| `observeOnly` | boolean | The `o` latch: pane input is not forwarded. |
+| `consoleTail` | string[] | Up to the last 20 console lines as the pane shows them (sanitized, URLs redacted, each at most 500 characters). |
+| `failures` | string[] | Up to the last 20 failed-request lines (sanitized, URLs redacted, each at most 500 characters). |
+| `updatedAt` | string | ISO 8601 time of the last write. |
+| `pid` | number | The renderer's process id. |
+
+```json
+{
+  "schemaVersion": 1,
+  "backend": "attach",
+  "session": "herdr-ws-w1",
+  "endpoint": "127.0.0.1:9222",
+  "attached": true,
+  "url": "http://localhost:3000/",
+  "title": "My app",
+  "observeOnly": false,
+  "consoleTail": ["✖ Uncaught TypeError: x is undefined"],
+  "failures": ["500 GET http://localhost:3000/api/items"],
+  "updatedAt": "2026-11-21T17:04:05.123Z",
+  "pid": 41234
+}
+```
+
+Page-controlled strings (URL, title, console, failures) pass through the same
+control-character sanitizer as the pane header, so printing them cannot inject
+terminal escapes. URLs are redacted the way QA reports them: the `url` field
+and every `http(s)://`, `ws(s)://`, `file://`, or `blob:` URL inside console and
+failure lines lose their username, password, query string, and fragment; a
+`data:` URL becomes `data:[redacted]`, and a page URL that does not parse is
+`[unavailable URL]`. In console and failure lines, a URL with a query or
+fragment is dropped up to the next whitespace, so text glued to its end goes
+with it. The whole file is at most
+64 KiB: when it would be larger, the oldest console and failure lines are
+dropped first. A file whose `pid` is no longer running counts as no pane.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | A pane file exists but cannot be read, is not JSON, or is not a schema version 1 object with the fields above (`{"status":"error",...}` with `--json`). |
+| `2` | Usage error: unknown command or flag. |
+| `3` | `hb status` only: no live pane for this workspace (`{"status":"no-pane"}` with `--json`). |
+
+`hb session` never exits `3`: an agent can drive agent-browser before the
+pane opens.
+
 ## Recording
 
 Recording captures the workspace's **agent-browser session**. Attach and
-launch workspaces have no such session, so the record actions refuse with
-an explanation instead of silently recording a fresh, unrelated headless
+launch workspaces have no such session, so Start recording refuses with an
+explanation instead of silently recording a fresh, unrelated headless
 browser — record from the automation client that owns the browser instead.
+This holds whether attach or launch is configured or chosen at runtime with
+`a` or `l`. Stop recording still finishes a recording that is already
+running.
 
 Start and stop recording through the existing recording actions. Each new
 capture is a run-scoped observation bundle:
@@ -488,6 +624,10 @@ Environment variables take precedence over config files.
 - Workspace identifiers are sanitized before they are used in state paths.
 - Polling frames are cached as PNG; streamed frames are cached as JPEG. Frame
   files are mode `0600` and removed when the pane exits.
+- The pane state file (`pane-<workspace-id>.json`) is mode `0600`, holds no
+  endpoint path or token (only `host:port`), redacts credentials, query
+  strings, and fragments from page URLs, is capped at 64 KiB, and is removed
+  when the pane exits.
 - Recording bundles use private directories (`0700`) and files (`0600`), and session names are metadata only—never path components.
 - WebM recordings are intentionally retained under the plugin state directory.
 - Browser sessions are a trusted local boundary: any local process that knows a

@@ -6,6 +6,8 @@ import http from "node:http";
 import net from "node:net";
 import { formatAxNodes, formatRequests } from "./page-text.mjs";
 
+/** @typedef {import("./backend.js").Backend} Backend */
+
 // Attach mode needs a WebSocket client; Node grew a global one in 22.
 // On Node 20 the pane keeps working in agent-browser mode — callers gate on
 // this instead of crashing at connect time.
@@ -37,6 +39,10 @@ function getJson(host, port, path, timeout = 5_000) {
 			(res) => {
 				let body = "";
 				res.setEncoding("utf8");
+				// Either listener settles a torn body alone; both stay on purpose,
+				// since which one fires depends on the Node version.
+				res.on("error", reject);
+				res.on("aborted", () => reject(new Error(`endpoint response aborted for ${path}`)));
 				res.on("data", (c) => {
 					body += c;
 					if (body.length > 4 * 1024 * 1024) req.destroy(new Error("oversized /json response"));
@@ -58,11 +64,15 @@ function getJson(host, port, path, timeout = 5_000) {
 	});
 }
 
-// Resolve a user-supplied endpoint — http(s)://host:port or a browser-level
+// Resolve a user-supplied endpoint — http://host:port or a browser-level
 // ws:// URL — to { wsUrl, host, port, browser (product string), pages }.
 // A pasted page-level URL (/devtools/page/<id>) is refused with a pointer at
 // the browser endpoint: Target.attachToTarget only works browser-level, and
 // this is the most common paste mistake from /json/list output.
+/**
+ * @param {string} input
+ * @param {{lookup?: (host: string) => Promise<{address: string}>}} [options]
+ */
 export async function discoverEndpoint(input, { lookup } = {}) {
 	let u;
 	try {
@@ -70,11 +80,13 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 	} catch {
 		throw new Error("not an endpoint URL — use http://host:port or ws://…");
 	}
+	if (u.protocol === "https:" || u.protocol === "wss:")
+		throw new Error("TLS is not supported — use http://host:port or ws://…");
 	if (/\/devtools\/page\//.test(u.pathname))
 		throw new Error(
 			"that is a page-level DevTools URL — use the browser endpoint (http://host:port or /devtools/browser/…)",
 		);
-	if (u.protocol === "ws:" || u.protocol === "wss:") {
+	if (u.protocol === "ws:") {
 		// Raw ws endpoint: no HTTP discovery surface; identity fields best-effort.
 		return {
 			wsUrl: u.href,
@@ -86,7 +98,7 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 			rediscoverable: false,
 		};
 	}
-	if (u.protocol !== "http:" && u.protocol !== "https:")
+	if (u.protocol !== "http:")
 		throw new Error("not an endpoint URL — use http://host:port or ws://…");
 	let host = u.hostname.replace(/^\[|\]$/g, "");
 	if (!net.isIP(host)) {
@@ -119,6 +131,10 @@ export async function discoverEndpoint(input, { lookup } = {}) {
 // requests carry an optional sessionId, responses correlate by id, events
 // route to subscribers. Never throws out of the message handler — a torn
 // frame from a dying browser must not become an uncaughtException.
+/**
+ * @param {string} wsUrl
+ * @param {{wsFactory?: (url: string) => WebSocket}} [options]
+ */
 export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 	const factory = wsFactory ?? ((url) => new WebSocket(url));
 	const ws = factory(wsUrl);
@@ -143,6 +159,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 			}
 		}
 	};
+	/** @type {Promise<void>} */
 	const opened = new Promise((resolve, reject) => {
 		const t = setTimeout(() => {
 			try {
@@ -229,7 +246,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 			return dead;
 		},
 		close() {
-			dead = true;
+			failAll("connection closed");
 			try {
 				ws.close();
 			} catch {
@@ -249,6 +266,7 @@ export function makeCdpSession(wsUrl, { wsFactory } = {}) {
 // The Renderer's existing typeof guards turn those absences into disabled
 // features instead of crashes. It never calls Target.createTarget,
 // Target.closeTarget, or Emulation.* — the pane observes, it does not own.
+/** @returns {Backend} */
 export function makeCdpBrowser(endpointInput, opts = {}) {
 	const quality = opts.quality ?? 60;
 	const maxDim = opts.maxDim ?? 1280;
@@ -262,6 +280,14 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	let handler = null; // onMessage subscriber (the Renderer)
 	let attachTimeMs = 0;
 	let connectedOnce = false;
+	// Set by close(): a connect() still setting up must never go on to attach,
+	// enable domains, or start a screencast on an abandoned browser. Every
+	// awaited setup step is followed by stillOpen().
+	let closed = false;
+	const abandoned = () => Object.assign(new Error("connection abandoned"), { code: "ABANDONED" });
+	const stillOpen = () => {
+		if (closed) throw abandoned();
+	};
 	let selection = 0;
 	let accessibilitySessionId = null;
 	let networkSessionId = null;
@@ -314,6 +340,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	// and observing a run must not be able to change its outcome.
 	const enableFeed = async (sessionId) => {
 		await session.send("Log.enable", {}, sessionId);
+		stillOpen();
 		if (consoleTier !== "log-only")
 			await session.send("Runtime.enable", {}, sessionId);
 	};
@@ -326,13 +353,16 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			targetId,
 			flatten: true,
 		});
+		stillOpen();
 		if (version !== selection || pinnedTargetId !== targetId) {
 			await session.send("Target.detachFromTarget", { sessionId }).catch(() => {});
 			throw targetError();
 		}
 		pageSessionId = sessionId;
 		await session.send("Page.enable", {}, sessionId);
+		stillOpen();
 		await enableFeed(sessionId);
+		stillOpen();
 		// Events-only auto-attach: OOPIFs and workers deliver their console and
 		// network failures on their own sessions, and a broken embedded frame
 		// with a silent console is exactly the case this feature exists for.
@@ -346,6 +376,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 		} catch {
 			/* older engines: page-level feed only */
 		}
+		stillOpen();
 		requireTarget(sessionId);
 		emit({ type: "target_selected", targetId, url: target.url, title: target.title });
 		try {
@@ -404,6 +435,12 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				ackId: m.params.sessionId,
 				gen,
 			});
+			return;
+		}
+		// A new main-frame document (navigation or reload, even to the same
+		// URL) invalidates anything captured from the old one.
+		if (m.method === "Page.frameNavigated" && pageSessionId && m.sessionId === pageSessionId && !m.params?.frame?.parentId) {
+			emit({ type: "document", url: m.params.frame.url ?? "" });
 			return;
 		}
 		if (m.method === "Target.targetInfoChanged") {
@@ -491,18 +528,27 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				session.close();
 				clearTarget("target_changing");
 			}
+			stillOpen();
 			endpoint = await discoverEndpoint(endpointInput, opts);
+			stillOpen();
 			session = makeCdpSession(endpoint.wsUrl, opts);
 			await session.opened;
+			if (closed) {
+				session.close();
+				throw abandoned();
+			}
 			session.onEvent(onCdpEvent);
 			session.onClose(() => emit({ type: "endpoint_gone" }));
 			await session.send("Target.setDiscoverTargets", { discover: true });
+			stillOpen();
 			const pages = await pageTargets();
+			stillOpen();
 			attachTimeMs = Date.now();
 			const target = !connectedOnce && pages.length === 1 ? pages[0]
 				: previousGuid && previousGuid === endpoint.guid ? pages.find((p) => p.targetId === previousTarget) : null;
 			connectedOnce = true;
 			if (target) await pinTarget(target);
+			stillOpen();
 			return {
 				host: endpoint.host,
 				port: endpoint.port,
@@ -518,7 +564,6 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			handler = fn;
 		},
 		attachTime: () => attachTimeMs,
-		frameMetadata: () => lastMeta,
 		// Ack path for the Renderer's paint-settle hook. Generation-guarded so
 		// an ack from before a restart/re-pin can never reach a new screencast.
 		async ackFrame(ackId, frameGen) {
@@ -644,6 +689,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			return session.ping();
 		},
 		close() {
+			closed = true;
 			const s = session;
 			if (!s || s.dead) return;
 			// Attach-mode cleanup: stop OUR screencast, close OUR socket.
@@ -653,6 +699,5 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 				: Promise.resolve();
 			done.finally(() => s.close());
 		},
-		_session: () => session, // U4 console wiring + tests reach the raw session
 	};
 }

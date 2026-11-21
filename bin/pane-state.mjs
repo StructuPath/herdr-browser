@@ -72,37 +72,38 @@ function safeHref(value) {
 	return u.href;
 }
 
-// URLs inside free text (console, failed requests). Finding where a URL ends
-// inside arbitrary text is guesswork, so nothing here depends on it. A URL
-// can carry a secret in only two places: userinfo, which needs an "@", and
-// the query or fragment, which start at the first "?" or "#". Per
-// whitespace-delimited word, from the URL's scheme on:
-// - an "@" anywhere: the rest of the word is "[redacted URL]";
-// - else a "?" or "#": everything from it to the end of the word goes;
-// - else the word is kept as is (no userinfo, no query, nothing to strip).
-// data: payloads are withheld whole. A trailing "…" (truncate()'s cut
-// marker) is kept. Over-redaction is the accepted cost.
-// Words split at ASCII whitespace only: sanitizeText keeps Unicode spaces
-// such as U+00A0, and a URL may contain one, so they must not end a word.
+// URLs inside free text (one console or failure line). Where a URL ends in
+// free text cannot be known: new URL() accepts quotes, brackets, spaces in
+// userinfo, and even drops tabs and newlines. So nothing here depends on it.
+// A URL can carry a secret only in userinfo, which needs an "@", or in its
+// query or fragment, which start at the first "?" or "#". The text before
+// the first URL is kept; from that URL's scheme to the end of the line:
+// - an "@", or a data: URL (all payload) anywhere: "[redacted URL]";
+// - else a "?" or "#": the URL keeps its origin and path, the rest goes;
+// - else the line is unchanged (nothing in it can hide a URL secret).
+// A trailing "…" (truncate()'s cut marker) is kept. This removes more text
+// than the URL when the line goes on after it; never less.
 // A scheme counts with "://" anywhere (even glued to a word), or with just
 // ":" when no letter or digit is glued before it (new URL() accepts
-// "https:host/…" and "wss:user@host", also after "." or "+"); a letter or
-// digit before it makes another word ("metadata:", "profile:").
-const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![A-Za-z0-9])(?:https?|wss?|file|blob|data):)/i;
+// "https:host/…" and "wss:user@host"); "metadata:" and "profile:" stay text.
+const URL_START = /(?:(?:https?|wss?|file):\/\/|(?<![A-Za-z0-9])(?:https?|wss?|file|blob|data):)/gi;
 export function redactUrls(text) {
-	return String(text).replace(/[^ \t\n\r\f\v]+/g, (word) => {
-		const at = word.search(URL_START);
-		if (at < 0) return word;
-		const head = word.slice(0, at);
-		let rest = word.slice(at);
-		const cut = rest.endsWith("…") ? "…" : "";
-		if (cut) rest = rest.slice(0, -1);
-		if (/^data:/i.test(rest)) return `${head}data:[redacted]${cut}`;
-		if (rest.includes("@")) return `${head}[redacted URL]${cut}`;
-		const query = rest.search(/[?#]/);
-		if (query < 0) return word;
-		return `${head}${safeHref(rest.slice(0, query))}${cut}`;
-	});
+	const line = String(text);
+	const starts = [...line.matchAll(URL_START)];
+	if (!starts.length) return line;
+	const at = starts[0].index;
+	const head = line.slice(0, at);
+	let rest = line.slice(at);
+	const cut = rest.endsWith("…") ? "…" : "";
+	if (cut) rest = rest.slice(0, -1);
+	if (/^data:/i.test(rest)) return `${head}data:[redacted]${cut}`;
+	if (rest.includes("@") || starts.some((m) => /^data:/i.test(m[0]))) return `${head}[redacted URL]${cut}`;
+	const query = rest.search(/[?#]/);
+	if (query < 0) return line;
+	// No "@" anywhere, so no userinfo: the first word up to the query is
+	// origin and path only.
+	const url = rest.slice(0, query).split(/[ \t\n\r\f\v]/)[0];
+	return `${head}${safeHref(url)}${cut}`;
 }
 
 // The page URL field: one URL of any scheme, "" before any page, or

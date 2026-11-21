@@ -528,12 +528,14 @@ terminal escapes. The `url` field is parsed as one URL and loses its username,
 password, query string, and fragment, the way QA reports URLs; a `data:` URL
 becomes `data:[redacted]`, and a page URL that does not parse is
 `[unavailable URL]`. Console and failure lines are free text, where the end
-of a URL cannot be found reliably, so the rule there does not try: for each
-word that contains an `http(s)://`, `ws(s)://`, `file://`, `blob:`, or
-`data:` URL, a word with an `@` after the scheme (possible userinfo) has the
-URL replaced by `[redacted URL]`; otherwise everything from the first `?` or
-`#` to the end of the word is dropped; a word with neither is kept as it is.
-This can remove more text than the URL itself, never less. The whole file is at most
+of a URL cannot be found reliably (a URL may even contain a space), so the
+rule there works per line. The text before the first `http(s)://`, `ws(s)://`,
+`file://`, `blob:`, or `data:` URL is kept. From that URL to the end of the
+line: an `@` (possible userinfo) or any `data:` URL makes it all
+`[redacted URL]`; otherwise a `?` or `#` keeps the URL's origin and path and
+drops the rest, so `✖ 500 GET https://api/items?id=3` becomes
+`✖ 500 GET https://api/items`; a line with neither is unchanged. Text after
+such a URL on the same line is lost; a URL secret never survives. The whole file is at most
 64 KiB: when it would be larger, the oldest console and failure lines are
 dropped first. A file whose `pid` is no longer running counts as no pane.
 

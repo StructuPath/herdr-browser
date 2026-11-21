@@ -472,15 +472,17 @@ test("pane state: URL credentials, query, and fragment never reach the file", ()
 	assert.equal(s.url, "https://example.test/private");
 	// Free text with userinfo loses the whole URL; the page URL field parses one.
 	assert.deepEqual(s.failures, ["Failed [redacted URL]"]);
-	assert.ok(s.consoleTail.includes("  ws [redacted URL] done"), JSON.stringify(s.consoleTail));
+	assert.ok(s.consoleTail.includes("  ws [redacted URL]"), JSON.stringify(s.consoleTail));
 });
 
 test("redactUrls strips userinfo, query, and hash from every URL in text", () => {
 	assert.equal(
 		redactUrls("a http://u:p@h/x?q=1#f b ws://h:9/d?t=2 c HTTPS://H/ok"),
-		"a [redacted URL] b ws://h:9/d c HTTPS://H/ok",
+		"a [redacted URL]", // an "@" after the first URL withholds the rest of the line
 	);
 	assert.equal(redactUrls("no url here"), "no url here");
+	assert.equal(redactUrls("b ws://h:9/d c HTTPS://H/ok"), "b ws://h:9/d c HTTPS://H/ok", "nothing to hide: unchanged");
+	assert.equal(redactUrls("b ws://h:9/d?t=2 c"), "b ws://h:9/d", "a query: origin and path stay, the rest goes");
 	assert.equal(redactUrls("xhttps://u:p@h/?q"), "x[redacted URL]", "a URL glued to a word");
 	assert.equal(redactUrls("trunc https://h/p?tok…"), "trunc https://h/p…");
 	assert.equal(redactUrl(SECRET_URL), "https://example.test/private");
@@ -652,7 +654,7 @@ test("redactUrls: quotes, brackets, and non-web schemes never keep a secret", ()
 		["https://user:P'ASS@example.test/p?token=TOKEN", "[redacted URL]"],
 		["see (https://user:pw@x.test/p).", "see ([redacted URL]"],
 		["file:///etc/x?secret=1#f", "file:///etc/x"],
-		["load data:text/plain,SECRET done", "load data:[redacted] done"],
+		["load data:text/plain,SECRET done", "load data:[redacted]"],
 		["blob:https://user:PASS@example.test/id", "[redacted URL]"],
 		["http://[::1]:9222/json?t=1", "http://[::1]:9222/json"],
 		["metadata: ok", "metadata: ok"],
@@ -686,15 +688,15 @@ test("pane state: a file that vanishes is written again on the next idle step", 
 
 test("redactUrls: <, >, and a literal … inside a URL never shield a secret", () => {
 	const cases = [
-		["load data:text/html,<b>SECRET</b> done", "load data:[redacted] done"],
-		["see https://h/?a…token=SECRET end", "see https://h/ end"],
+		["load data:text/html,<b>SECRET</b> done", "load data:[redacted]"],
+		["see https://h/?a…token=SECRET end", "see https://h/"],
 		["<https://u:p@x.test/p>", "<[redacted URL]"],
 		["cut https://h/path…", "cut https://h/path…"], // truncate()'s own marker stays
 		["cut https://h/p?token=SEC…", "cut https://h/p…"],
 		// No "@", "?", or "#": nothing to strip, so the glued text is kept as is.
 		["request <https://example.com>net::ERR_CONNECTION_REFUSED", "request <https://example.com>net::ERR_CONNECTION_REFUSED"],
 		["<https://a.test/x>https://u:p@b.test/y?t=SEC", "<[redacted URL]"],
-		["get https://h/?q=<b>SECRET done", "get https://h/ done"],
+		["get https://h/?q=<b>SECRET done", "get https://h/"],
 		// Userinfo needs an "@"; any "@" withholds the URL, however it is spelled.
 		["https://user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
 		["https://user:pw>SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
@@ -768,9 +770,11 @@ test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret",
 		const word = `${pre}${sep}${scheme}${userinfo}${host}/${junk()}p${query}${frag}${junk()}`;
 		if (userinfo) withUserinfo++;
 		if (query) withQuery++;
-		const out = redactUrls(`before ${word} after`);
-		assert.doesNotMatch(out, /SECRET[UQF]/, `${word} -> ${out}`);
-		assert.ok(out.startsWith("before ") && out.endsWith(" after"), out);
+		// Spaces may now sit inside the userinfo or the query as well.
+		const spaced = rnd(4) === 0 ? word.replace("SECRET", " SECRET") : word;
+		const out = redactUrls(`before ${spaced} after`);
+		assert.doesNotMatch(out, /SECRET[UQF]/, `${spaced} -> ${out}`);
+		assert.ok(out.startsWith("before "), out);
 	}
 	// The generator really produced the shapes it claims to test.
 	assert.ok(withUserinfo > 2_000 && withQuery > 2_000, `${withUserinfo} userinfo, ${withQuery} query cases`);
@@ -789,7 +793,26 @@ test("pane state: Unicode spaces and slashless schemes never shield a URL secret
 	];
 	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
 	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
-	assert.equal(redactUrls("x https:example.test/?token=SECRET y"), "x https://example.test/ y");
+	assert.equal(redactUrls("x https:example.test/?token=SECRET y"), "x https://example.test/");
 	// The boundary keeps ordinary words that end in a scheme name alone.
 	assert.equal(redactUrls("metadata:a@b profile:x?y"), "metadata:a@b profile:x?y");
+});
+
+test("pane state: a URL secret that spans words never survives (line rule)", () => {
+	// new URL() accepts a raw space in userinfo or a query, and drops tabs and
+	// newlines, so a secret may span "words"; the rule never splits a line.
+	const lines = [
+		"x https://u:pw SECRET@h.test/ y",
+		"x https://h.test/p? token=SECRET y",
+		"x https://h.test/p# SECRET y",
+		"x https://u:pw\tSECRET@h.test/ y",
+		"x https://u:pw\nSECRET@h.test/ y",
+		"see https://a.test/x then data:text/plain,SECRET",
+	];
+	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
+	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
+	// Failure lines keep what the agent needs: method, status, origin, path.
+	assert.equal(redactUrls("✖ 500 GET https://api.test/items?id=3&token=SEC"), "✖ 500 GET https://api.test/items");
+	// A line with nothing that can hide a URL secret is unchanged.
+	assert.equal(redactUrls("request <https://example.com>net::ERR_CONNECTION_REFUSED"), "request <https://example.com>net::ERR_CONNECTION_REFUSED");
 });

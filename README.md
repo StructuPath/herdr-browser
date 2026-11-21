@@ -417,7 +417,10 @@ The pane publishes what it observes to a private state file, and
 learn the page URL and title, the backend, the observe-only latch, the last
 console lines and failed requests, and which session or endpoint to drive.
 Run it from the agent's shell; `HERDR_WORKSPACE_ID` (set by Herdr in every
-pane) selects the workspace.
+pane) selects the workspace. Without `HERDR_WORKSPACE_ID`, every directory
+shares one `pane-default.json`, so `hb` accepts a pane only when its `session`
+equals the session `hb` derives for the caller (same rules as
+[Session model](#session-model)); otherwise it reports no pane.
 
 ```sh
 HB="/path/to/herdr-browser/bin/hb.mjs"   # the linked or installed plugin checkout
@@ -450,13 +453,17 @@ export HERDR_PLUGIN_CONFIG_DIR="$(herdr plugin config-dir structupath.browser)"
 ### Pane state file
 
 The renderer writes `pane-<workspace-id>.json` in the plugin state directory
-(`HERDR_PLUGIN_STATE_DIR`, mode `0700`). It writes atomically (temporary file,
-then rename) with mode `0600`, only when the observable state changes — never
-per frame — and deletes the file when the pane exits. When
+(`HERDR_PLUGIN_STATE_DIR`, mode `0700`). It writes atomically (a temporary
+file with an unpredictable name, created exclusively at mode `0600` and never
+through a symlink, then renamed), only when the observable state changes —
+never per frame. On exit the pane deletes the file only if it still holds the
+pane's own `pid`, so a newer pane for the same workspace keeps its file. When
 `HERDR_PLUGIN_STATE_DIR` is unset, `hb` looks in
 `$XDG_STATE_HOME/herdr/plugins/structupath.browser` (if set), then
 `~/.local/state/herdr/plugins/structupath.browser`, then
-`~/.local/state/herdr-browser`, and uses the first live pane.
+`~/.local/state/herdr-browser`. When more than one holds a live pane, `hb`
+takes the one whose `session` matches the caller's derived session; with no
+match it takes the first and names all of them on stderr.
 
 Schema version 1 (`hb status --json` prints exactly this object):
 
@@ -467,11 +474,11 @@ Schema version 1 (`hb status --json` prints exactly this object):
 | `session` | string | The agent-browser session name the pane uses. |
 | `endpoint` | string \| null | CDP `host:port` in attach mode; `null` for agent-browser. Never a path or token. |
 | `attached` | boolean | The pane is connected to its session or endpoint now. |
-| `url` | string | Current page URL (sanitized). |
-| `title` | string | Current page title (sanitized). |
+| `url` | string | Current page URL (sanitized, redacted, at most 2,000 characters). |
+| `title` | string | Current page title (sanitized, at most 2,000 characters). |
 | `observeOnly` | boolean | The `o` latch: pane input is not forwarded. |
-| `consoleTail` | string[] | Last 20 console lines as the pane shows them (sanitized). |
-| `failures` | string[] | Last 20 failed-request lines (sanitized). |
+| `consoleTail` | string[] | Up to the last 20 console lines as the pane shows them (sanitized, URLs redacted, each at most 500 characters). |
+| `failures` | string[] | Up to the last 20 failed-request lines (sanitized, URLs redacted, each at most 500 characters). |
 | `updatedAt` | string | ISO 8601 time of the last write. |
 | `pid` | number | The renderer's process id. |
 
@@ -494,14 +501,18 @@ Schema version 1 (`hb status --json` prints exactly this object):
 
 Page-controlled strings (URL, title, console, failures) pass through the same
 control-character sanitizer as the pane header, so printing them cannot inject
-terminal escapes. A file whose `pid` is no longer running counts as no pane.
+terminal escapes. URLs are redacted the way QA reports them: the `url` field
+and every `http(s)://` or `ws(s)://` URL inside console and failure lines lose
+their username, password, query string, and fragment. The whole file is at most
+64 KiB: when it would be larger, the oldest console and failure lines are
+dropped first. A file whose `pid` is no longer running counts as no pane.
 
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | A pane file exists but cannot be read or parsed (`{"status":"error",...}` with `--json`). |
+| `1` | A pane file exists but cannot be read, is not JSON, or is not a schema version 1 object with the fields above (`{"status":"error",...}` with `--json`). |
 | `2` | Usage error: unknown command or flag. |
 | `3` | `hb status` only: no live pane for this workspace (`{"status":"no-pane"}` with `--json`). |
 
@@ -587,7 +598,9 @@ Environment variables take precedence over config files.
 - Polling frames are cached as PNG; streamed frames are cached as JPEG. Frame
   files are mode `0600` and removed when the pane exits.
 - The pane state file (`pane-<workspace-id>.json`) is mode `0600`, holds no
-  endpoint path or token (only `host:port`), and is removed when the pane exits.
+  endpoint path or token (only `host:port`), redacts credentials, query
+  strings, and fragments from page URLs, is capped at 64 KiB, and is removed
+  when the pane exits.
 - Recording bundles use private directories (`0700`) and files (`0600`), and session names are metadata only—never path components.
 - WebM recordings are intentionally retained under the plugin state directory.
 - Browser sessions are a trusted local boundary: any local process that knows a

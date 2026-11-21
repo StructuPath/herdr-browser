@@ -16,6 +16,7 @@ import {
 	buildPaneState,
 	paneStateFile,
 	paneStateKey,
+	removePaneStateIfOwned,
 	writePaneState,
 } from "./pane-state.mjs";
 
@@ -2032,7 +2033,9 @@ export class Renderer {
 		this.lastHeaderSig = null; // the observe marker lives in line 1
 		this.header();
 		this.renderBottom();
-		this.publishPaneState(); // not in sig(); the agent should see it now
+		// Not in sig(), so the agent should see it now. On a failed write, clear
+		// the step gate: an idle pane would otherwise never retry.
+		if (!this.publishPaneState()) this.paneStateLastSig = null;
 	}
 
 	noteObserveBlocked() {
@@ -2557,11 +2560,7 @@ export class Renderer {
 			/* already closed */
 		}
 		this.live = null;
-		try {
-			fs.unlinkSync(this.paneFile); // a dead pane must not look live
-		} catch {
-			/* never written */
-		}
+		removePaneStateIfOwned(this.paneFile, process.pid); // a dead pane must not look live
 		// The runtime-backend marker routes clicks only while this pane lives.
 		try {
 			fs.unlinkSync(

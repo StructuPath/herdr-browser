@@ -5,13 +5,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Renderer, sanitizeText } from "../bin/renderer.mjs";
+import { Renderer, deriveSession, sanitizeText } from "../bin/renderer.mjs";
+import { stateDirCandidates } from "../bin/hb.mjs";
 import {
+	PANE_STATE_MAX_BYTES,
 	PANE_STATE_SCHEMA_VERSION,
 	buildPaneState,
 	endpointHostPort,
 	paneStateFile,
 	readPaneState,
+	redactUrl,
+	redactUrls,
 	writePaneState,
 } from "../bin/pane-state.mjs";
 
@@ -304,14 +308,15 @@ test("writePaneState is atomic and private even under a permissive umask", () =>
 	const dir = tmpDir("hb-w-");
 	const file = paneStateFile(dir, "w1");
 	assert.equal(file, path.join(dir, "pane-w1.json"));
+	const state = buildPaneState({ session: "s", pid: 1 }, sanitizeText);
 	const old = process.umask(0);
 	try {
-		writePaneState(file, { schemaVersion: 1, pid: 1 });
+		writePaneState(file, state);
 	} finally {
 		process.umask(old);
 	}
 	assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-	assert.deepEqual(readPaneState(file), { schemaVersion: 1, pid: 1 });
+	assert.deepEqual(readPaneState(file), state);
 	assert.deepEqual(fs.readdirSync(dir), ["pane-w1.json"]);
 	assert.equal(readPaneState(path.join(dir, "missing.json")), null);
 });
@@ -445,4 +450,195 @@ test("hb help and usage errors use stable exit codes", () => {
 	assert.match(bad.stderr, /unknown command/);
 	const badFlag = runHb(["status", "--yaml"], env);
 	assert.equal(badFlag.status, 2);
+});
+
+// --- review fixes ---
+
+const SECRET_URL =
+	"https://synthetic-user:synthetic-pass@example.test/private?token=SYNTHETIC-QUERY#SYNTHETIC-FRAGMENT";
+
+test("pane state: URL credentials, query, and fragment never reach the file", () => {
+	const r = quiet(mkRenderer());
+	r.lastUrl = SECRET_URL;
+	r.pushLogEntry({ source: "network", text: "Failed", url: SECRET_URL, level: "error" });
+	r.pushConsole([{ text: "ws wss://u:p@h.test:1/x?SYNTHETIC-QUERY=1 done", type: "log" }], false);
+	r.publishPaneState();
+	const raw = fs.readFileSync(paneFileOf(r), "utf8");
+	for (const s of ["synthetic-user", "synthetic-pass", "SYNTHETIC-QUERY", "SYNTHETIC-FRAGMENT", "u:p@"])
+		assert.ok(!raw.includes(s), `${s} persisted`);
+	const s = JSON.parse(raw);
+	assert.equal(s.url, "https://example.test/private");
+	assert.deepEqual(s.failures, ["Failed https://example.test/private"]);
+	assert.ok(s.consoleTail.includes("  ws wss://h.test:1/x done"), JSON.stringify(s.consoleTail));
+});
+
+test("redactUrls strips userinfo, query, and hash from every URL in text", () => {
+	assert.equal(
+		redactUrls("a http://u:p@h/x?q=1#f b ws://h:9/d?t=2 c HTTPS://H/ok"),
+		"a http://h/x b ws://h:9/d c https://h/ok",
+	);
+	assert.equal(redactUrls("no url here"), "no url here");
+	assert.equal(redactUrls("xhttps://u:p@h/?q"), "xhttps://h/", "a URL glued to a word");
+	assert.equal(redactUrls("trunc https://h/p?tok…"), "trunc https://h/p…");
+	assert.equal(redactUrl(SECRET_URL), "https://example.test/private");
+	assert.equal(redactUrl("about:blank"), "about:blank");
+	assert.equal(redactUrl(""), "");
+	assert.equal(redactUrl("file:///a?b#c"), "file:///a");
+});
+
+const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+test("pane state: every string and the whole file are bounded", () => {
+	const r = quiet(mkRenderer());
+	const big = "X".repeat(256 * 1024);
+	r.lastTitle = `a${"😀".repeat(2000)}`; // the 2,000-unit cut lands inside a pair
+	r.lastUrl = `https://example.test/${big}`;
+	r.consoleLines = Array.from({ length: 20 }, (_, i) => `c${i} ${"€".repeat(1000)}`);
+	r.failedRequests = Array.from({ length: 20 }, (_, i) => `f${i} ${"€".repeat(1000)}`);
+	r.publishPaneState();
+	const file = paneFileOf(r);
+	assert.ok(fs.statSync(file).size <= PANE_STATE_MAX_BYTES, `file is ${fs.statSync(file).size} bytes`);
+	const s = JSON.parse(fs.readFileSync(file, "utf8"));
+	assert.ok(s.title.length <= 2000 && s.url.length <= 2000);
+	assert.ok(!loneSurrogate.test(s.title), "surrogate pair split");
+	for (const l of [...s.consoleTail, ...s.failures]) assert.ok(l.length <= 500, `line ${l.length}`);
+	assert.ok(s.consoleTail.length + s.failures.length < 40, "oldest lines dropped to fit");
+	assert.ok(s.consoleTail.at(-1).trimStart().startsWith("c19"), "newest console line kept");
+	assert.ok(s.failures.at(-1).startsWith("f19"), "newest failure kept");
+});
+
+test("writePaneState never follows a symlink and creates its temp file exclusively at 0600", () => {
+	const dir = tmpDir("hb-sym-");
+	const victim = path.join(dir, "victim.txt");
+	const file = paneStateFile(dir, "w1");
+	fs.writeFileSync(victim, "DO NOT REPLACE", { mode: 0o644 });
+	fs.symlinkSync(victim, `${file}.${process.pid}.tmp`); // the old predictable name
+	const state = buildPaneState({ session: "s", pid: process.pid }, sanitizeText);
+	writePaneState(file, state);
+	assert.equal(fs.readFileSync(victim, "utf8"), "DO NOT REPLACE");
+	// A symlink planted at the exact temp name between naming and open: the
+	// exclusive create must refuse it, and the planted link must survive.
+	const realOpen = fs.openSync;
+	let planted = null;
+	let modeAtOpen = null;
+	fs.openSync = function (p, ...rest) {
+		if (String(p).startsWith(`${file}.`) && planted === null) {
+			planted = String(p);
+			fs.symlinkSync(victim, planted);
+		}
+		return realOpen.call(this, p, ...rest);
+	};
+	try {
+		assert.throws(() => writePaneState(file, state), { code: "EEXIST" });
+	} finally {
+		fs.openSync = realOpen;
+	}
+	assert.ok(planted, "the temp file is created with fs.openSync");
+	assert.equal(fs.readFileSync(victim, "utf8"), "DO NOT REPLACE");
+	assert.ok(fs.lstatSync(planted).isSymbolicLink(), "someone else's file is not unlinked");
+	// The temp file is 0600 from creation, even under a permissive umask.
+	fs.openSync = function (p, ...rest) {
+		const fd = realOpen.call(this, p, ...rest);
+		if (String(p).startsWith(`${file}.`)) modeAtOpen = fs.fstatSync(fd).mode & 0o777;
+		return fd;
+	};
+	const old = process.umask(0);
+	try {
+		writePaneState(file, state);
+	} finally {
+		process.umask(old);
+		fs.openSync = realOpen;
+	}
+	assert.equal(modeAtOpen, 0o600);
+	assert.equal(fs.lstatSync(file).isSymbolicLink(), false);
+});
+
+test("pane state: a failed observe-only publish is retried by the next idle step", async () => {
+	const r = quiet(mkRenderer());
+	r.browser = stubBrowser({ url: "https://x/", title: "t" });
+	await r.step();
+	r.paneFile = path.join(r.stateDir, "missing-dir", "pane-w1.json");
+	r.toggleObserveOnly(); // the write fails
+	r.paneFile = paneFileOf(r);
+	await r.step(); // nothing in sig() moved
+	assert.equal(JSON.parse(fs.readFileSync(paneFileOf(r), "utf8")).observeOnly, true);
+});
+
+test("pane state: cleanup leaves a pane file that another process now owns", async () => {
+	const r = quiet(mkRenderer());
+	r.browser = stubBrowser({ url: "https://x/", title: "" });
+	await r.step();
+	const other = buildPaneState({ session: "newer", pid: process.pid + 1 }, sanitizeText);
+	writePaneState(paneFileOf(r), other); // a newer pane for the same workspace
+	r.cleanup();
+	assert.deepEqual(readPaneState(paneFileOf(r)), other);
+});
+
+test("hb without HERDR_WORKSPACE_ID accepts only a pane whose session is the caller's", () => {
+	const dir = tmpDir("hb-nows-");
+	const cwd = fs.realpathSync(tmpDir("hb-cwd-"));
+	const env = hbEnv({ HERDR_PLUGIN_STATE_DIR: dir });
+	const mine = deriveSession(env, cwd);
+	const file = paneStateFile(dir, "default");
+	writePaneState(file, buildPaneState({ session: "herdr-cwd-1", pid: process.pid }, sanitizeText));
+	const st = runHb(["status", "--json"], env, { cwd });
+	assert.equal(st.status, 3, st.stdout);
+	assert.deepEqual(JSON.parse(st.stdout), { status: "no-pane" });
+	const se = runHb(["session", "--json"], env, { cwd });
+	assert.deepEqual(JSON.parse(se.stdout), { session: mine, source: "derived", backend: null, endpoint: null });
+	writePaneState(file, buildPaneState({ session: mine, pid: process.pid }, sanitizeText));
+	const ok = runHb(["status", "--json"], env, { cwd });
+	assert.equal(ok.status, 0, ok.stderr);
+	assert.equal(JSON.parse(ok.stdout).session, mine);
+});
+
+test("hb prefers the matching session when several state dirs hold a live pane", () => {
+	const home = tmpDir("hb-home-");
+	const env = { PATH: process.env.PATH, HOME: home, XDG_STATE_HOME: tmpDir("hb-xdg-"), HERDR_WORKSPACE_ID: "w1" };
+	const dirs = stateDirCandidates(env);
+	assert.equal(dirs.length, 3);
+	dirs.forEach((d, i) => {
+		fs.mkdirSync(d, { recursive: true });
+		const session = i === 2 ? "herdr-ws-w1" : `candidate-${i}`;
+		writePaneState(paneStateFile(d, "w1"), buildPaneState({ session, pid: process.pid }, sanitizeText));
+	});
+	const res = runHb(["session", "--json"], env);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(JSON.parse(res.stdout).session, "herdr-ws-w1");
+	assert.equal(res.stderr, "");
+	// No candidate matches: the choice is reported, not silent.
+	writePaneState(paneStateFile(dirs[2], "w1"), buildPaneState({ session: "candidate-2", pid: process.pid }, sanitizeText));
+	const amb = runHb(["status", "--json"], env);
+	assert.equal(amb.status, 0);
+	assert.equal(JSON.parse(amb.stdout).session, "candidate-0");
+	assert.match(amb.stderr, /several live pane files/);
+	assert.ok(amb.stderr.includes(dirs[1]));
+});
+
+test("hb status: a pane file that is not schema v1 is an error, exit 1", () => {
+	const dir = tmpDir("hb-schema-");
+	const file = paneStateFile(dir, "w1");
+	const env = hbEnv({ HERDR_WORKSPACE_ID: "w1", HERDR_PLUGIN_STATE_DIR: dir });
+	const good = buildPaneState({ session: "s", pid: process.pid }, sanitizeText);
+	for (const bad of [
+		{},
+		{ pid: process.pid, unexpected: "not pane schema" },
+		{ ...good, schemaVersion: 2 },
+		{ ...good, consoleTail: [1] },
+		{ ...good, attached: "yes" },
+		[],
+	]) {
+		fs.writeFileSync(file, JSON.stringify(bad), { mode: 0o600 });
+		const res = runHb(["status", "--json"], env);
+		assert.equal(res.status, 1, JSON.stringify(bad));
+		assert.equal(JSON.parse(res.stdout).status, "error");
+	}
+});
+
+test("hb runs when invoked through a symlink", () => {
+	const link = path.join(tmpDir("hb-link-"), "hb");
+	fs.symlinkSync(HB, link);
+	const res = spawnSync(process.execPath, [link, "help"], { encoding: "utf8" });
+	assert.equal(res.status, 0, res.stderr);
+	assert.match(res.stdout, /Exit codes/);
 });

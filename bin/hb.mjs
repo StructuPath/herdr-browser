@@ -3,9 +3,10 @@
 // agent beside the pane: the renderer publishes pane-<ws>.json (see
 // bin/pane-state.mjs); this reads it back and names the session to drive.
 // Read-only: hb never creates the state dir or touches the browser.
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { deriveSession, resolveStateDir, safeWsId, sanitizeText } from "./renderer.mjs";
 import { paneStateFile, pidAlive, readPaneState } from "./pane-state.mjs";
 
@@ -24,7 +25,9 @@ Usage:
   hb help               this text
 
 The workspace comes from HERDR_WORKSPACE_ID; the session name is derived
-exactly as the pane derives it (see README "Session model").
+exactly as the pane derives it (see README "Session model"). Without
+HERDR_WORKSPACE_ID, only a pane whose session matches that derived name
+counts.
 
 Exit codes:
   0  success
@@ -47,12 +50,18 @@ export function stateDirCandidates(env) {
 	return [...new Set(dirs)];
 }
 
-// { state, file } for the first live pane; { state: null } when none is
-// live (missing file or dead pid); { error } when a file is unreadable and
-// no candidate is live.
-export function findPane(env) {
+const clean = (v) => sanitizeText(String(v ?? ""));
+
+// { state, file } for the live pane; { state: null } when none is live
+// (missing file or dead pid); { error } when a file is unreadable and no
+// candidate is live. Without HERDR_WORKSPACE_ID every cwd shares
+// pane-default.json, so only a pane whose session is the caller's own
+// counts. Several live candidates: the caller's session wins; otherwise the
+// first is used and the choice is reported on stderr.
+export function findPane(env, cwd) {
 	const ws = safeWsId(env.HERDR_WORKSPACE_ID);
 	let error = null;
+	const live = [];
 	for (const dir of stateDirCandidates(env)) {
 		const file = paneStateFile(dir, ws);
 		let state;
@@ -62,12 +71,24 @@ export function findPane(env) {
 			error ??= `${file}: ${err.message}`;
 			continue;
 		}
-		if (state && pidAlive(state.pid)) return { state, file };
+		if (state && pidAlive(state.pid)) live.push({ state, file });
 	}
+	let pool = live;
+	if (live.length > 1 || !env.HERDR_WORKSPACE_ID) {
+		const mine = deriveSession(env, cwd);
+		const matching = live.filter((p) => p.state.session === mine);
+		pool = matching.length || !env.HERDR_WORKSPACE_ID ? matching : live;
+	}
+	if (pool.length > 1)
+		process.stderr.write(
+			`hb: several live pane files for this workspace; using ${clean(pool[0].file)} (also ${pool
+				.slice(1)
+				.map((p) => clean(p.file))
+				.join(", ")})\n`,
+		);
+	if (pool.length) return pool[0];
 	return error ? { error } : { state: null };
 }
-
-const clean = (v) => sanitizeText(String(v ?? ""));
 
 function printStatusText(s) {
 	const rows = [
@@ -90,8 +111,8 @@ function printStatusText(s) {
 	process.stdout.write(`${out.join("\n")}\n`);
 }
 
-function status(env, json) {
-	const found = findPane(env);
+function status(env, cwd, json) {
+	const found = findPane(env, cwd);
 	if (found.error) {
 		if (json) process.stdout.write(`${JSON.stringify({ status: "error", error: found.error })}\n`);
 		else process.stderr.write(`hb: cannot read pane state: ${clean(found.error)}\n`);
@@ -111,7 +132,7 @@ function status(env, json) {
 // otherwise derive the name the pane would use. Session never fails: the
 // agent can drive agent-browser before the pane opens.
 function session(env, cwd, json) {
-	const found = findPane(env);
+	const found = findPane(env, cwd);
 	const live = found.state && typeof found.state.session === "string" && found.state.session;
 	const out = live
 		? {
@@ -152,9 +173,19 @@ export function main(argv, env = process.env, cwd = process.cwd()) {
 		return EXIT.usage;
 	}
 	const json = rest.includes("--json");
-	return cmd === "status" ? status(env, json) : session(env, cwd, json);
+	return cmd === "status" ? status(env, cwd, json) : session(env, cwd, json);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compare real paths: Node resolves a symlinked entry script for
+// import.meta.url but not for argv[1].
+function invokedDirectly() {
+	try {
+		return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+	} catch {
+		return false;
+	}
+}
+
+if (process.argv[1] && invokedDirectly()) {
 	process.exitCode = main(process.argv.slice(2));
 }

@@ -3154,6 +3154,35 @@ const killQuietly = (pid) => {
 	}
 };
 
+test("launch mode: quitting before DevToolsActivePort exists kills the starting browser", { skip: !canCdp }, async () => {
+	// A Chromium that never writes its port file: the pane is still inside
+	// the startup wait when the quit arrives.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-chrome-slow-"));
+	const bin = path.join(dir, "slow-chromium");
+	const pidFile = path.join(dir, "pid");
+	fs.writeFileSync(bin, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\nexec /bin/sleep 30\n`, {
+		mode: 0o755,
+	});
+	const r = quiet(mkRenderer({ HERDR_BROWSER_CHROMIUM: bin }));
+	let settled = false;
+	const launch = r.launchChromium().then(() => (settled = true));
+	let pid = null;
+	try {
+		assert.ok(await until(() => (pid = readPid(pidFile))), "fake Chromium started");
+		r.cleanup();
+		assert.ok(
+			await until(() => !isAlive(pid), 2_000),
+			"quit during startup must not orphan the launched browser",
+		);
+		assert.ok(await until(() => settled, 2_000), "quit cancels the startup wait");
+		assert.equal(r.launchedChild, null);
+		assert.doesNotMatch(r.banner, /did not expose a DevTools port/);
+	} finally {
+		killQuietly(pid);
+		await launch;
+	}
+});
+
 test("execFileBounded: a child that ignores SIGTERM is SIGKILLed after the grace", { timeout: 10_000 }, async () => {
 	const { bin, pidFile } = sigtermIgnoringScript();
 	try {

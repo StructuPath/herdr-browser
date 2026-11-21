@@ -1029,8 +1029,15 @@ export class Renderer {
 			child.once("error", (err) => {
 				spawnFailed.err = err;
 			});
+			// Own the child from spawn on, so a quit (or attach elsewhere)
+			// during the startup wait kills it instead of orphaning it. Taking
+			// ownership away also cancels the wait; the taker did the kill.
+			this.launchedChild = child;
+			this.launchedEndpoint = null;
 			const port = await this.waitForDevToolsPort(portFile, child, spawnFailed);
+			if (this.launchedChild !== child) return;
 			if (!port) {
+				this.launchedChild = null;
 				try {
 					child.kill();
 				} catch {
@@ -1043,7 +1050,6 @@ export class Renderer {
 				);
 				return;
 			}
-			this.launchedChild = child;
 			this.launchedEndpoint = `http://127.0.0.1:${port}`;
 			const ep = this.launchedEndpoint;
 			child.once("exit", () => {
@@ -1086,6 +1092,7 @@ export class Renderer {
 	async waitForDevToolsPort(portFile, child, spawnFailed = null, timeoutMs = 15_000) {
 		const until = Date.now() + timeoutMs;
 		while (Date.now() < until) {
+			if (this.launchedChild !== child) return null; // quit cancelled the launch
 			// Signal deaths leave exitCode null and set signalCode — check both.
 			if (child.exitCode !== null || child.signalCode !== null) return null;
 			if (spawnFailed?.err) return null; // binary missing/not executable

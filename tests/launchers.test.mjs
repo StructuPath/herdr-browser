@@ -199,6 +199,53 @@ test("concurrent opens are serialized: one pane opens, the other focuses it", as
 	);
 });
 
+test("the open lock holds even when mkdir reports success for an existing dir", async () => {
+	// uutils mkdir 0.8.0 (Ubuntu 26.04 LTS) can exit 0 for both of two
+	// concurrent creates (uutils/coreutils#13970). This stub always does, so
+	// the mkdir exit code alone would let the second invoke in while the
+	// first holds the lock.
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+	fs.rmSync(path.join(stateDir, "open-lock-w9"), {
+		recursive: true,
+		force: true,
+	});
+	const lyingDir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-mkdir-"));
+	const lyingMkdir = path.join(lyingDir, "mkdir");
+	fs.writeFileSync(
+		lyingMkdir,
+		'#!/usr/bin/env bash\nPATH=/usr/bin:/bin mkdir "$@" 2>/dev/null\n[ -d "${!#}" ]\n',
+	);
+	fs.chmodSync(lyingMkdir, 0o755);
+	const env = freshEnv({ STUB_OPEN_SLEEP: "0.5", STUB_PANE_ALIVE: "0" });
+	env.PATH = `${lyingDir}:${env.PATH}`;
+	const runAsync = () =>
+		new Promise((resolve) => {
+			const c = spawn("bash", [path.join(repoRoot, "scripts", "open.sh")], {
+				env,
+			});
+			c.on("close", (code) => resolve(code));
+		});
+	const first = runAsync();
+	// The second invoke starts while the first holds the lock.
+	const deadline = Date.now() + 5000;
+	while (!fs.existsSync(path.join(stateDir, "open-lock-w9", "pid"))) {
+		assert.ok(Date.now() < deadline, "first invoke never took the lock");
+		await new Promise((r) => setTimeout(r, 10));
+	}
+	const [a, b] = await Promise.all([first, runAsync()]);
+	assert.equal(a, 0);
+	assert.equal(b, 0);
+	const l = log();
+	assert.equal(l.match(/plugin pane open/g).length, 1, "mutual exclusion held");
+	assert.match(l, /plugin pane focus w9:p7/);
+	assert.equal(
+		fs.existsSync(path.join(stateDir, "open-lock-w9")),
+		false,
+		"lock released",
+	);
+	fs.rmSync(lyingDir, { recursive: true, force: true });
+});
+
 test("a stale lock from a crashed opener is stolen, not waited on forever", () => {
 	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
 	fs.mkdirSync(path.join(stateDir, "open-lock-w9"), { recursive: true });

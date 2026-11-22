@@ -103,8 +103,18 @@ until mkdir "$lock" 2>/dev/null && (set -C && printf '%s\n' "$$" >"$lock/pid") 2
 	if [ "$tries" -gt "$tries_max" ] && [ "$stolen" -eq 0 ]; then
 		holder="$(cat "$lock/pid" 2>/dev/null || true)"
 		if [ -z "$holder" ]; then
-			missing_pid_tries=$((missing_pid_tries + 1))
+			# Count only a lock that exists with no pid; an absent lock is a
+			# handover between holders, not a crash.
+			if [ -d "$lock" ]; then
+				missing_pid_tries=$((missing_pid_tries + 1))
+			else
+				missing_pid_tries=0
+			fi
 			if [ "$missing_pid_tries" -gt "$tries_max" ]; then
+				# Still pid-less after a second wait budget: the opener crashed
+				# before or during its pid write. An empty pid file blocks
+				# rmdir, so remove it too — but never a pid file with content.
+				[ -s "$lock/pid" ] || rm -f "$lock/pid" 2>/dev/null
 				rmdir "$lock" 2>/dev/null || true
 				stolen=1
 				tries=0

@@ -89,15 +89,25 @@ case "${HERDR_BROWSER_LOCK_TRIES:-20}" in
 esac
 tries=0
 stolen=0
+missing_pid_tries=0
 until mkdir "$lock" 2>/dev/null; do
 	tries=$((tries + 1))
 	if [ "$tries" -gt "$tries_max" ] && [ "$stolen" -eq 0 ]; then
 		holder="$(cat "$lock/pid" 2>/dev/null || true)"
-		if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+		if [ -z "$holder" ]; then
+			missing_pid_tries=$((missing_pid_tries + 1))
+			if [ "$missing_pid_tries" -gt "$tries_max" ]; then
+				rmdir "$lock" 2>/dev/null || true
+				stolen=1
+				tries=0
+				missing_pid_tries=0
+			fi
+		elif ! kill -0 "$holder" 2>/dev/null; then
 			rm -f "$lock/pid" 2>/dev/null
 			rmdir "$lock" 2>/dev/null || true
 			stolen=1
 			tries=0
+			missing_pid_tries=0
 		fi
 	fi
 	sleep 0.1

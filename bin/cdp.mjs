@@ -339,6 +339,7 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 	// Runtime.enable is page-observable — stealth automation stacks avoid it,
 	// and observing a run must not be able to change its outcome.
 	const enableFeed = async (sessionId) => {
+		stillOpen(); // auto-attached child targets arrive at any time
 		await session.send("Log.enable", {}, sessionId);
 		stillOpen();
 		if (consoleTier !== "log-only")
@@ -518,47 +519,59 @@ export function makeCdpBrowser(endpointInput, opts = {}) {
 			.join(" ")
 			.slice(0, 2_000);
 
+	// Identity of what we're attached to; the Renderer compares guid across
+	// reattaches so a reused port can't silently swap browsers underneath.
+	const connectOnce = async () => {
+		const previousTarget = pinnedTargetId;
+		const previousGuid = endpoint?.guid;
+		if (session) {
+			session.close();
+			clearTarget("target_changing");
+		}
+		stillOpen();
+		endpoint = await discoverEndpoint(endpointInput, opts);
+		stillOpen();
+		session = makeCdpSession(endpoint.wsUrl, opts);
+		await session.opened;
+		if (closed) {
+			session.close();
+			throw abandoned();
+		}
+		session.onEvent(onCdpEvent);
+		session.onClose(() => emit({ type: "endpoint_gone" }));
+		await session.send("Target.setDiscoverTargets", { discover: true });
+		stillOpen();
+		const pages = await pageTargets();
+		stillOpen();
+		attachTimeMs = Date.now();
+		const target = !connectedOnce && pages.length === 1 ? pages[0]
+			: previousGuid && previousGuid === endpoint.guid ? pages.find((p) => p.targetId === previousTarget) : null;
+		connectedOnce = true;
+		if (target) await pinTarget(target);
+		stillOpen();
+		return {
+			host: endpoint.host,
+			port: endpoint.port,
+			browser: endpoint.browser,
+			guid: endpoint.guid,
+			rediscoverable: endpoint.rediscoverable,
+			targetId: pinnedTargetId,
+			url: target?.url ?? "",
+			title: target?.title ?? "",
+		};
+	};
+
 	return {
-		// Identity of what we're attached to; the Renderer compares guid across
-		// reattaches so a reused port can't silently swap browsers underneath.
+		// A failure that close() itself caused (the socket closing under a
+		// pending command, a torn handshake) is reported as ABANDONED; a real
+		// connection failure keeps its own error for the banner.
 		async connect() {
-			const previousTarget = pinnedTargetId;
-			const previousGuid = endpoint?.guid;
-			if (session) {
-				session.close();
-				clearTarget("target_changing");
+			try {
+				return await connectOnce();
+			} catch (err) {
+				if (closed && err?.code !== "ABANDONED") throw abandoned();
+				throw err;
 			}
-			stillOpen();
-			endpoint = await discoverEndpoint(endpointInput, opts);
-			stillOpen();
-			session = makeCdpSession(endpoint.wsUrl, opts);
-			await session.opened;
-			if (closed) {
-				session.close();
-				throw abandoned();
-			}
-			session.onEvent(onCdpEvent);
-			session.onClose(() => emit({ type: "endpoint_gone" }));
-			await session.send("Target.setDiscoverTargets", { discover: true });
-			stillOpen();
-			const pages = await pageTargets();
-			stillOpen();
-			attachTimeMs = Date.now();
-			const target = !connectedOnce && pages.length === 1 ? pages[0]
-				: previousGuid && previousGuid === endpoint.guid ? pages.find((p) => p.targetId === previousTarget) : null;
-			connectedOnce = true;
-			if (target) await pinTarget(target);
-			stillOpen();
-			return {
-				host: endpoint.host,
-				port: endpoint.port,
-				browser: endpoint.browser,
-				guid: endpoint.guid,
-				rediscoverable: endpoint.rediscoverable,
-				targetId: pinnedTargetId,
-				url: target?.url ?? "",
-				title: target?.title ?? "",
-			};
 		},
 		onMessage(fn) {
 			handler = fn;

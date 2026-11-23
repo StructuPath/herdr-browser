@@ -28,9 +28,11 @@ export function diagnose(env = process.env, {
 	const endpoint = String(env.HERDR_BROWSER_CDP_URL || readConfig("cdp-url")).trim();
 	const launch = truthyConfig(env.HERDR_BROWSER_LAUNCH || readConfig("launch"));
 	if (endpoint) {
-		let valid = false;
-		try { valid = ["http:", "https:", "ws:", "wss:"].includes(new URL(endpoint).protocol); } catch {}
-		add(valid && webSocket ? "ok" : "error", "Selected backend: attach", valid ? "endpoint configured (not contacted); requires Node 22+" : "invalid endpoint; use http://host:port or a browser WebSocket URL");
+		let protocol = "";
+		try { protocol = new URL(endpoint).protocol; } catch {}
+		const valid = protocol === "http:" || protocol === "ws:";
+		const tls = protocol === "https:" || protocol === "wss:";
+		add(valid && webSocket ? "ok" : "error", "Selected backend: attach", valid ? "endpoint configured (not contacted); requires Node 22+" : tls ? "TLS endpoints (https://, wss://) are not supported yet; use http://host:port or ws://…" : "invalid endpoint; use http://host:port or a browser WebSocket URL");
 	} else if (launch) {
 		add(launchable && webSocket ? "ok" : "error", "Selected backend: launch", "requires Node 22+ and an executable Chrome/Chromium; set HERDR_BROWSER_CHROMIUM");
 	} else {

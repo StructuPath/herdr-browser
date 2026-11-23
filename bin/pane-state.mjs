@@ -33,6 +33,21 @@ export function endpointHostPort(url) {
 	return `${u.hostname}:${u.port || defaults[u.protocol]}`;
 }
 
+// Whether host:port alone answers CDP discovery. An http(s) endpoint does,
+// and a browser the pane launches publishes one. A WebSocket URL cannot be
+// told apart by its shape: a proxy may use Chrome's /devtools/browser/<id>
+// path too, so every ws(s) endpoint is reported as not discoverable.
+function discoverable(url) {
+	let protocol;
+	try {
+		({ protocol } = new URL(String(url)));
+	} catch {
+		return null;
+	}
+	if (protocol === "http:" || protocol === "https:") return true;
+	return protocol === "ws:" || protocol === "wss:" ? false : null;
+}
+
 // URLs leave the pane the way QA reports them (bin/qa.mjs safeUrl): no
 // username, password, query, or fragment — those carry tokens. A data: URL
 // is all payload; a blob: URL wraps an origin URL that is stripped in turn.
@@ -56,25 +71,48 @@ function safeHref(value) {
 	return u.href;
 }
 
-// URLs inside free text (console, failed requests). A match runs to the next
-// whitespace: quotes, brackets, and ";" are legal inside a query, so stopping
-// at them would leave the rest of a token behind. Sentence punctuation is
-// given back only when the URL has no query or fragment to hide it in; with
-// one, everything to the next whitespace is dropped (over-redaction is the
-// safe side). "…" ends a match: truncate() appends it to long URLs.
-// blob:/data: need a non-word char before them so "metadata:" is left alone.
-const URL_IN_TEXT = /(?:(?:https?|wss?|file):\/\/|(?<![\w+.-])(?:blob|data):)[^\s<>…]+/gi;
+// URLs inside free text (one console or failure line). Where a URL ends in
+// free text cannot be known: new URL() accepts quotes, brackets, spaces in
+// userinfo, and even drops tabs and newlines. So nothing here depends on it.
+// A URL can carry a secret only in userinfo, which needs an "@", or in its
+// query or fragment, which start at the first "?" or "#". The text before
+// the first URL is kept; from that URL's scheme to the end of the line:
+// - an "@", or a data: URL (all payload) anywhere: "[redacted URL]";
+// - else a "?" or "#": the URL keeps its origin and path, the rest goes;
+// - else the line is unchanged (nothing in it can hide a URL secret).
+// A trailing "…" (truncate()'s cut marker) is kept. This removes more text
+// than the URL when the line goes on after it; never less.
+// A scheme counts with "://" anywhere (even glued to a word), or with just
+// ":" when no letter or digit is glued before it (new URL() accepts
+// "https:host/…" and "wss:user@host"); "metadata:" and "profile:" stay text.
+// new URL() deletes tabs and newlines anywhere, even inside the scheme
+// ("ht\ttps://"), and sanitizeText turns a tab into a space, so the scheme
+// and its ":" and "//" may have ASCII whitespace between their characters.
+const W = "[ \\t\\n\\r]*";
+const spaced = (letters) => [...letters].join(W);
+const SCHEME = `(?:${spaced("http")}(?:${W}s)?|${spaced("ws")}(?:${W}s)?|${spaced("file")})`;
+const URL_START = new RegExp(
+	`(?:${SCHEME}${W}:${W}\\/${W}\\/|(?<![A-Za-z0-9])(?:${SCHEME}|${spaced("blob")}|${spaced("data")})${W}:)`,
+	"gi",
+);
+const isData = (s) => /^data:/i.test(s.replace(/[ \t\n\r]/g, ""));
 export function redactUrls(text) {
-	return String(text).replace(URL_IN_TEXT, (m) => {
-		let url = m;
-		let after = "";
-		if (!/[?#]/.test(m)) {
-			const tail = /[.,;:!)\]}'"]+$/.exec(m)?.[0] ?? "";
-			url = m.slice(0, m.length - tail.length);
-			after = tail;
-		}
-		return safeHref(url) + after;
-	});
+	const line = String(text);
+	const starts = [...line.matchAll(URL_START)];
+	if (!starts.length) return line;
+	const at = starts[0].index;
+	const head = line.slice(0, at);
+	let rest = line.slice(at);
+	const cut = rest.endsWith("…") ? "…" : "";
+	if (cut) rest = rest.slice(0, -1);
+	if (isData(rest)) return `${head}data:[redacted]${cut}`;
+	if (rest.includes("@") || starts.some((m) => isData(m[0]))) return `${head}[redacted URL]${cut}`;
+	const query = rest.search(/[?#]/);
+	if (query < 0) return line;
+	// No "@" anywhere, so no userinfo: the first word up to the query is
+	// origin and path only.
+	const url = rest.slice(0, query).split(/[ \t\n\r\f\v]/)[0];
+	return `${head}${safeHref(url)}${cut}`;
 }
 
 // The page URL field: one URL of any scheme, "" before any page, or
@@ -112,6 +150,10 @@ export function buildPaneState(input, sanitize) {
 		session: input.session == null ? null : text(input.session, sanitize),
 		endpoint:
 			backend === "agent-browser" ? null : clip(endpointHostPort(input.endpoint) ?? "", MAX_FIELD) || null,
+		// Whether host:port alone reaches the browser; the capability path a
+		// raw WebSocket front needs never leaves the pane.
+		endpointDiscoverable:
+			backend === "agent-browser" ? null : discoverable(input.endpoint),
 		attached: Boolean(input.attached),
 		url: clip(redactUrl(text(input.url, sanitize, Infinity)), MAX_FIELD),
 		title: text(input.title, sanitize),
@@ -175,6 +217,8 @@ const FIELD_CHECKS = {
 	backend: isStr,
 	session: (v) => v === null || isStr(v),
 	endpoint: (v) => v === null || isStr(v),
+	// Added within v1: files from an older writer simply lack it.
+	endpointDiscoverable: (v) => v === undefined || v === null || typeof v === "boolean",
 	attached: (v) => typeof v === "boolean",
 	url: isStr,
 	title: isStr,

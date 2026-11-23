@@ -63,6 +63,9 @@ if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
 fi
 if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
   [ -n "\${STUB_OPEN_SLEEP:-}" ] && sleep "$STUB_OPEN_SLEEP"
+  if [ -n "\${STUB_OPEN_GATE:-}" ]; then
+    i=0; while [ ! -e "$STUB_OPEN_GATE" ] && [ "$i" -lt 300 ]; do sleep 0.05; i=$((i + 1)); done
+  fi
   if [ -n "\${STUB_PRETTY:-}" ]; then
     printf '{\\n  "result": {\\n    "plugin_pane": {"pane": {"pane_id": "w9:p7"}}\\n  }\\n}\\n'
   else
@@ -192,6 +195,89 @@ test("concurrent opens are serialized: one pane opens, the other focuses it", as
 		"exactly one pane opened",
 	);
 	assert.match(l, /plugin pane focus w9:p7/);
+	assert.equal(
+		fs.existsSync(path.join(stateDir, "open-lock-w9")),
+		false,
+		"lock released",
+	);
+});
+
+test("the open lock holds even when mkdir reports success for an existing dir", async () => {
+	// uutils mkdir 0.8.0 (Ubuntu 26.04 LTS) can exit 0 for both of two
+	// concurrent creates (uutils/coreutils#13970). This stub always does, so
+	// the mkdir exit code alone would let the second invoke in while the
+	// first holds the lock. No timing: the first pane open blocks on a gate
+	// until the stub has reported success for a create that really failed.
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+	fs.rmSync(path.join(stateDir, "open-lock-w9"), {
+		recursive: true,
+		force: true,
+	});
+	const lyingDir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-mkdir-"));
+	const lied = path.join(lyingDir, "lied");
+	const gate = path.join(lyingDir, "gate");
+	const lyingMkdir = path.join(lyingDir, "mkdir");
+	fs.writeFileSync(
+		lyingMkdir,
+		`#!/usr/bin/env bash
+target="\${!#}"
+PATH=/usr/bin:/bin mkdir "$@" 2>/dev/null && exit 0
+[ -d "$target" ] || exit 1
+# The real mkdir failed (EEXIST) and the stub reports success anyway.
+case "$target" in *open-lock-*) : >"${lied}" ;; esac
+exit 0
+`,
+	);
+	fs.chmodSync(lyingMkdir, 0o755);
+	const env = freshEnv({ STUB_OPEN_GATE: gate, STUB_PANE_ALIVE: "0" });
+	env.PATH = `${lyingDir}:${env.PATH}`;
+	const runAsync = () =>
+		new Promise((resolve) => {
+			const c = spawn("bash", [path.join(repoRoot, "scripts", "open.sh")], {
+				env,
+			});
+			c.on("close", (code) => resolve(code));
+		});
+	const both = Promise.all([runAsync(), runAsync()]);
+	// Watchdog only: the gate opens as soon as one invoke was lied to.
+	const deadline = Date.now() + 10000;
+	while (!fs.existsSync(lied) && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 20));
+	}
+	const sawLie = fs.existsSync(lied);
+	fs.writeFileSync(gate, "");
+	const [a, b] = await both;
+	assert.ok(sawLie, "mkdir stub never reported success for the held lock");
+	assert.equal(a, 0);
+	assert.equal(b, 0);
+	const l = log();
+	assert.equal(l.match(/plugin pane open/g).length, 1, "mutual exclusion held");
+	assert.match(l, /plugin pane focus w9:p7/);
+	assert.equal(
+		fs.existsSync(path.join(stateDir, "open-lock-w9")),
+		false,
+		"lock released",
+	);
+	fs.rmSync(lyingDir, { recursive: true, force: true });
+});
+
+test("a lock whose opener crashed between pid create and pid write is recovered", () => {
+	// The pid file exists but is empty: rmdir alone cannot remove the lock.
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
+	fs.rmSync(path.join(stateDir, "open-lock-w9"), {
+		recursive: true,
+		force: true,
+	});
+	fs.mkdirSync(path.join(stateDir, "open-lock-w9"));
+	fs.writeFileSync(path.join(stateDir, "open-lock-w9", "pid"), "");
+	const r = spawnSync("bash", [path.join(repoRoot, "scripts", "open.sh")], {
+		env: freshEnv({ HERDR_BROWSER_LOCK_TRIES: "3" }),
+		encoding: "utf8",
+		timeout: 20000,
+	});
+	assert.equal(r.signal, null, "open.sh waited forever on the empty pid file");
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /plugin pane open/);
 	assert.equal(
 		fs.existsSync(path.join(stateDir, "open-lock-w9")),
 		false,
@@ -695,6 +781,21 @@ test("a dead pane's stale backend marker is ignored", () => {
 	assert.equal(r.status, 0, r.stderr);
 	assert.match(log(), /agent-browser --session herdr-ws-w9 open/);
 	fs.rmSync(path.join(stateDir, "backend-w9"), { force: true });
+});
+
+test("a fresh pane clears the marker a killed attach pane left behind", () => {
+	fs.writeFileSync(path.join(stateDir, "pane-id-w9"), "w9:p3\n"); // the killed pane
+	fs.writeFileSync(path.join(stateDir, "backend-w9"), "attach\n"); // SIGKILL skipped its cleanup
+	let r = runScript("open.sh", ["http://localhost:5003/a"]); // p3 is dead: a fresh pane opens
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /plugin pane open/);
+	assert.ok(!fs.existsSync(path.join(stateDir, "backend-w9")), "stale marker removed");
+	// The fresh pane is alive on the configured backend: clicks drive agent-browser.
+	r = runScript("open.sh", ["http://localhost:5003/b"], freshEnv({ STUB_PANE_ALIVE: "0" }));
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(log(), /agent-browser --session herdr-ws-w9 open http:\/\/localhost:5003\/b/);
+	assert.ok(!fs.existsSync(path.join(stateDir, "navigate-w9")), "no handoff file for an agent-browser pane");
+	fs.rmSync(path.join(stateDir, "pane-id-w9"), { force: true });
 });
 
 test("whitespace-only HERDR_BROWSER_CDP_URL is not attach mode (renderer parity)", () => {

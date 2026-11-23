@@ -282,7 +282,8 @@ screenshot. A captured snapshot or diff is dropped, rather than shown stale,
 when the page navigates to a new URL underneath it — in polling, live-stream,
 and attach modes alike. In attach and launch mode it is also dropped on a
 reload or a tab switch that keeps the same URL; in agent-browser mode a
-same-URL reload is not detected, so press `s` again. The request table is a
+same-URL reload is not detected, so press `s` twice (once to close the old
+snapshot, once to take a new one). The request table is a
 session log and stays until dismissed.
 Switching to a different browser (`a` or `l`) also forgets the last snapshot,
 so `d` asks for a fresh `s` instead of diffing two unrelated browsers.
@@ -493,6 +494,7 @@ Schema version 1 (`hb status --json` prints exactly this object):
 | `backend` | string | `"agent-browser"` or `"attach"`. A Chromium launched with `l` is `"attach"`. |
 | `session` | string | The agent-browser session name the pane uses. |
 | `endpoint` | string \| null | CDP `host:port` in attach mode; `null` for agent-browser. Never a path or token. |
+| `endpointDiscoverable` | boolean \| null | `true` when `host:port` alone answers CDP discovery: an `http://` endpoint or a browser the pane launched. `false` for any `ws://` or `wss://` endpoint: its shape cannot show whether `host:port` reaches the browser (a proxy may use Chrome's `/devtools/browser/<id>` path too), and the pane never publishes the path or token; `hb session` then gives no `connect` hint. `null` for agent-browser. Files from an earlier writer may lack it. |
 | `attached` | boolean | The pane is connected to its session or endpoint now. |
 | `url` | string | Current page URL (sanitized, redacted, at most 2,000 characters). |
 | `title` | string | Current page title (sanitized, at most 2,000 characters). |
@@ -508,6 +510,7 @@ Schema version 1 (`hb status --json` prints exactly this object):
   "backend": "attach",
   "session": "herdr-ws-w1",
   "endpoint": "127.0.0.1:9222",
+  "endpointDiscoverable": true,
   "attached": true,
   "url": "http://localhost:3000/",
   "title": "My app",
@@ -521,13 +524,18 @@ Schema version 1 (`hb status --json` prints exactly this object):
 
 Page-controlled strings (URL, title, console, failures) pass through the same
 control-character sanitizer as the pane header, so printing them cannot inject
-terminal escapes. URLs are redacted the way QA reports them: the `url` field
-and every `http(s)://`, `ws(s)://`, `file://`, or `blob:` URL inside console and
-failure lines lose their username, password, query string, and fragment; a
-`data:` URL becomes `data:[redacted]`, and a page URL that does not parse is
-`[unavailable URL]`. In console and failure lines, a URL with a query or
-fragment is dropped up to the next whitespace, so text glued to its end goes
-with it. The whole file is at most
+terminal escapes. The `url` field is parsed as one URL and loses its username,
+password, query string, and fragment, the way QA reports URLs; a `data:` URL
+becomes `data:[redacted]`, and a page URL that does not parse is
+`[unavailable URL]`. Console and failure lines are free text, where the end
+of a URL cannot be found reliably (a URL may even contain a space), so the
+rule there works per line. The text before the first `http(s)://`, `ws(s)://`,
+`file://`, `blob:`, or `data:` URL is kept. From that URL to the end of the
+line: an `@` (possible userinfo) or any `data:` URL makes it all
+`[redacted URL]`; otherwise a `?` or `#` keeps the URL's origin and path and
+drops the rest, so `✖ 500 GET https://api/items?id=3` becomes
+`✖ 500 GET https://api/items`; a line with neither is unchanged. Text after
+such a URL on the same line is lost; a URL secret never survives. The whole file is at most
 64 KiB: when it would be larger, the oldest console and failure lines are
 dropped first. A file whose `pid` is no longer running counts as no pane.
 

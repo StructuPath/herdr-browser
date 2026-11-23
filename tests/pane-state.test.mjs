@@ -106,10 +106,15 @@ test("pane state: a run-loop step writes pane-w1.json, mode 0600, schema v1", as
 	);
 });
 
+// A constant shell command: the lib path travels in the environment, never
+// in the command string (CodeQL js/shell-command-injection-from-environment).
+const LIB_SH = path.join(repoRoot, "scripts", "lib.sh");
+const SESSION_NAME_SH = '. "$HB_LIB" && session_name';
+
 test("pane state: session matches bash session_name for the workspace", async () => {
 	const r = quiet(mkRenderer());
 	const env = { PATH: process.env.PATH, HERDR_WORKSPACE_ID: "w1" };
-	const sh = execFileSync("bash", ["-c", `. "${repoRoot}/scripts/lib.sh" && session_name`], { env })
+	const sh = execFileSync("bash", ["-c", SESSION_NAME_SH], { env: { ...env, HB_LIB: LIB_SH } })
 		.toString()
 		.trim();
 	assert.equal(r.session, sh);
@@ -287,7 +292,7 @@ test("buildPaneState shapes, caps, and sanitizes every field", () => {
 		sanitizeText,
 	);
 	assert.deepEqual(Object.keys(s), [
-		"schemaVersion", "backend", "session", "endpoint", "attached", "url", "title",
+		"schemaVersion", "backend", "session", "endpoint", "endpointDiscoverable", "attached", "url", "title",
 		"observeOnly", "consoleTail", "failures", "updatedAt", "pid",
 	]);
 	assert.equal(s.schemaVersion, PANE_STATE_SCHEMA_VERSION);
@@ -397,7 +402,7 @@ test("hb session matches bash session_name across env/config/workspace/cwd", () 
 	];
 	for (const over of cases) {
 		const env = { PATH: process.env.PATH, HOME: tmpDir("hb-home-"), HERDR_PLUGIN_STATE_DIR: tmpDir("hb-st-"), ...over };
-		const sh = execFileSync("bash", ["-c", `. "${repoRoot}/scripts/lib.sh" && session_name`], { env, cwd })
+		const sh = execFileSync("bash", ["-c", SESSION_NAME_SH], { env: { ...env, HB_LIB: LIB_SH }, cwd })
 			.toString()
 			.trim();
 		const text = runHb(["session"], env, { cwd });
@@ -410,6 +415,7 @@ test("hb session matches bash session_name across env/config/workspace/cwd", () 
 			source: "derived",
 			backend: null,
 			endpoint: null,
+			endpointDiscoverable: null,
 		});
 	}
 });
@@ -431,10 +437,13 @@ test("hb session reports the live pane's session and attach endpoint", () => {
 		source: "pane",
 		backend: "attach",
 		endpoint: "127.0.0.1:9222",
+		endpointDiscoverable: false, // a ws URL cannot show whether host:port reaches the browser
 	});
 	const text = runHb(["session"], env);
 	assert.match(text.stdout, /^session: pane-session\nendpoint: 127\.0\.0\.1:9222\n/);
-	assert.match(text.stdout, /agent-browser --session pane-session connect http:\/\/127\.0\.0\.1:9222/);
+	// A ws endpoint gets no connect hint: host:port may not reach the browser.
+	assert.doesNotMatch(text.stdout, /connect http:/);
+	assert.match(text.stdout, /ask for the full URL/);
 	assert.ok(!text.stdout.includes("/devtools/browser/"));
 });
 
@@ -468,17 +477,20 @@ test("pane state: URL credentials, query, and fragment never reach the file", ()
 		assert.ok(!raw.includes(s), `${s} persisted`);
 	const s = JSON.parse(raw);
 	assert.equal(s.url, "https://example.test/private");
-	assert.deepEqual(s.failures, ["Failed https://example.test/private"]);
-	assert.ok(s.consoleTail.includes("  ws wss://h.test:1/x done"), JSON.stringify(s.consoleTail));
+	// Free text with userinfo loses the whole URL; the page URL field parses one.
+	assert.deepEqual(s.failures, ["Failed [redacted URL]"]);
+	assert.ok(s.consoleTail.includes("  ws [redacted URL]"), JSON.stringify(s.consoleTail));
 });
 
 test("redactUrls strips userinfo, query, and hash from every URL in text", () => {
 	assert.equal(
 		redactUrls("a http://u:p@h/x?q=1#f b ws://h:9/d?t=2 c HTTPS://H/ok"),
-		"a http://h/x b ws://h:9/d c https://h/ok",
+		"a [redacted URL]", // an "@" after the first URL withholds the rest of the line
 	);
 	assert.equal(redactUrls("no url here"), "no url here");
-	assert.equal(redactUrls("xhttps://u:p@h/?q"), "xhttps://h/", "a URL glued to a word");
+	assert.equal(redactUrls("b ws://h:9/d c HTTPS://H/ok"), "b ws://h:9/d c HTTPS://H/ok", "nothing to hide: unchanged");
+	assert.equal(redactUrls("b ws://h:9/d?t=2 c"), "b ws://h:9/d", "a query: origin and path stay, the rest goes");
+	assert.equal(redactUrls("xhttps://u:p@h/?q"), "x[redacted URL]", "a URL glued to a word");
 	assert.equal(redactUrls("trunc https://h/p?tok…"), "trunc https://h/p…");
 	assert.equal(redactUrl(SECRET_URL), "https://example.test/private");
 	assert.equal(redactUrl("about:blank"), "about:blank");
@@ -585,7 +597,7 @@ test("hb without HERDR_WORKSPACE_ID accepts only a pane whose session is the cal
 	assert.equal(st.status, 3, st.stdout);
 	assert.deepEqual(JSON.parse(st.stdout), { status: "no-pane" });
 	const se = runHb(["session", "--json"], env, { cwd });
-	assert.deepEqual(JSON.parse(se.stdout), { session: mine, source: "derived", backend: null, endpoint: null });
+	assert.deepEqual(JSON.parse(se.stdout), { session: mine, source: "derived", backend: null, endpoint: null, endpointDiscoverable: null });
 	writePaneState(file, buildPaneState({ session: mine, pid: process.pid }, sanitizeText));
 	const ok = runHb(["status", "--json"], env, { cwd });
 	assert.equal(ok.status, 0, ok.stderr);
@@ -646,15 +658,14 @@ test("hb runs when invoked through a symlink", () => {
 test("redactUrls: quotes, brackets, and non-web schemes never keep a secret", () => {
 	const cases = [
 		["https://h/p?token='TOKEN'#FRAG", "https://h/p"],
-		["https://user:P'ASS@example.test/p?token=TOKEN", "https://example.test/p"],
-		["see (https://user:pw@x.test/p).", "see (https://x.test/p)."],
+		["https://user:P'ASS@example.test/p?token=TOKEN", "[redacted URL]"],
+		["see (https://user:pw@x.test/p).", "see ([redacted URL]"],
 		["file:///etc/x?secret=1#f", "file:///etc/x"],
-		["load data:text/plain,SECRET done", "load data:[redacted] done"],
-		["blob:https://user:PASS@example.test/id", "blob:https://example.test/id"],
+		["load data:text/plain,SECRET done", "load data:[redacted]"],
+		["blob:https://user:PASS@example.test/id", "[redacted URL]"],
 		["http://[::1]:9222/json?t=1", "http://[::1]:9222/json"],
 		["metadata: ok", "metadata: ok"],
-		// A delimiter inside a query looks like the URL's end; everything to the
-		// next whitespace goes so no part of the token survives.
+		// From the first "?" to the end of the word goes, delimiters and all.
 		["failure(https://example.test/p?token=')SECRET);retry=false", "failure(https://example.test/p"],
 	];
 	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
@@ -680,4 +691,156 @@ test("pane state: a file that vanishes is written again on the next idle step", 
 	fs.unlinkSync(file); // an older pane's cleanup raced this pane's write
 	await r.step(); // nothing observable changed
 	assert.ok(fs.existsSync(file), "the live pane restores its file without a state change");
+});
+
+test("redactUrls: <, >, and a literal … inside a URL never shield a secret", () => {
+	const cases = [
+		["load data:text/html,<b>SECRET</b> done", "load data:[redacted]"],
+		["see https://h/?a…token=SECRET end", "see https://h/"],
+		["<https://u:p@x.test/p>", "<[redacted URL]"],
+		["cut https://h/path…", "cut https://h/path…"], // truncate()'s own marker stays
+		["cut https://h/p?token=SEC…", "cut https://h/p…"],
+		// No "@", "?", or "#": nothing to strip, so the glued text is kept as is.
+		["request <https://example.com>net::ERR_CONNECTION_REFUSED", "request <https://example.com>net::ERR_CONNECTION_REFUSED"],
+		["<https://a.test/x>https://u:p@b.test/y?t=SEC", "<[redacted URL]"],
+		["get https://h/?q=<b>SECRET done", "get https://h/"],
+		// Userinfo needs an "@"; any "@" withholds the URL, however it is spelled.
+		["https://user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
+		["https://user:pw>SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
+		["https://user:pw…<SECRET@example.test/p", "[redacted URL]"],
+		["<https://user:pw>SECRET@example.test/p>", "<[redacted URL]"],
+		["https:///user:pw<SECRET@example.test/p?token=QUERY#FRAGMENT", "[redacted URL]"],
+		["https:////user:pw@example.test/p", "[redacted URL]"],
+		["request <https://user:pw<SECRET@example.test>net::ERR", "request <[redacted URL]"],
+		["HTTPS://U:P@X.TEST/a?T=QUERY", "[redacted URL]"],
+	];
+	for (const [input, want] of cases) assert.equal(redactUrls(input), want, input);
+	for (const [input] of cases) assert.doesNotMatch(redactUrls(input), /SECRET|SEC|u:p@|pw|QUERY|FRAGMENT/);
+});
+
+test("pane state: endpointDiscoverable says whether host:port alone reaches the browser", () => {
+	const s = (endpoint, backend = "attach") => buildPaneState({ backend, endpoint, pid: 1 }, (x) => x);
+	assert.equal(s("http://127.0.0.1:9222").endpointDiscoverable, true);
+	assert.equal(s("ws://127.0.0.1:9222/devtools/browser/abc").endpointDiscoverable, false, "same shape as a proxy");
+	assert.equal(s("ws://proxy.test:8080/devtools/browser/abc").endpointDiscoverable, false, "a proxy with Chrome's path");
+	assert.equal(s("ws://127.0.0.1:3000/5f2c9a").endpointDiscoverable, false, "a Playwright server");
+	assert.equal(s("wss://cloud.test/?token=TOKEN").endpointDiscoverable, false, "a hosted browser");
+	assert.equal(s("ws://proxy.test:8080/cdp/browser/TOKEN").endpointDiscoverable, false, "a proxy");
+	assert.doesNotMatch(JSON.stringify(s("ws://proxy.test:8080/cdp/browser/TOKEN")), /TOKEN/);
+	assert.equal(s(null, "agent-browser").endpointDiscoverable, null);
+});
+
+test("hb session only suggests connect for an endpoint that answers discovery", () => {
+	const env = hbEnv({ HERDR_WORKSPACE_ID: "w1", HERDR_PLUGIN_STATE_DIR: tmpDir("hb-st-") });
+	const file = paneStateFile(env.HERDR_PLUGIN_STATE_DIR, "w1");
+	const write = (endpoint) => writePaneState(file, buildPaneState({ backend: "attach", session: "herdr-ws-w1", endpoint, pid: process.pid }, sanitizeText));
+	write("ws://proxy.test:8080/cdp/browser/TOKEN");
+	let out = runHb(["session"], env).stdout;
+	assert.doesNotMatch(out, /connect http:/);
+	assert.match(out, /ask for the full URL/);
+	assert.doesNotMatch(out, /TOKEN/);
+	write("http://127.0.0.1:9222");
+	out = runHb(["session"], env).stdout;
+	assert.match(out, /connect http:\/\/127\.0\.0\.1:9222/);
+	assert.equal(JSON.parse(runHb(["session", "--json"], env).stdout).endpointDiscoverable, true);
+});
+
+test("readPaneState accepts a v1 file from a writer that predates endpointDiscoverable", () => {
+	const file = path.join(tmpDir("hb-old-"), "pane-w1.json");
+	const state = buildPaneState({ backend: "attach", session: "s", endpoint: "http://127.0.0.1:9222", pid: process.pid }, sanitizeText);
+	delete state.endpointDiscoverable;
+	writePaneState(file, state);
+	assert.equal(readPaneState(file).endpoint, "127.0.0.1:9222");
+});
+
+test("redactUrls: no generated URL keeps a userinfo, query, or fragment secret", () => {
+	// Seeded, so a failure reproduces. Secrets sit only where a URL can carry
+	// them; everything around them is drawn from characters that confused the
+	// earlier boundary guessing.
+	let seed = 0x5eed;
+	// Math.imul keeps the LCG exact (a plain * overflows 2^53 and zeroes the
+	// low bits); the high bits are the well-mixed ones.
+	const rnd = (n) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 16) % n;
+	const pick = (xs) => xs[rnd(xs.length)];
+	const junk = () => Array.from({ length: rnd(4) }, () => pick(["<", ">", "…", "'", '"', ")", "(", ";", "/", "[", "]", ":", "x", "\u00a0", "\u3000", "\u2009"])).join("");
+	let withUserinfo = 0;
+	let withQuery = 0;
+	for (let i = 0; i < 5_000; i++) {
+		const scheme = pick(["http://", "https://", "ws://", "wss://", "HTTPS://", "https:///", "https:////", "blob:https://", "file://", "https:", "wss:", "HTTP:"]);
+		const userinfo = rnd(2) ? `u${junk()}:pw${junk()}SECRETU${junk()}@` : "";
+		const host = pick(["example.test", "[::1]", "127.0.0.1:9222", "h"]);
+		const query = rnd(2) ? `?${junk()}t=${junk()}SECRETQ${junk()}` : "";
+		const frag = rnd(2) ? `#${junk()}SECRETF` : "";
+		// A letter or digit glued before a slashless scheme makes another scheme
+		// ("xhttps:"), which no parser reads as https; keep a boundary there.
+		const pre = junk();
+		const sep = !scheme.includes("//") && /[A-Za-z0-9]$/.test(pre) ? "(" : "";
+		const word = `${pre}${sep}${scheme}${userinfo}${host}/${junk()}p${query}${frag}${junk()}`;
+		if (userinfo) withUserinfo++;
+		if (query) withQuery++;
+		// Spaces may now sit inside the userinfo or the query as well.
+		let spaced = rnd(4) === 0 ? word.replace("SECRET", " SECRET") : word;
+		// new URL() deletes tabs anywhere, even inside the scheme.
+		if (rnd(4) === 0) spaced = spaced.replace(/^(.*?)(t)(t?ps?:|s:|s?:)/, "$1$2\t$3");
+		const out = redactUrls(sanitizeText(`before ${spaced} after`));
+		assert.doesNotMatch(out, /SECRET[UQF]/, `${spaced} -> ${out}`);
+		assert.ok(out.startsWith("before "), out);
+	}
+	// The generator really produced the shapes it claims to test.
+	assert.ok(withUserinfo > 2_000 && withQuery > 2_000, `${withUserinfo} userinfo, ${withQuery} query cases`);
+});
+
+test("pane state: Unicode spaces and slashless schemes never shield a URL secret", () => {
+	const lines = [
+		"x https://u:pw\u00a0SECRET@h.test/ y",
+		"x https://h.test/p?token=\u00a0SECRET y",
+		"x https://h.test/p#frag\u3000SECRET y",
+		"x wss:u:SECRET@h.test/ y",
+		"x https:example.test/?token=SECRET y",
+		"x HTTP:u:SECRET@h.test/ y",
+		"x .https:example.test/?token=SECRET y",
+		"x +wss:u:SECRET@h.test/ y",
+	];
+	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
+	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
+	assert.equal(redactUrls("x https:example.test/?token=SECRET y"), "x https://example.test/");
+	// The boundary keeps ordinary words that end in a scheme name alone.
+	assert.equal(redactUrls("metadata:a@b profile:x?y"), "metadata:a@b profile:x?y");
+});
+
+test("pane state: a URL secret that spans words never survives (line rule)", () => {
+	// new URL() accepts a raw space in userinfo or a query, and drops tabs and
+	// newlines, so a secret may span "words"; the rule never splits a line.
+	const lines = [
+		"x https://u:pw SECRET@h.test/ y",
+		"x https://h.test/p? token=SECRET y",
+		"x https://h.test/p# SECRET y",
+		"x https://u:pw\tSECRET@h.test/ y",
+		"x https://u:pw\nSECRET@h.test/ y",
+		"see https://a.test/x then data:text/plain,SECRET",
+	];
+	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
+	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
+	// Failure lines keep what the agent needs: method, status, origin, path.
+	assert.equal(redactUrls("✖ 500 GET https://api.test/items?id=3&token=SEC"), "✖ 500 GET https://api.test/items");
+	// A line with nothing that can hide a URL secret is unchanged.
+	assert.equal(redactUrls("request <https://example.com>net::ERR_CONNECTION_REFUSED"), "request <https://example.com>net::ERR_CONNECTION_REFUSED");
+});
+
+test("pane state: a tab inside the scheme does not hide a URL (new URL() deletes it)", () => {
+	const lines = [
+		"x ht\ttps://u:SECRET@h.test/ y",
+		"x https:\t//u:SECRET@h.test/ y",
+		"x h\nttps://u:SECRET@h.test/ y",
+		"x w\ts:u:SECRET@h.test/ y",
+		"x d\tata:text/plain,SECRET y",
+		"x ht\ttps://h.test/p?token=SECRET y",
+	];
+	const state = buildPaneState({ backend: "agent-browser", consoleLines: lines, failures: lines, pid: 1 }, sanitizeText);
+	for (const line of [...state.consoleTail, ...state.failures]) assert.doesNotMatch(line, /SECRET/, line);
+	// Long runs of whitespace after a scheme name stay cheap.
+	const start = performance.now();
+	redactUrls(`http${" ".repeat(1_996)}`);
+	redactUrls(`http ${"s ".repeat(997)}`);
+	assert.ok(performance.now() - start < 1_000, "no catastrophic backtracking");
 });

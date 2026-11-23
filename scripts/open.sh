@@ -82,6 +82,14 @@ fi
 # time alone must never break mutual exclusion. Each waiter steals at most
 # once, then keeps waiting; the steal removes only the known token file +
 # dir, never an rm -rf of a foreign path.
+#
+# The lock is held only by the invoke that also creates "$lock/pid" with
+# noclobber. bash itself opens that file with O_EXCL, so exactly one invoke
+# can win even when the mkdir binary lies: uutils mkdir 0.8.0 (Ubuntu 26.04
+# LTS) exits 0 for both of two concurrent creates of one directory
+# (uutils/coreutils#13970). A lock dir with no pid yet is either a winner
+# between those two steps or a crashed opener; it is removed only after it
+# stays empty for a second full wait budget.
 lock="$(state_dir)/open-lock-$(ws_id)"
 case "${HERDR_BROWSER_LOCK_TRIES:-20}" in
 '' | *[!0-9]*) tries_max=20 ;;
@@ -89,20 +97,41 @@ case "${HERDR_BROWSER_LOCK_TRIES:-20}" in
 esac
 tries=0
 stolen=0
-until mkdir "$lock" 2>/dev/null; do
+missing_pid_tries=0
+until mkdir "$lock" 2>/dev/null && (set -C && printf '%s\n' "$$" >"$lock/pid") 2>/dev/null; do
 	tries=$((tries + 1))
 	if [ "$tries" -gt "$tries_max" ] && [ "$stolen" -eq 0 ]; then
 		holder="$(cat "$lock/pid" 2>/dev/null || true)"
-		if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+		if [ -z "$holder" ]; then
+			# Count only a lock that exists with no pid; an absent lock is a
+			# handover between holders, not a crash.
+			if [ -d "$lock" ]; then
+				missing_pid_tries=$((missing_pid_tries + 1))
+			else
+				missing_pid_tries=0
+			fi
+			if [ "$missing_pid_tries" -gt "$tries_max" ]; then
+				# Still pid-less after a second wait budget: the opener crashed
+				# before or during its pid write. An empty pid file blocks
+				# rmdir, so remove it too — but never a pid file with content.
+				[ -s "$lock/pid" ] || rm -f "$lock/pid" 2>/dev/null
+				rmdir "$lock" 2>/dev/null || true
+				stolen=1
+				tries=0
+				missing_pid_tries=0
+			fi
+		elif ! kill -0 "$holder" 2>/dev/null; then
 			rm -f "$lock/pid" 2>/dev/null
 			rmdir "$lock" 2>/dev/null || true
 			stolen=1
 			tries=0
+			missing_pid_tries=0
+		else
+			missing_pid_tries=0
 		fi
 	fi
 	sleep 0.1
 done
-printf '%s\n' "$$" >"$lock/pid"
 trap 'if [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ]; then rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null; fi' EXIT
 
 pidfile="$(pane_id_file)"
@@ -121,6 +150,10 @@ if pane_alive "$existing"; then
 fi
 
 if [ "$focused" -eq 0 ]; then
+	# A pane killed without cleanup (SIGKILL) leaves its runtime-backend marker.
+	# The fresh pane starts on the configured backend, so the old marker must
+	# not route clicks or block recording for it. Still under the open lock.
+	rm -f "$(backend_marker_file)"
 	out="$(with_timeout 15 "$HERDR" plugin pane open --plugin "$PLUGIN_ID" --entrypoint view \
 		--placement split --direction right --focus)" || {
 		echo "herdr-browser: failed to open pane" >&2

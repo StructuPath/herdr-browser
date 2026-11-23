@@ -781,7 +781,8 @@ export class Renderer {
 		// while set; lastSnapshot backs the diff key.
 		this.textView = null;
 		this.lastSnapshot = null;
-		this.pageRevision = 0; // bumped by a reload, tab switch, or target reset
+		this.pageRevision = 0; // bumped by a URL change, reload, tab switch, or target reset
+		this.pageRevisionUrl = "";
 		this.pasteState = null;
 		this.inputRevision = 0;
 		this.cdpTargetId = null;
@@ -2347,7 +2348,12 @@ export class Renderer {
 	// the current one. Every URL source calls this — poll, stream, and CDP.
 	// force: a reload or tab switch is new content even at an unchanged URL.
 	dropStaleTextView({ force = false } = {}) {
-		if (force) this.pageRevision++;
+		// Every URL transition counts, even one that later returns (A → B → A):
+		// a snapshot that spanned it may have read B.
+		if (force || this.lastUrl !== this.pageRevisionUrl) {
+			this.pageRevision++;
+			this.pageRevisionUrl = this.lastUrl;
+		}
 		const tv = this.textView;
 		if (!tv || tv.mode === "network" || (!force && tv.url === this.lastUrl)) return;
 		this.textView = null;

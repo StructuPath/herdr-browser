@@ -698,6 +698,25 @@ test("adapter feed: auto-attached OOPIF sessions get their own feed enabled", as
 	);
 });
 
+// Wait for a milestone, but fail fast when the promise under test settles
+// first (it would otherwise spin forever) or when the deadline passes.
+const waitFor = async (cond, settled, what, ms = 2_000) => {
+	const end = Date.now() + ms;
+	while (!cond()) {
+		if (settled.done) assert.fail(`settled before ${what}: ${settled.value?.message ?? settled.value}`);
+		if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+};
+const track = (promise) => {
+	const settled = { done: false, value: undefined };
+	settled.promise = promise.then(
+		(value) => Object.assign(settled, { done: true, value }).value,
+		(err) => Object.assign(settled, { done: true, value: err }).value,
+	);
+	return settled;
+};
+
 test("adapter close during discovery or handshake never attaches to the abandoned browser", async (t) => {
 	// Discovery held open by a slow /json/version, then close() before it answers.
 	let answer;
@@ -710,11 +729,11 @@ test("adapter close during discovery or handshake never attaches to the abandone
 	const slow = makeCdpBrowser(`http://127.0.0.1:${server.address().port}`, {
 		wsFactory: () => { sockets++; return makeFakeCdp().ws; },
 	});
-	const connecting = slow.connect().catch((err) => err);
-	while (!answer) await new Promise((resolve) => setImmediate(resolve));
+	const connecting = track(slow.connect());
+	await waitFor(() => answer, connecting, "the discovery request");
 	slow.close();
 	answer();
-	assert.equal((await connecting)?.code, "ABANDONED");
+	assert.equal((await connecting.promise)?.code, "ABANDONED");
 	assert.equal(sockets, 0, "no WebSocket opens after close()");
 
 	// Handshake held open, then close() before the socket opens.
@@ -748,13 +767,50 @@ test("adapter close during target setup stops before any further CDP command", a
 			return fake.ws;
 		},
 	});
-	const connecting = b.connect().catch((err) => err);
-	while (!fake.calls("Page.enable").length) await new Promise((r) => setImmediate(r));
+	const connecting = track(b.connect());
+	await waitFor(() => fake.calls("Page.enable").length, connecting, "Page.enable");
 	b.close();
 	const before = fake.sent.length;
 	fake.deliver({ id: fake.calls("Page.enable")[0].id, result: {} });
-	assert.equal((await connecting)?.code, "ABANDONED");
+	assert.equal((await connecting.promise)?.code, "ABANDONED");
 	const after = fake.sent.slice(before).map((m) => m.method);
 	for (const method of ["Log.enable", "Runtime.enable", "Target.setAutoAttach", "Page.startScreencast"])
 		assert.ok(!after.includes(method), `${method} sent after close`);
+});
+
+test("adapter close: a failure the close caused reads as ABANDONED, and child targets get no feed", async () => {
+	// Page.enable hangs; the close-time stopScreencast answers, so the socket
+	// closes under the pending Page.enable and rejects it "connection closed".
+	const fake = makeFakeCdp({ results: { "Page.enable": null } });
+	const b = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", {
+		wsFactory: () => {
+			queueMicrotask(() => fake.ws.onopen?.());
+			return fake.ws;
+		},
+	});
+	const connecting = track(b.connect());
+	await waitFor(() => fake.calls("Page.enable").length, connecting, "Page.enable");
+	b.close();
+	assert.equal((await connecting.promise)?.code, "ABANDONED");
+	// An OOPIF that auto-attaches while the close is in flight gets no domains.
+	const before = fake.sent.length;
+	fake.deliver({ method: "Target.attachedToTarget", params: { sessionId: "sess-IF", targetInfo: { targetId: "IF", type: "iframe" } } });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.deepEqual(fake.sent.slice(before).filter((m) => m.sessionId === "sess-IF").map((m) => m.method), []);
+});
+
+test("adapter connect keeps a real connection failure's own error", async () => {
+	const fake = makeFakeCdp({ results: { "Target.setDiscoverTargets": null } }); // never answers
+	const b = makeCdpBrowser("ws://127.0.0.1:1/devtools/browser/test", {
+		wsFactory: () => {
+			queueMicrotask(() => fake.ws.onopen?.());
+			return fake.ws;
+		},
+	});
+	const connecting = track(b.connect());
+	await waitFor(() => fake.calls("Target.setDiscoverTargets").length, connecting, "setDiscoverTargets");
+	fake.ws.close(); // the browser goes away; the adapter was never closed
+	const err = await connecting.promise;
+	assert.ok(err instanceof Error);
+	assert.notEqual(err.code, "ABANDONED");
 });

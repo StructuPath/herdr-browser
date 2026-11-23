@@ -3637,15 +3637,14 @@ test("capLength never splits a grapheme cluster", () => {
 	assert.equal(capLength("short", 10), "short");
 });
 
-test("truncate stops scanning once the output width is reached", () => {
+test("truncate segments only a bounded prefix once the output width is reached", (t) => {
+	// Counts the text handed to Intl.Segmenter instead of timing it: CI runners
+	// (and Node 20's Segmenter) are too slow for a wall-clock budget.
+	const segment = t.mock.method(Intl.Segmenter.prototype, "segment");
 	const big = "x".repeat(2_000_000);
-	let best = Infinity;
-	for (let i = 0; i < 3; i++) {
-		const start = performance.now();
-		assert.equal(truncate(big, 80), `${"x".repeat(79)}…`);
-		best = Math.min(best, performance.now() - start);
-	}
-	assert.ok(best < 30, `truncate of a 2M-char string took ${best.toFixed(1)} ms`);
+	assert.equal(truncate(big, 80), `${"x".repeat(79)}…`);
+	const scanned = segment.mock.calls.reduce((n, call) => n + String(call.arguments[0]).length, 0);
+	assert.ok(scanned <= 1_024, `truncate segmented ${scanned} of ${big.length} units`);
 });
 
 test("chunked truncate matches whole-string segmentation across chunk edges", () => {
@@ -4257,4 +4256,29 @@ test("text view: a snapshot or diff that finishes after a page change is discard
 	await flush();
 	assert.equal(r.textView, null);
 	assert.match(r.banner, /page changed/);
+});
+
+test("text view: a snapshot that spans A → B → A is discarded", async () => {
+	const r = quiet(mkRenderer());
+	r.attached = true;
+	r.lastUrl = "https://a/";
+	let answer;
+	r.browser = { snapshotText: () => new Promise((resolve) => { answer = resolve; }) };
+	r.feed("s");
+	await flush();
+	r.onCdpMessage({ type: "url", url: "https://b/" }); // the query may now read B
+	r.onCdpMessage({ type: "url", url: "https://a/" }); // and the page comes back
+	answer({ title: "B", lines: ['@e1 [button] "B"'] });
+	await flush();
+	assert.equal(r.textView, null);
+	assert.match(r.banner, /page changed/);
+	// A title-only update at the same URL is not a page change.
+	r.banner = "";
+	r.browser = { snapshotText: () => new Promise((resolve) => { answer = resolve; }) };
+	r.feed("s");
+	await flush();
+	r.onCdpMessage({ type: "url", url: "https://a/", title: "A (1)" });
+	answer({ title: "A", lines: ['@e1 [button] "A"'] });
+	await flush();
+	assert.equal(r.textView?.mode, "snapshot");
 });
